@@ -4,7 +4,7 @@ setlocal
 title DeepSeek Local Service
 cd /d "%~dp0"
 if errorlevel 1 (
-  echo Cannot open script directory: %~dp0
+  echo "Cannot open script directory: %~dp0"
   goto :failed
 )
 

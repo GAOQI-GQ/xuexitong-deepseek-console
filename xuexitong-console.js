@@ -805,9 +805,19 @@ return null;
 }
 
 function dismissVideoQuiz(card) {
-for (let scope = card, depth = 0; scope && depth < 3; depth++, scope = scope.parentElement) {
-for (const label of ['继续播放', '继续', '下一题', '知道了', '关闭', '确定']) {
+for (let scope = card, depth = 0; scope && depth < 4; depth++, scope = scope.parentElement) {
+for (const label of ['继续学习', '继续播放', '继续观看', '继续', '下一题', '知道了', '关闭', '确定']) {
 const button = findButtonIn(scope, label);
+if (button) {
+button.click();
+return true;
+}
+}
+}
+const doc = card.ownerDocument;
+if (doc && doc.documentElement) {
+for (const label of ['继续学习', '继续播放', '继续观看']) {
+const button = findButtonIn(doc.documentElement, label);
 if (button) {
 button.click();
 return true;
@@ -867,15 +877,15 @@ if (Date.now() < videoQuizRetryAt) return;
 let question = findVideoQuizCard();
 if (!question) return;
 const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
-if (video && !video.paused) {
-try { video.pause(); } catch (_) { /* 忽略 */ }
-}
 const signatureTitle = question.title
 .replace(/回答(?:错误|正确)[\s\S]*$/, '')
 .replace(/正确答案\s*[：:][A-H\s、,，]*/g, '')
 .trim();
 const signature = `${question.kind}:${signatureTitle}:${question.options.map((option) => `${option.letter}${option.text}`).join('|')}`;
 if (attemptedVideoQuizzes.has(signature)) return;
+if (video && !video.paused) {
+try { video.pause(); } catch (_) { /* 忽略 */ }
+}
 const state = videoQuizState(signature);
 const text = clean(question.card.innerText);
 const currentCorrect = correctCount(text);
@@ -886,12 +896,17 @@ attemptedVideoQuizzes.add(signature);
 console.log('%c视频弹题回答正确', 'color:#4CAF50');
 videoQuizBusy = true;
 app._videoQuizActive = true;
+let dismissed = false;
 try {
-dismissVideoQuiz(question.card);
+dismissed = dismissVideoQuiz(question.card);
 } finally {
 videoQuizBusy = false;
 app._videoQuizActive = false;
 }
+if (!dismissed) console.warn('%c视频弹题已答对，但未找到“继续学习”按钮，请手动点击', 'color:#FF9800');
+setTimeout(() => {
+if (typeof app._tryResumePlayback === 'function') app._tryResumePlayback('video-quiz-done');
+}, 600);
 return;
 }
 if (state.attempts >= MAX_VIDEO_QUIZ_ATTEMPTS) {

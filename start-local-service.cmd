@@ -1,4 +1,9 @@
 @echo off
+if /i "%~1"=="--minimized" goto :run
+start "" /min "%~f0" --minimized
+exit /b 0
+
+:run
 chcp 65001 >nul
 setlocal
 title DeepSeek Local Service

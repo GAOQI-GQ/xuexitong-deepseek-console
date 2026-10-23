@@ -14,12 +14,13 @@
 - DeepSeek 输出被截断时自动降级重试，不会提交残缺答案
 - 大章节显示“暂无内容”时自动点击“下一节”跳过，最多连续跳过 10 个
 - 页面整页跳转后通过辅助窗口自动恢复脚本
+- 启动时自动最小化命令行窗口，并在 Edge 中打开学习通
 
 ## 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
-| `start-local-service.cmd` | 启动本地服务，并打开可视化设置页输入 DeepSeek API Key |
+| `start-local-service.cmd` | 启动本地服务（窗口自动最小化），打开学习通和可视化设置页 |
 | `deepseek-local.mjs` | 本地 HTTP 服务（`127.0.0.1:37841`），校验令牌并转发答题请求 |
 | `deepseek-request.mjs` | 调用 DeepSeek Chat Completions API 的答题逻辑 |
 | `xuexitong-console.js` | 注入学习通课程页面的自动化脚本 |
@@ -35,13 +36,14 @@
 
 ## 使用方法
 
-1. 双击 `start-local-service.cmd`。会弹出一个可视化的设置窗口，粘贴 DeepSeek API Key，勾选“记住密钥”后点击“保存并启动”。
-   黑色命令行窗口会继续保留用于显示日志和停止服务，但不再需要在那里输入 Key。
-2. 如果没有自动弹出设置窗口，用浏览器打开 `http://127.0.0.1:37841/setup`。
-3. 用 Edge 登录学习通，进入课程播放页（地址包含 `/mycourse/studentstudy`）。
-4. 用记事本打开 `xuexitong-console.js`，全选复制。
-5. 在课程页按 `F12` 打开控制台（Console），粘贴脚本并按 Enter。
+1. 双击 `start-local-service.cmd`。黑色命令行窗口会自动最小化，并在 Edge 中打开学习通（`https://i.chaoxing.com/`）。
+2. 首次使用会同时弹出一个可视化的设置窗口，粘贴 DeepSeek API Key，勾选“记住密钥”后点击“保存并启动”。之后启动会自动读取已保存的 Key，不再弹设置窗口。
+3. 如果设置窗口没有自动弹出，用浏览器打开 `http://127.0.0.1:37841/setup`。
+4. 在 Edge 中登录学习通，进入课程播放页（地址包含 `/mycourse/studentstudy`）。
+5. 用记事本打开 `xuexitong-console.js`，全选复制；或在课程页按 `F12` 打开控制台，粘贴脚本并按 Enter。也可以用下面的书签方式。
 6. 浏览器询问是否允许访问本地网络时选择“允许”；脚本弹出的辅助窗口不要关闭。
+
+需要查看日志或停止服务时，从任务栏还原最小化的 `DeepSeek Local Service` 窗口，关闭它即可停止服务。
 
 脚本启动后会自动开始播放与答题。
 

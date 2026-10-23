@@ -339,6 +339,7 @@ const server = createServer(async (req, res) => {
             }
             console.log(`DeepSeek API Key 已设置（${maskedKey(key)}）`);
             sendJson(res, 200, { ok: true, masked: maskedKey(key), warning });
+            openChaoxingPage();
             return;
         }
         sendJson(res, 404, { error: '未找到接口' });
@@ -415,14 +416,18 @@ const server = createServer(async (req, res) => {
     }
 });
 
-function openSetupPage() {
-    if (process.env.XXT_NO_BROWSER === '1') return;
-    const url = `http://127.0.0.1:${PORT}/setup`;
+function findEdge() {
     const candidates = [
         process.env['ProgramFiles(x86)'] && join(process.env['ProgramFiles(x86)'], 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
         process.env.ProgramFiles && join(process.env.ProgramFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
     ].filter(Boolean);
-    const edge = candidates.find((candidate) => existsSync(candidate));
+    return candidates.find((candidate) => existsSync(candidate));
+}
+
+function openSetupPage() {
+    if (process.env.XXT_NO_BROWSER === '1') return;
+    const url = `http://127.0.0.1:${PORT}/setup`;
+    const edge = findEdge();
     try {
         if (edge) {
             spawn(edge, [`--app=${url}`, '--window-size=480,720'], { detached: true, stdio: 'ignore' }).unref();
@@ -438,6 +443,31 @@ function openSetupPage() {
     }
 }
 
+const CHAOXING_URL = 'https://i.chaoxing.com/';
+let chaoxingOpened = false;
+
+function openChaoxingPage() {
+    if (process.env.XXT_NO_BROWSER === '1' || chaoxingOpened) return;
+    chaoxingOpened = true;
+    const edge = findEdge();
+    try {
+        if (edge) {
+            spawn(edge, ['--new-window', CHAOXING_URL], { detached: true, stdio: 'ignore' }).unref();
+            console.log('已在 Edge 打开学习通：' + CHAOXING_URL);
+            return;
+        }
+        if (process.platform === 'win32') {
+            spawn('cmd', ['/c', 'start', '', CHAOXING_URL], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+            console.log('已用默认浏览器打开学习通：' + CHAOXING_URL);
+            return;
+        }
+        spawn('xdg-open', [CHAOXING_URL], { detached: true, stdio: 'ignore' }).unref();
+    } catch (error) {
+        chaoxingOpened = false;
+        console.warn('无法自动打开学习通，请手动访问：' + CHAOXING_URL);
+    }
+}
+
 server.listen(PORT, '127.0.0.1', () => {
     writeFileSync(scriptPath, scriptWithToken, 'utf8');
     console.log(`本地服务已启动：http://127.0.0.1:${PORT}`);
@@ -446,8 +476,9 @@ server.listen(PORT, '127.0.0.1', () => {
         console.log(`已加载保存的 API Key（${maskedKey(apiKey)}），无需重新输入。`);
     } else {
         console.log('尚未设置 API Key，正在打开设置窗口...');
-        openSetupPage();
     }
+    openChaoxingPage();
+    if (!apiKey) openSetupPage();
     console.log('方式一：复制同目录 xuexitong-console.js 的全部内容，粘贴到学习通页面的 Edge 控制台并按 Enter。');
     console.log('方式二（推荐）：在学习通页面点击“学习通自动答题”书签，自动拉取本次启动的脚本，无需 DevTools。');
     console.log('关闭本窗口即可停止服务。');

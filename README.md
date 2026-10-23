@@ -19,7 +19,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `start-local-service.cmd` | 启动本地服务，并在窗口内输入 DeepSeek API Key |
+| `start-local-service.cmd` | 启动本地服务，并打开可视化设置页输入 DeepSeek API Key |
 | `deepseek-local.mjs` | 本地 HTTP 服务（`127.0.0.1:37841`），校验令牌并转发答题请求 |
 | `deepseek-request.mjs` | 调用 DeepSeek Chat Completions API 的答题逻辑 |
 | `xuexitong-console.js` | 注入学习通课程页面的自动化脚本 |
@@ -35,19 +35,26 @@
 
 ## 使用方法
 
-1. 双击 `start-local-service.cmd`，粘贴 DeepSeek API Key 后按 Enter（输入过程不显示字符，属正常现象）。
-   看到“本地服务已启动”后保持窗口打开。
-2. 用 Edge 登录学习通，进入课程播放页（地址包含 `/mycourse/studentstudy`）。
-3. 用记事本打开 `xuexitong-console.js`，全选复制。
-4. 在课程页按 `F12` 打开控制台（Console），粘贴脚本并按 Enter。
-5. 浏览器询问是否允许访问本地网络时选择“允许”；脚本弹出的辅助窗口不要关闭。
+1. 双击 `start-local-service.cmd`。会弹出一个可视化的设置窗口，粘贴 DeepSeek API Key，勾选“记住密钥”后点击“保存并启动”。
+   黑色命令行窗口会继续保留用于显示日志和停止服务，但不再需要在那里输入 Key。
+2. 如果没有自动弹出设置窗口，用浏览器打开 `http://127.0.0.1:37841/setup`。
+3. 用 Edge 登录学习通，进入课程播放页（地址包含 `/mycourse/studentstudy`）。
+4. 用记事本打开 `xuexitong-console.js`，全选复制。
+5. 在课程页按 `F12` 打开控制台（Console），粘贴脚本并按 Enter。
+6. 浏览器询问是否允许访问本地网络时选择“允许”；脚本弹出的辅助窗口不要关闭。
 
 脚本启动后会自动开始播放与答题。
+
+## 密钥记忆
+
+- 勾选“记住密钥”后，Key 会使用 Windows 当前用户的 DPAPI 加密，保存在 `%APPDATA%\xuexitong-deepseek\config.json`，下次启动自动加载，无需重新输入。
+- 需要更换或删除时，打开 `http://127.0.0.1:37841/setup`，输入新 Key 或点击“清除已保存的密钥”。
+- 不勾选“记住密钥”时，Key 只在本次运行期间保留，不写入磁盘。
 
 ## 注意事项
 
 - 每次重新启动本地服务后，脚本中的临时令牌都会更新，需要重新复制一次 `xuexitong-console.js` 再粘贴。
-- 本地服务只监听 `127.0.0.1`，API Key 不会写入文件，但答题内容会发送至 DeepSeek API。
+- 本地服务只监听 `127.0.0.1`；勾选“记住密钥”时 Key 会加密保存在本机，答题内容会发送至 DeepSeek API。
 - 使用 API 会产生费用；AI 可能答错；自动化操作可能触发平台风控。
 - 如果页面出现“已在调试程序中暂停”，在开发者工具中按 `F8` 恢复，或在 Sources 面板关闭“遇到异常时暂停”。
 

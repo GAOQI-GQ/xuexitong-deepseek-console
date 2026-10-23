@@ -69,7 +69,7 @@ try {
 keeper = PAGE.open('', 'xuexitongConsoleKeeper', 'width=360,height=150');
 if (!keeper) throw new Error('浏览器阻止了辅助窗口');
 keeper.document.title = '学习通自动任务辅助窗口';
-keeper.document.body.innerHTML = '<p style="font:16px sans-serif;padding:12px">学习通自动任务正在运行。请保持此窗口打开；课程页整页跳转后，它会重新启动脚本。</p>';
+keeper.document.body.innerHTML = '<p style="font:16px sans-serif;padding:12px">GQ提醒您：学习通自动任务正在运行。请保持此窗口打开；课程页整页跳转后，它会重新启动脚本。</p>';
 keeper.__xuexitongSource = `(${xuexitongMain.toString()})();`;
 keeper.__xuexitongLastUrl = location.href;
 keeper.__xuexitongLastInjectionAt = Date.now();

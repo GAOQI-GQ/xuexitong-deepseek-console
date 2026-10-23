@@ -126,7 +126,7 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
 
 function readBrowserSource() {
     const sourcePath = process.env.XXT_SELF;
-    if (!sourcePath) throw new Error('请通过 start-local-service.cmd 启动本地服务');
+    if (!sourcePath) throw new Error('请通过“学习通自动刷课 G版.cmd”启动本地服务');
     const text = readFileSync(sourcePath, 'utf8');
     const start = text.indexOf(BROWSER_START);
     if (start < 0) throw new Error('单文件启动器缺少浏览器脚本起始标记');

@@ -126,15 +126,13 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
 
 function readBrowserSource() {
     const sourcePath = process.env.XXT_SELF;
-    if (sourcePath) {
-        const text = readFileSync(sourcePath, 'utf8');
-        const start = text.indexOf(BROWSER_START);
-        if (start < 0) throw new Error('单文件启动器缺少浏览器脚本起始标记');
-        const end = text.indexOf(BROWSER_END, start + BROWSER_START.length);
-        if (end < 0) throw new Error('单文件启动器缺少浏览器脚本结束标记');
-        return text.slice(start + BROWSER_START.length, end).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
-    }
-    return readFileSync(new URL('./xuexitong-console.js', import.meta.url), 'utf8');
+    if (!sourcePath) throw new Error('请通过 start-local-service.cmd 启动本地服务');
+    const text = readFileSync(sourcePath, 'utf8');
+    const start = text.indexOf(BROWSER_START);
+    if (start < 0) throw new Error('单文件启动器缺少浏览器脚本起始标记');
+    const end = text.indexOf(BROWSER_END, start + BROWSER_START.length);
+    if (end < 0) throw new Error('单文件启动器缺少浏览器脚本结束标记');
+    return text.slice(start + BROWSER_START.length, end).replace(/^\r?\n/, '').replace(/\r?\n$/, '');
 }
 const allowedOrigin = (origin) => /^https:\/\/([a-z0-9-]+\.)*chaoxing\.com$/i.test(origin || '');
 
@@ -499,7 +497,7 @@ const server = createServer(async (req, res) => {
         return;
     }
     if (req.headers['x-xuexitong-token'] !== token) {
-        send(res, 403, { error: '本地令牌不匹配，请重新复制控制台脚本' }, origin);
+        send(res, 403, { error: '本地令牌不匹配，请刷新学习通页面后重新点击书签' }, origin);
         return;
     }
     if (req.method === 'GET' && req.url === '/health') {
@@ -623,7 +621,7 @@ console.error('请在学习通课程播放页的控制台执行本脚本');
 return;
 }
 if (!DIRECT_MODE && LOCAL_TOKEN === '__LOCAL_TOKEN__') {
-console.error('请先启动 DeepSeek 本地服务，再复制更新后的 xuexitong-console.js');
+console.error('请先启动 DeepSeek 本地服务，再点击书签注入');
 return;
 }
 

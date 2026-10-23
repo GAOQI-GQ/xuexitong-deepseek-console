@@ -45,6 +45,21 @@
 
 脚本启动后会自动开始播放与答题。
 
+### 方式二：用书签启动（可选，不用每次复制脚本）
+
+本地服务还提供 `http://127.0.0.1:37841/script`。书签每次点击都会拉取本次启动、已注入新令牌的脚本，所以服务重启后也不需要修改书签。
+
+1. 确认本地服务已在运行（`start-local-service.cmd` 窗口不要关）。
+2. 在 Edge 按 `Ctrl+Shift+O` 打开收藏夹管理，添加一个新收藏夹。
+3. 名称填“学习通自动答题”，网址填下面这一整行（必须以 `javascript:` 开头）：
+
+```javascript
+javascript:(async()=>{try{const r=await fetch('http://127.0.0.1:37841/script',{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const s=document.createElement('script');s.textContent=await r.text();document.documentElement.appendChild(s);s.remove()}catch(e){alert('注入失败：'+e.message)}})()
+```
+
+4. 打开学习通课程播放页，点击书签即可注入，不需要按 `F12`。
+5. 如果点击后没有反应，可能是页面 CSP 拦截了内联脚本，改用上面的复制粘贴方式。
+
 ## 密钥记忆
 
 - 勾选“记住密钥”后，Key 会使用 Windows 当前用户的 DPAPI 加密，保存在 `%APPDATA%\xuexitong-deepseek\config.json`，下次启动自动加载，无需重新输入。

@@ -448,6 +448,7 @@ server.listen(PORT, '127.0.0.1', () => {
         console.log('尚未设置 API Key，正在打开设置窗口...');
         openSetupPage();
     }
-    console.log('下一步：复制同目录 xuexitong-console.js 的全部内容，粘贴到学习通页面的 Edge 控制台并按 Enter。');
+    console.log('方式一：复制同目录 xuexitong-console.js 的全部内容，粘贴到学习通页面的 Edge 控制台并按 Enter。');
+    console.log('方式二（推荐）：在学习通页面点击“学习通自动答题”书签，自动拉取本次启动的脚本，无需 DevTools。');
     console.log('关闭本窗口即可停止服务。');
 });

@@ -740,6 +740,10 @@ let quizBusy = false;
 let videoQuizBusy = false;
 let videoQuizTimer = null;
 let videoQuizRetryAt = 0;
+let videoQuizSkipAt = 0;
+let videoQuizStuckSince = 0;
+let activeVideoQuiz = null;
+let leaveDialogClickedAt = 0;
 let stopped = false;
 const originalDestroy = app.destroy.bind(app);
 app.destroy = function () {
@@ -914,6 +918,57 @@ const generic = findButton(doc, '下一节');
 if (generic) return generic;
 }
 return null;
+}
+
+function findLeaveChapterDialog() {
+const marker = /当前章节还有任务点未完成|还有任务点未完成/;
+for (const doc of courseDocuments()) {
+if (!doc.body) continue;
+if (!String(doc.body.textContent || '').includes('任务点未完成')) continue;
+let walker;
+try {
+walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+} catch (_) { continue; }
+let node;
+while ((node = walker.nextNode())) {
+if (!marker.test(clean(node.textContent))) continue;
+let scope = node.parentElement;
+let candidate = null;
+for (let depth = 0; scope && depth < 8; depth++, scope = scope.parentElement) {
+if (!visible(scope)) { candidate = null; break; }
+const full = clean(scope.innerText);
+if (full.length > 800) break;
+if (!marker.test(full)) continue;
+candidate = scope;
+if (scope.querySelector('.layui-layer-btn0, .bluebtn, .sure, [role="dialog"] button') ||
+findButtonIn(scope, '去完成') || findButtonIn(scope, '确定') || findButtonIn(scope, '确认')) break;
+}
+if (candidate) return candidate;
+}
+}
+return null;
+}
+
+function findLeaveChapterDialogButton(dialog) {
+for (const label of ['去完成', '确定', '确认', '继续学习', '下一节']) {
+const button = findButtonIn(dialog, label);
+if (button) return button;
+}
+const primary = dialog.querySelector('.layui-layer-btn0, .bluebtn, .sure, [role="dialog"] button');
+return visible(primary) ? primary : null;
+}
+
+function confirmLeaveChapterDialog() {
+if (Date.now() - leaveDialogClickedAt < 2000) return false;
+const dialog = findLeaveChapterDialog();
+if (!dialog) return false;
+const button = findLeaveChapterDialogButton(dialog);
+if (!button) return false;
+leaveDialogClickedAt = Date.now();
+console.log('%c检测到“当前章节还有任务点未完成”弹窗，自动点击“去完成”继续', 'color:#FF9800');
+button.scrollIntoView({ block: 'center' });
+button.click();
+return true;
 }
 
 async function revealQuizQuestions() {
@@ -1122,6 +1177,7 @@ let skipped = 0;
 let emptySince = 0;
 let clickedAt = 0;
 let nextLogAt = 0;
+let dialogClicks = 0;
 const clickNext = async () => {
 let button = findNextButton();
 for (let retry = 0; !button && retry < 6 && !stopped; retry++) {
@@ -1143,6 +1199,12 @@ let stepReady = false;
 for (let attempt = 0; attempt < 600; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 await sleep(500);
+if (dialogClicks < 5 && confirmLeaveChapterDialog()) {
+dialogClicks++;
+clickedAt = Date.now();
+nextLogAt = clickedAt + 15000;
+emptySince = 0;
+}
 currentStep = app._currentStepTitle();
 if (currentStep === '章节测验' && currentStep !== previousStep) {
 stepReady = true;
@@ -1383,9 +1445,63 @@ return;
 
 function videoQuizState(signature) {
 if (!videoQuizStates.has(signature)) {
-videoQuizStates.set(signature, { attempts: 0, tried: [], correctBefore: -1, lastSubmittedAt: 0 });
+videoQuizStates.set(signature, {
+signature,
+question: null,
+attempts: 0,
+tried: [],
+correctBefore: -1,
+lastSubmittedAt: 0,
+skipCount: 0,
+});
 }
 return videoQuizStates.get(signature);
+}
+
+function videoQuizMaxAttempts(question) {
+const count = question && Array.isArray(question.options) ? question.options.length : 0;
+return Math.max(MAX_VIDEO_QUIZ_ATTEMPTS, Math.min(8, count + 1));
+}
+
+function findVisibleVideoQuizResult() {
+for (const doc of videoQuizDocuments()) {
+if (!doc.body) continue;
+const bodyText = String(doc.body.textContent || '');
+if (!/回答错误|答错了|答案错误|回答不正确|您的回答正确|回答正确|答案正确|答对了/.test(bodyText)) continue;
+let walker;
+try {
+walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+} catch (_) { continue; }
+let node;
+while ((node = walker.nextNode())) {
+const text = clean(node.textContent);
+if (!isVideoQuizWrong(text) && !isVideoQuizSuccess(text)) continue;
+let scope = node.parentElement;
+let picked = null;
+for (let depth = 0; scope && depth < 6; depth++, scope = scope.parentElement) {
+if (!visible(scope)) { picked = null; break; }
+if (clean(scope.innerText).length > 1500) break;
+if (!picked) picked = scope;
+}
+if (picked) return { card: picked, wrong: isVideoQuizWrong(text), success: isVideoQuizSuccess(text) };
+}
+}
+return null;
+}
+
+function skipVideoQuizToNext(reason) {
+if (Date.now() - videoQuizSkipAt < 5000) return false;
+const button = findNextButton();
+if (!button) {
+console.warn(`%c视频弹题${reason}，但页面上没有“下一节”按钮，请手动完成`, 'color:#F44336');
+return false;
+}
+videoQuizSkipAt = Date.now();
+videoQuizStuckSince = 0;
+console.warn(`%c视频弹题${reason}，自动点击“下一节”继续`, 'color:#FF9800');
+button.scrollIntoView({ block: 'center' });
+button.click();
+return true;
 }
 
 function correctCount(text) {
@@ -1458,17 +1574,18 @@ const letters = question.kind === '多选题' ? shownLetters : [shownLetters[0]]
 console.log(`%c使用页面提示的正确答案：${letters.join('')}`, 'color:#4CAF50');
 return letters;
 }
-const last = state.tried[state.tried.length - 1];
-if (!last) {
+const tried = state.tried.filter((entry) => Array.isArray(entry) && entry.length);
+if (!tried.length) {
 const answers = validateAnswers([question], await askDeepSeek([question]));
 return answers.get(1);
 }
-const hint = `（注意：上一次选择 ${last.join('、')} 被判为错误，请换一个不同的答案，不要重复上次的选择。）`;
+const triedText = tried.map((entry) => entry.join('、')).join('；');
+const hint = `（注意：以下选择都已被判为错误：${triedText}。请重新思考题目，必须换一个没有试过的答案，不要重复这些选择。）`;
 const hinted = { ...question, title: `${question.title}${hint}`.slice(0, 500) };
 let letters = null;
 try {
 letters = validateAnswers([question], await askDeepSeek([hinted])).get(1);
-if (letters && sameLetters(letters, last)) letters = null;
+if (letters && tried.some((entry) => sameLetters(letters, entry))) letters = null;
 } catch (error) {
 console.warn('视频弹题重答请求失败，改用排除法:', error);
 }
@@ -1482,24 +1599,51 @@ async function handleVideoQuiz() {
 if (stopped || videoQuizBusy || app._isChapterTest() || app._nextUnitPending) return;
 if (Date.now() < videoQuizRetryAt) return;
 let question = findVideoQuizCard();
-if (!question) return;
+const stored = activeVideoQuiz;
+if (!question && stored && stored.card && stored.card.isConnected && visible(stored.card)) {
+question = stored;
+}
+if (!question) {
+const result = stored && stored.card && stored.card.isConnected && visible(stored.card) ? findVisibleVideoQuizResult() : null;
+if (result && result.wrong) {
+if (!videoQuizStuckSince) videoQuizStuckSince = Date.now();
+if (Date.now() - videoQuizStuckSince >= 8000) skipVideoQuizToNext('答错后 8 秒内仍无法重新选择');
+} else {
+activeVideoQuiz = null;
+videoQuizStuckSince = 0;
+}
+return;
+}
+activeVideoQuiz = question;
+videoQuizStuckSince = 0;
 const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
 const signatureTitle = question.title
 .replace(/回答(?:错误|正确)[\s\S]*$/, '')
 .replace(/正确答案\s*[：:][A-H\s、,，]*/g, '')
 .trim();
-const signature = `${question.kind}:${signatureTitle}:${question.options.map((option) => `${option.letter}${option.text}`).join('|')}`;
-if (attemptedVideoQuizzes.has(signature)) return;
+const signature = `${question.kind}:${signatureTitle}:${question.options.map((option) => option.letter).join('')}`;
+const state = videoQuizState(signature);
+state.signature = signature;
+state.question = question;
+if (attemptedVideoQuizzes.has(signature)) {
+const result = findVisibleVideoQuizResult();
+if (result && result.wrong && state.skipCount < 3) {
+state.skipCount++;
+skipVideoQuizToNext('已尝试过仍未通过');
+}
+return;
+}
 if (video && !video.paused) {
 try { video.pause(); } catch (_) { /* 忽略 */ }
 }
-const state = videoQuizState(signature);
 const text = clean(question.card.innerText);
+const result = findVisibleVideoQuizResult();
 const currentCorrect = correctCount(text);
 const successByCounter = state.correctBefore >= 0 && currentCorrect > state.correctBefore;
-const successByText = state.attempts > 0 && isVideoQuizSuccess(text);
+const successByText = state.attempts > 0 && (isVideoQuizSuccess(text) || Boolean(result && result.success));
 if (successByCounter || successByText) {
 attemptedVideoQuizzes.add(signature);
+activeVideoQuiz = null;
 console.log('%c视频弹题回答正确', 'color:#4CAF50');
 videoQuizBusy = true;
 app._videoQuizActive = true;
@@ -1516,12 +1660,16 @@ if (typeof app._tryResumePlayback === 'function') app._tryResumePlayback('video-
 }, 600);
 return;
 }
-if (state.attempts >= MAX_VIDEO_QUIZ_ATTEMPTS) {
+if (state.attempts >= videoQuizMaxAttempts(question)) {
 attemptedVideoQuizzes.add(signature);
-console.error(`视频弹题已尝试 ${state.attempts} 次仍未通过，请手动完成`);
+console.error(`视频弹题已尝试 ${state.attempts} 次仍未通过`);
+if (state.skipCount < 3) {
+state.skipCount++;
+skipVideoQuizToNext('多次作答仍未通过');
+}
 return;
 }
-if (state.attempts > 0 && isVideoQuizWrong(text)) {
+if (state.attempts > 0 && (isVideoQuizWrong(text) || Boolean(result && result.wrong))) {
 console.warn('%c检测到上一次回答错误，准备重新作答', 'color:#FF9800');
 }
 const shownLetters = state.attempts > 0 ? shownCorrectLetters(text) : null;
@@ -1535,6 +1683,8 @@ console.log('%c点击弹题的“重新回答”按钮', 'color:#607D8B');
 retry.click();
 await sleep(600);
 question = findVideoQuizCard() || question;
+state.question = question;
+activeVideoQuiz = question;
 }
 }
 if (state.attempts === 0 && currentCorrect >= 0) state.correctBefore = currentCorrect;
@@ -1589,7 +1739,9 @@ text: clean(doc.body?.innerText || '').slice(0, 500),
 };
 
 videoQuizTimer = setInterval(() => {
-if (stopped || videoQuizBusy) return;
+if (stopped) return;
+confirmLeaveChapterDialog();
+if (videoQuizBusy) return;
 handleVideoQuiz().catch((error) => console.error('视频弹题检测失败:', error));
 }, 2000);
 

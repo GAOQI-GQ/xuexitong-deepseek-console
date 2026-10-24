@@ -1627,9 +1627,13 @@ return null;
 function videoQuizSuccessVisible() {
 const result = findVisibleVideoQuizResult();
 if (result && result.success) return true;
-// 正常播放时视频里也可能出现普通“继续学习”入口；只有视频暂停（弹题面板打开）时才据此判断通过
+// 结果面板的正文有时会被拆成多个节点而识别失败；只要播放器里出现“继续学习”，
+// 且视频文档确实带着弹题面板的文字，就按“已通过”处理
 const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
-if (video && !video.paused) return false;
+const doc = video && video.ownerDocument;
+if (!doc || !doc.body) return false;
+const context = String(doc.body.textContent || '');
+if (!activeVideoQuiz && !/(共\s*\d+\s*题|已答对\s*\d+\s*题|回答正确|答对了|恭喜你)/.test(context)) return false;
 return Boolean(findVideoQuizContinueButton());
 }
 

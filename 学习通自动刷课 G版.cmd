@@ -2040,7 +2040,26 @@ this._guardLastTime = current;
 if (video.ended && this._isPlaying) {
 console.log("%c检测到视频结束，准备切换下一个...", "color:#9C27B0");
 this._isPlaying = false;
+this._nearEndSince = 0;
 setTimeout(() => this.nextUnit(), 1000);
+} else if (this._isPlaying) {
+const duration = Number(video.duration || 0);
+const current = Number(video.currentTime || 0);
+const nearEnd = Number.isFinite(duration) && duration > 0 && current > 0 && duration - current <= 1.5;
+if (nearEnd) {
+if (!this._nearEndSince) {
+this._nearEndSince = Date.now();
+console.log(`%c视频已停在结尾（${current.toFixed(1)}/${duration.toFixed(1)} 秒），等待结束事件...`, "color:#FF9800");
+} else if (Date.now() - this._nearEndSince >= 6000) {
+this._nearEndSince = 0;
+console.log("%c长时间未收到视频结束事件，自动切换下一节", "color:#FF9800");
+this._isPlaying = false;
+this._clearCheckInterval();
+setTimeout(() => this.nextUnit(), 800);
+}
+} else {
+this._nearEndSince = 0;
+}
 }
 } catch (e) {
 console.error("视频状态检查失败:", e);
@@ -2054,6 +2073,7 @@ _delayedNextUnitTimer: null,
 _guardLastTime: 0,
 _guardLastWallTs: 0,
 _guardLastResumeTs: 0,
+_nearEndSince: 0,
 async play() {
 try {
 if (this._isChapterTest()) {

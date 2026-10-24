@@ -742,6 +742,7 @@ let videoQuizTimer = null;
 let videoQuizRetryAt = 0;
 let videoQuizSkipAt = 0;
 let videoQuizStuckSince = 0;
+let videoQuizDiagAt = 0;
 let videoQuizContinueAt = 0;
 let videoEndedNextTimer = 0;
 let activeVideoQuiz = null;
@@ -1317,10 +1318,19 @@ const docs = [];
 const add = (doc) => {
 if (doc && !docs.includes(doc)) docs.push(doc);
 };
+const visit = (doc, depth) => {
+if (!doc || depth > 3 || docs.includes(doc)) return;
+add(doc);
+let frames = [];
+try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) { return; }
+for (const frame of frames) {
+try { visit(frame.contentDocument, depth + 1); } catch (_) { /* 跨域 */ }
+}
+};
 const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
-if (video && video.ownerDocument) add(video.ownerDocument);
-for (const doc of courseDocuments()) add(doc);
-add(document);
+if (video && video.ownerDocument) visit(video.ownerDocument, 0);
+for (const doc of courseDocuments()) visit(doc, 0);
+visit(document, 0);
 return docs;
 }
 
@@ -1354,6 +1364,66 @@ const candidates = Array.from(card.querySelectorAll('button,a,input[type="button
 .filter((el) => visible(el) && clean(el.value || el.innerText) === label);
 return candidates.find((el) => /^(BUTTON|A|INPUT)$/.test(el.tagName)) ||
 candidates.find((el) => !Array.from(el.children).some((child) => clean(child.innerText) === label)) || null;
+}
+
+const CONTINUE_LABELS = ['继续学习', '继续播放', '继续观看', '继续'];
+const DISMISS_LABELS = [...CONTINUE_LABELS, '下一题', '知道了', '关闭', '确定'];
+
+function controlText(el) {
+try { return clean(el.value || el.innerText || el.textContent || ''); } catch (_) { return ''; }
+}
+
+// 按文字找按钮：允许按钮带图标或多余空格（innerText 不再严格等于标签），并优先取最内层元素
+function findTextControl(root, labels) {
+if (!root || typeof root.querySelectorAll !== 'function') return null;
+const nodes = Array.from(root.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],div,span,p,li'));
+const found = [];
+for (const el of nodes) {
+if (!visible(el)) continue;
+const text = controlText(el);
+if (!text || text.length > 18) continue;
+const label = labels.find((item) => text.length <= item.length + 4 && text.includes(item));
+if (!label) continue;
+const childSame = Array.from(el.children).some((child) => controlText(child) === text);
+const rank = /^(BUTTON|A|INPUT)$/.test(el.tagName) ? 0 : el.getAttribute('role') === 'button' ? 1 : 2;
+found.push({ el, text, childSame, rank });
+}
+if (!found.length) return null;
+found.sort((a, b) => Number(a.childSame) - Number(b.childSame) || a.rank - b.rank || a.text.length - b.text.length);
+return found[0].el;
+}
+
+// 用完整的鼠标事件序列点击，兼容只监听 mousedown/pointerdown 的播放器按钮
+function fireClick(el) {
+if (!el) return false;
+const doc = el.ownerDocument || document;
+const win = doc.defaultView || window;
+try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) { /* 忽略 */ }
+let rect = { left: 0, top: 0, width: 0, height: 0 };
+try { rect = el.getBoundingClientRect(); } catch (_) { /* 忽略 */ }
+const options = {
+bubbles: true,
+cancelable: true,
+composed: true,
+view: win,
+button: 0,
+clientX: rect.left + rect.width / 2,
+clientY: rect.top + rect.height / 2,
+};
+const dispatch = (type, Ctor) => {
+try { el.dispatchEvent(new Ctor(type, options)); } catch (_) { /* 忽略单个事件失败 */ }
+};
+const Pointer = typeof win.PointerEvent === 'function' ? win.PointerEvent : win.MouseEvent;
+dispatch('pointerover', Pointer);
+dispatch('pointerdown', Pointer);
+dispatch('mousedown', win.MouseEvent);
+dispatch('pointerup', Pointer);
+dispatch('mouseup', win.MouseEvent);
+try {
+if (typeof el.click === 'function') el.click();
+else el.dispatchEvent(new win.MouseEvent('click', options));
+} catch (_) { /* 忽略 */ }
+return true;
 }
 
 function parseTextOptions(card) {
@@ -1533,20 +1603,34 @@ function isVideoQuizWrong(text) {
 return /回答错误|答错了|答错啦|答案错误|回答不正确|不完全正确|真遗憾|很遗憾|再接再厉|不对哦|差一点|再想想|未答对|没答对|答得不对|请重新作答|重新作答|再试一次|重新回答|再次作答/.test(text);
 }
 
-function findVideoQuizContinueButton() {
-for (const doc of videoQuizDocuments()) {
-if (!doc.documentElement) continue;
-for (const label of ['继续学习', '继续播放', '继续观看', '继续', '下一题', '知道了']) {
-const button = findButtonIn(doc.documentElement, label);
-if (button) return button;
+function videoQuizQuizText(doc) {
+try { return String(doc.body?.textContent || ''); } catch (_) { return ''; }
 }
+
+// 播放器内的“继续学习”按钮只要可见，就说明这轮弹题已经通过
+function findVideoQuizContinueButton() {
+const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
+const videoDoc = video && video.ownerDocument;
+if (videoDoc) {
+const inVideo = findTextControl(videoDoc, CONTINUE_LABELS);
+if (inVideo) return inVideo;
+}
+for (const doc of videoQuizDocuments()) {
+if (!doc.documentElement || doc === videoDoc) continue;
+if (!/(共\s*\d+\s*题|已答对\s*\d+\s*题|回答正确|答对了|恭喜你)/.test(videoQuizQuizText(doc))) continue;
+const button = findTextControl(doc, CONTINUE_LABELS);
+if (button) return button;
 }
 return null;
 }
 
 function videoQuizSuccessVisible() {
 const result = findVisibleVideoQuizResult();
-return Boolean(result && result.success);
+if (result && result.success) return true;
+// 正常播放时视频里也可能出现普通“继续学习”入口；只有视频暂停（弹题面板打开）时才据此判断通过
+const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
+if (video && !video.paused) return false;
+return Boolean(findVideoQuizContinueButton());
 }
 
 function clickVideoQuizContinue() {
@@ -1556,8 +1640,7 @@ if (!button) return false;
 videoQuizContinueAt = Date.now();
 app._videoQuizPending = false;
 console.log('%c视频弹题已通过，自动点击“继续学习”', 'color:#4CAF50');
-button.scrollIntoView({ block: 'center' });
-button.click();
+fireClick(button);
 if (app._videoEndedDuringQuiz) scheduleVideoEndedNext(1500);
 return true;
 }
@@ -1586,34 +1669,35 @@ if (typeof app.nextUnit === 'function') app.nextUnit();
 }
 app._scheduleVideoEndedNext = scheduleVideoEndedNext;
 
+const RETRY_LABELS = ['重新回答', '重新作答', '重新答题', '再次作答', '再试一次', '重新选择', '重试', '继续作答', '重做'];
+
 function findRetryButton(card) {
 for (let scope = card, depth = 0; scope && depth < 3; depth++, scope = scope.parentElement) {
-for (const label of ['重新回答', '重新作答', '重新答题', '再次作答', '再试一次', '重新选择', '重试', '继续作答', '重做']) {
-const button = findButtonIn(scope, label);
+const button = findTextControl(scope, RETRY_LABELS);
 if (button) return button;
-}
 }
 return null;
 }
 
 function dismissVideoQuiz(card) {
 for (let scope = card, depth = 0; scope && depth < 4; depth++, scope = scope.parentElement) {
-for (const label of ['继续学习', '继续播放', '继续观看', '继续', '下一题', '知道了', '关闭', '确定']) {
-const button = findButtonIn(scope, label);
+const button = findTextControl(scope, DISMISS_LABELS);
 if (button) {
-button.click();
+fireClick(button);
 return true;
 }
 }
+const globalButton = findVideoQuizContinueButton();
+if (globalButton) {
+fireClick(globalButton);
+return true;
 }
 const doc = card.ownerDocument;
 if (doc && doc.documentElement) {
-for (const label of ['继续学习', '继续播放', '继续观看']) {
-const button = findButtonIn(doc.documentElement, label);
+const button = findTextControl(doc.documentElement, CONTINUE_LABELS);
 if (button) {
-button.click();
+fireClick(button);
 return true;
-}
 }
 }
 return false;
@@ -1701,7 +1785,23 @@ async function handleVideoQuiz() {
 if (stopped || videoQuizBusy || app._isChapterTest()) return;
 if (videoQuizSuccessVisible()) {
 app._videoQuizPending = true;
-clickVideoQuizContinue();
+if (!clickVideoQuizContinue() && !findVideoQuizContinueButton() && Date.now() - videoQuizDiagAt > 10000) {
+videoQuizDiagAt = Date.now();
+const snippets = [];
+for (const doc of videoQuizDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('button,a,input[type="button"],[role="button"],div,span')); } catch (_) { continue; }
+for (const el of nodes) {
+const text = controlText(el);
+if (!text || text.length > 30 || !/继续|下一题|查看解析/.test(text)) continue;
+if (!visible(el)) continue;
+snippets.push(`${el.tagName}.${String(el.className || '').slice(0, 30)}="${text}"`);
+if (snippets.length >= 12) break;
+}
+if (snippets.length >= 12) break;
+}
+console.warn('%c已看到弹题通过提示，但没找到“继续学习”按钮。可见候选：', 'color:#FF9800', snippets);
+}
 return;
 }
 if (app._nextUnitPending) return;
@@ -1753,9 +1853,7 @@ const result = findVisibleVideoQuizResult();
 const currentCorrect = correctCount(text);
 const successByCounter = state.correctBefore >= 0 && currentCorrect > state.correctBefore;
 const successByText = state.attempts > 0 && (isVideoQuizSuccess(text) || Boolean(result && result.success));
-const successByDismiss = state.attempts > 0 && Boolean(
-findButtonIn(question.card, '继续学习') || findButtonIn(question.card, '继续播放') ||
-findButtonIn(question.card, '继续观看'));
+const successByDismiss = state.attempts > 0 && Boolean(findTextControl(question.card, CONTINUE_LABELS));
 if (successByCounter || successByText || successByDismiss) {
 attemptedVideoQuizzes.add(signature);
 console.log('%c视频弹题回答正确', 'color:#4CAF50');

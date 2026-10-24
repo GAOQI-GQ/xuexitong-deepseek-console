@@ -1084,6 +1084,11 @@ for (const letter of answers.get(i + 1)) {
 if (stopped) throw new Error('脚本已停止');
 const option = q.options.find((item) => item.letter === letter);
 if (!option?.element?.isConnected) throw new Error(`第 ${i + 1} 题选项已变化`);
+const existingInput = option.element.matches('input') ? option.element : option.element.querySelector('input');
+const alreadyChecked = Boolean(existingInput?.checked) ||
+option.element.getAttribute('aria-checked') === 'true' ||
+Boolean(option.element.querySelector('[aria-checked="true"], .checked, .selected, .is-checked, .checkbox-checked'));
+if (alreadyChecked) continue;
 option.element.scrollIntoView({ block: 'center' });
 const before = q.card.outerHTML;
 option.element.click();
@@ -1467,7 +1472,7 @@ function findVisibleVideoQuizResult() {
 for (const doc of videoQuizDocuments()) {
 if (!doc.body) continue;
 const bodyText = String(doc.body.textContent || '');
-if (!/回答错误|答错了|答案错误|回答不正确|您的回答正确|回答正确|答案正确|答对了/.test(bodyText)) continue;
+if (!/回答错误|答错了|答错啦|答案错误|回答不正确|不完全正确|真遗憾|很遗憾|再接再厉|您的回答正确|回答正确|答案正确|答对了/.test(bodyText)) continue;
 let walker;
 try {
 walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
@@ -1514,7 +1519,7 @@ return /您的回答正确|回答正确[！!。\s]|回答正确$|答案正确[�
 }
 
 function isVideoQuizWrong(text) {
-return /回答错误|答错了|答案错误|回答不正确|请重新作答|重新作答|再试一次|重新回答|再次作答/.test(text);
+return /回答错误|答错了|答错啦|答案错误|回答不正确|不完全正确|真遗憾|很遗憾|再接再厉|请重新作答|重新作答|再试一次|重新回答|再次作答/.test(text);
 }
 
 function findRetryButton(card) {
@@ -1595,6 +1600,39 @@ if (!fallback) throw new Error('所有选项都已尝试过，仍未答对，请
 return fallback;
 }
 
+function videoQuizOptionChecked(option) {
+const el = option && option.element;
+if (!el || !el.isConnected) return false;
+const input = el.matches('input') ? el : el.querySelector('input');
+if (input && input.checked) return true;
+if (el.getAttribute('aria-checked') === 'true') return true;
+return Boolean(el.querySelector('[aria-checked="true"], .checked, .selected, .is-checked, .checkbox-checked'));
+}
+
+async function clearVideoQuizSelections(question) {
+let cleared = 0;
+for (const option of question.options) {
+if (!videoQuizOptionChecked(option)) continue;
+const el = option.element;
+el.scrollIntoView({ block: 'center' });
+const targets = [el];
+const input = el.matches('input') ? el : el.querySelector('input');
+if (input && input !== el) targets.push(input);
+const label = el.closest('label') || el.querySelector('label');
+if (label && !targets.includes(label)) targets.push(label);
+for (const target of targets) {
+target.click();
+await sleep(120);
+if (!videoQuizOptionChecked(option)) {
+cleared++;
+break;
+}
+}
+}
+if (cleared) console.log(`%c多选题重答前已清空 ${cleared} 个已勾选选项`, 'color:#607D8B');
+return cleared;
+}
+
 async function handleVideoQuiz() {
 if (stopped || videoQuizBusy || app._isChapterTest() || app._nextUnitPending) return;
 if (Date.now() < videoQuizRetryAt) return;
@@ -1618,6 +1656,8 @@ activeVideoQuiz = question;
 videoQuizStuckSince = 0;
 const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
 const signatureTitle = question.title
+.replace(/共\s*\d+\s*题[，,]\s*已答对\s*\d+\s*题/g, '')
+.replace(/真遗憾[，,]?再?再接再厉[！!。]?/g, '')
 .replace(/回答(?:错误|正确)[\s\S]*$/, '')
 .replace(/正确答案\s*[：:][A-H\s、,，]*/g, '')
 .trim();
@@ -1687,8 +1727,15 @@ state.question = question;
 activeVideoQuiz = question;
 }
 }
+await clearVideoQuizSelections(question);
+question = findVideoQuizCard() || question;
+state.question = question;
+activeVideoQuiz = question;
 if (state.attempts === 0 && currentCorrect >= 0) state.correctBefore = currentCorrect;
 const letters = await chooseVideoQuizLetters(question, state, shownLetters);
+const targetLetters = new Set(letters);
+const stale = question.options.filter((option) => !targetLetters.has(option.letter) && videoQuizOptionChecked(option));
+if (state.attempts > 0 && stale.length) throw new Error(`多选题旧选项未能取消（${stale.map((option) => option.letter).join('、')}），暂不提交`);
 console.log(`%c视频弹题第 ${state.attempts + 1} 次作答：${letters.join('')}`, 'color:#2196F3');
 await selectAnswers([question], new Map([[1, letters]]));
 const submit = findButtonIn(question.card, '提交');

@@ -632,8 +632,8 @@ previousApp.destroy();
 if (PAGE.__xuexitongPlayerV3 && typeof PAGE.__xuexitongPlayerV3.destroy === 'function') {
 PAGE.__xuexitongPlayerV3.destroy();
 }
-if (PAGE.__xuexitongPlayerV4DeepSeek && typeof PAGE.__xuexitongPlayerV4DeepSeek.destroy === 'function') {
-PAGE.__xuexitongPlayerV4DeepSeek.destroy();
+if (PAGE.__xuexitongPlayerV800DeepSeek && typeof PAGE.__xuexitongPlayerV800DeepSeek.destroy === 'function') {
+PAGE.__xuexitongPlayerV800DeepSeek.destroy();
 }
 if (PAGE[BOOT_TIMER_KEY]) {
 clearInterval(PAGE[BOOT_TIMER_KEY]);
@@ -2205,7 +2205,7 @@ get cellData() {
 return this._cellData;
 },
 run() {
-console.log("%c=== 学习通视频与章节测验助手 V4 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
+console.log("%c=== 学习通视频与章节测验助手 V800 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
 this._nextUnitPending = false;
 this._chapterAdvanceTimes = 0;
 this._getTreeContainer();
@@ -2586,7 +2586,7 @@ this._initCellData();
 this.play();
 }, 1800);
 };
-$(document).off('click.xuexitongPlayerV4', '.prev_white').on('click.xuexitongPlayerV4', '.prev_white', (e) => {
+$(document).off('click.xuexitongPlayerV800', '.prev_white').on('click.xuexitongPlayerV800', '.prev_white', (e) => {
 const text = ($(e.currentTarget).text() || "").replace(/\s+/g, "");
 if (text.includes("视频") || text.includes("章节测验")) {
 console.log(`%c检测到步骤切换点击：${text}，准备重新识别页面`, "color:#607D8B");
@@ -3007,7 +3007,7 @@ this._isPlaying = false;
 this._clearCheckInterval();
 this._detachVideoEvents();
 if (this._delayedNextUnitTimer) clearTimeout(this._delayedNextUnitTimer);
-$(document).off('.xuexitongPlayerV4');
+$(document).off('.xuexitongPlayerV800');
 if (this._pageGuards) {
 const { preventPause, resumePlaybackNow } = this._pageGuards;
 document.removeEventListener('mouseleave', preventPause);

@@ -1624,16 +1624,24 @@ if (button) return button;
 return null;
 }
 
-function videoQuizSuccessVisible() {
-const result = findVisibleVideoQuizResult();
-if (result && result.success) return true;
-// 结果面板的正文有时会被拆成多个节点而识别失败；只要播放器里出现“继续学习”，
-// 且视频文档确实带着弹题面板的文字，就按“已通过”处理
+function videoQuizBodyFeedback() {
 const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
 const doc = video && video.ownerDocument;
-if (!doc || !doc.body) return false;
-const context = String(doc.body.textContent || '');
-if (!activeVideoQuiz && !/(共\s*\d+\s*题|已答对\s*\d+\s*题|回答正确|答对了|恭喜你)/.test(context)) return false;
+const text = String(doc && doc.body ? doc.body.textContent || '' : '');
+return {
+success: /回答正确|答案正确|答对了|答对啦|全部正确|完全正确|太棒了|恭喜你|恭喜答对/.test(text),
+wrong: /回答错误|答错了|答错啦|答案错误|回答不正确|不完全正确|真遗憾|很遗憾|再接再厉|未答对|没答对|答得不对/.test(text),
+};
+}
+
+function videoQuizSuccessVisible() {
+const feedback = videoQuizBodyFeedback();
+// 页面明确显示答错、又没有答对文字时，一律按“未通过”处理。
+// 否则答错后选项还没清空、面板仍停在原题时，会被误判成已通过而不再重答。
+if (feedback.wrong && !feedback.success) return false;
+const result = findVisibleVideoQuizResult();
+if (result && result.success) return true;
+if (feedback.wrong || !feedback.success) return false;
 return Boolean(findVideoQuizContinueButton());
 }
 
@@ -1725,7 +1733,12 @@ if (!untried.length) return null;
 return question.kind === '多选题' ? untried : [untried[0]];
 }
 
-async function chooseVideoQuizLetters(question, state, shownLetters) {
+function videoQuizFeedbackText(text) {
+const match = String(text || '').match(/(真遗憾[^。！!\n]*|很遗憾[^。！!\n]*|再接再厉[^。！!\n]*|回答错误[^。！!\n]*|答错了[^。！!\n]*|答案错误[^。！!\n]*|不完全正确[^。！!\n]*|未答对[^。！!\n]*|没答对[^。！!\n]*)/);
+return match ? clean(match[1]) : '';
+}
+
+async function chooseVideoQuizLetters(question, state, shownLetters, feedbackText) {
 if (shownLetters && shownLetters.length && shownLetters.every((letter) => question.options.some((option) => option.letter === letter))) {
 const letters = question.kind === '多选题' ? shownLetters : [shownLetters[0]];
 console.log(`%c使用页面提示的正确答案：${letters.join('')}`, 'color:#4CAF50');
@@ -1737,7 +1750,10 @@ const answers = validateAnswers([question], await askDeepSeek([question]));
 return answers.get(1);
 }
 const triedText = tried.map((entry) => entry.join('、')).join('；');
-const hint = `（注意：以下选择都已被判为错误：${triedText}。请重新思考题目，必须换一个没有试过的答案，不要重复这些选择。）`;
+const feedback = videoQuizFeedbackText(feedbackText);
+const feedbackHint = feedback ? `页面反馈：“${feedback}”。` : '';
+const multiHint = question.kind === '多选题' ? '；多选题判错可能是多选了某一项，也可能是漏选了某一项，请逐项重新核对，并选全所有正确项' : '';
+const hint = `（注意：以下选择都已被判为错误：${triedText}。${feedbackHint}请重新审题，必须换一个没有试过的答案，不要重复这些选择${multiHint}。）`;
 const hinted = { ...question, title: `${question.title}${hint}`.slice(0, 500) };
 let letters = null;
 try {
@@ -1745,6 +1761,20 @@ letters = validateAnswers([question], await askDeepSeek([hinted])).get(1);
 if (letters && tried.some((entry) => sameLetters(letters, entry))) letters = null;
 } catch (error) {
 console.warn('视频弹题重答请求失败，改用排除法:', error);
+}
+if (!letters) {
+// AI 仍给出旧答案时，再问一次，并明确要求“与之前所有尝试不同”
+try {
+const strictHint = `（这是一道${question.kind}。上一次提交的答案 ${triedText} 已被页面判错，必须给出与之前所有尝试都不同的答案${multiHint}。）`;
+const strict = { ...question, title: `${question.title}${strictHint}`.slice(0, 500) };
+const second = validateAnswers([question], await askDeepSeek([strict])).get(1);
+if (second && !tried.some((entry) => sameLetters(second, entry))) {
+console.log(`%cAI 重新判断后给出新答案：${second.join('')}`, 'color:#2196F3');
+letters = second;
+}
+} catch (error) {
+console.warn('视频弹题第二次重答请求失败，改用排除法:', error);
+}
 }
 if (letters) return letters;
 const fallback = fallbackLetters(question, state);
@@ -1766,15 +1796,24 @@ let cleared = 0;
 for (const option of question.options) {
 if (!videoQuizOptionChecked(option)) continue;
 const el = option.element;
-el.scrollIntoView({ block: 'center' });
-const targets = [el];
+try { el.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+const targets = [];
+const addTarget = (target) => {
+if (target && !targets.includes(target)) targets.push(target);
+};
+addTarget(el);
 const input = el.matches('input') ? el : el.querySelector('input');
-if (input && input !== el) targets.push(input);
+addTarget(input);
 const label = el.closest('label') || el.querySelector('label');
-if (label && !targets.includes(label)) targets.push(label);
+addTarget(label);
+for (const child of el.querySelectorAll('i,em,span,b,div')) {
+if (child.children.length) continue;
+const className = String(child.className || '');
+if (/check|select|active|box|on/i.test(className) || /^[A-H]$/.test(controlText(child))) addTarget(child);
+}
 for (const target of targets) {
-target.click();
-await sleep(120);
+fireClick(target);
+await sleep(150);
 if (!videoQuizOptionChecked(option)) {
 cleared++;
 break;
@@ -1857,7 +1896,8 @@ const result = findVisibleVideoQuizResult();
 const currentCorrect = correctCount(text);
 const successByCounter = state.correctBefore >= 0 && currentCorrect > state.correctBefore;
 const successByText = state.attempts > 0 && (isVideoQuizSuccess(text) || Boolean(result && result.success));
-const successByDismiss = state.attempts > 0 && Boolean(findTextControl(question.card, CONTINUE_LABELS));
+const successByDismiss = state.attempts > 0 && !isVideoQuizWrong(text) && !(result && result.wrong) &&
+Boolean(findTextControl(question.card, CONTINUE_LABELS));
 if (successByCounter || successByText || successByDismiss) {
 attemptedVideoQuizzes.add(signature);
 console.log('%c视频弹题回答正确', 'color:#4CAF50');
@@ -1920,7 +1960,7 @@ question = findVideoQuizCard() || question;
 state.question = question;
 activeVideoQuiz = question;
 if (state.attempts === 0 && currentCorrect >= 0) state.correctBefore = currentCorrect;
-const letters = await chooseVideoQuizLetters(question, state, shownLetters);
+const letters = await chooseVideoQuizLetters(question, state, shownLetters, text);
 const targetLetters = new Set(letters);
 const stale = question.options.filter((option) => !targetLetters.has(option.letter) && videoQuizOptionChecked(option));
 if (state.attempts > 0 && stale.length) throw new Error(`多选题旧选项未能取消（${stale.map((option) => option.letter).join('、')}），暂不提交`);

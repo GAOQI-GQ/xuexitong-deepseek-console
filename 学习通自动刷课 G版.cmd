@@ -1641,6 +1641,11 @@ if (!button) {
 console.warn(`%c视频弹题${reason}，但页面上没有“下一节”按钮，请手动完成`, 'color:#F44336');
 return false;
 }
+app._quizSkipAttempts = (app._quizSkipAttempts || 0) + 1;
+if (app._quizSkipAttempts > 2) {
+console.warn('%c视频弹题多次未通过、且已两次尝试跳过，为避免反复触发“任务点未完成”弹窗，已暂停自动跳节，请手动完成本题', 'color:#F44336;font-weight:bold');
+return false;
+}
 videoQuizSkipAt = Date.now();
 videoQuizStuckSince = 0;
 app._videoQuizPending = false;
@@ -1713,6 +1718,7 @@ const button = findVideoQuizContinueButton();
 if (!button) return false;
 videoQuizContinueAt = Date.now();
 app._videoQuizPending = false;
+app._quizSkipAttempts = 0;
 console.log('%c视频弹题已通过，自动点击“继续学习”', 'color:#4CAF50');
 fireClick(button);
 if (app._videoEndedDuringQuiz) scheduleVideoEndedNext(1500);
@@ -2148,6 +2154,8 @@ _noVideoRetryTimes: 0,
 _videoQuizActive: false,
 _videoQuizPending: false,
 _videoEndedDuringQuiz: false,
+_quizVideo: null,
+_quizSkipAttempts: 0,
 _checkInterval: null,
 _eventVideoEl: null,
 _boundVideoHandlers: null,

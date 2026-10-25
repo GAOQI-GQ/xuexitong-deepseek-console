@@ -836,7 +836,8 @@ return el ? clean(el.textContent || el.innerText) : '';
 }
 
 const QUIZ_TEXT_PATTERN = /[\[【](单选题|多选题|判断题|填空题|简答题)[\]】]|共\s*\d+\s*题|题量\s*[:：]\s*\d+|开始(答题|测验|考试)|继续(答题|作答)/;
-const QUIZ_DOM_SELECTOR = '.TiMu,.questionLi,.mark_item,.subject,input[type="radio"],input[type="checkbox"]';
+// 注意：.mark_item 是“任务点”区块的样式，图文页里每个任务点都有一个，绝不能当作题目结构
+const QUIZ_DOM_SELECTOR = '.TiMu,.questionLi,.subject,.question-item,.questionBox,.stem';
 
 function quizFrameEvidence() {
 let frame = null;
@@ -880,6 +881,8 @@ try {
 if (!doc.body) continue;
 if (QUIZ_TEXT_PATTERN.test(String(doc.body.textContent || ''))) sawText = true;
 if (doc.querySelector(QUIZ_DOM_SELECTOR)) sawDom = true;
+// 单个复选框/单选框可能只是普通控件，至少要有 2 个才算作答选项
+if (!sawDom && doc.querySelectorAll('input[type="radio"],input[type="checkbox"]').length >= 2) sawDom = true;
 for (const video of doc.querySelectorAll('video')) {
 const rects = video.getClientRects();
 if (rects.length && rects[0].width >= 80 && rects[0].height >= 40) {
@@ -913,19 +916,25 @@ const label = activeCatalogLabel();
 const labelSaysQuiz = /测验|考试|测试|答题/.test(label);
 // 1) 视频还在播：绝不可能是章节测验
 if (probe.videoPlaying) return '视频';
-// 2) 框架里明确没有题目：有视频按视频，没有视频就交给阅读/图文逻辑
+// 2) 内容框架里确实是文章/图片、又没有真正的题目结构：这是阅读/图文任务点
+if (!probe.videoAny) {
+let docPage = false;
+try { docPage = contentFrameDocs().length > 0; } catch (_) { docPage = false; }
+if (docPage) return '';
+}
+// 3) 框架里明确没有题目：有视频按视频，没有视频就交给阅读/图文逻辑
 if (probe.quiz === 'none') {
 if (probe.videoAny) return '视频';
 if (labelSaysQuiz) return title;
 return '';
 }
-// 3) 框架跨域读不到：目录高亮不是测验时，不再当作测验
+// 4) 框架跨域读不到：目录高亮不是测验时，不再当作测验
 if (probe.quiz === 'unknown') {
 if (!labelSaysQuiz && label) return probe.videoAny ? '视频' : '';
 if (probe.videoAny && !labelSaysQuiz) return '视频';
 return title;
 }
-// 4) 有题目痕迹，但目录高亮明确不是测验节点（例如 1.2 学习天地）：仍按视频处理
+// 5) 有题目痕迹，但目录高亮明确不是测验节点（例如 1.2 学习天地）：仍按视频处理
 if (label && !labelSaysQuiz && probe.videoAny) return '视频';
 return title;
 };
@@ -997,22 +1006,29 @@ const add = (el) => {
 if (!el || list.some((entry) => entry.el === el)) return;
 let r = null;
 try { r = el.getClientRects()[0]; } catch (_) {}
-if (r && (r.width < 160 || r.height < 80)) return;
+if (r && (r.width < 140 || r.height < 70)) return;
 list.push({ el, doc });
 };
 try {
 const scroller = doc.scrollingElement || doc.documentElement;
 if (scroller && scroller.scrollHeight - scroller.clientHeight > 40) add(scroller);
 for (const el of doc.querySelectorAll('div,section,article,main')) {
-if (list.length >= 8) break;
+if (list.length >= 12) break;
 const style = win.getComputedStyle(el);
 if (!/(auto|scroll|overlay)/.test(style.overflowY)) continue;
-if (el.scrollHeight - el.clientHeight <= 40 || el.scrollHeight < 400) continue;
+if (el.scrollHeight - el.clientHeight <= 40 || el.scrollHeight < 300) continue;
 add(el);
 }
 } catch (_) { /* 忽略单个框架 */ }
 }
 return list;
+}
+
+function containerAtBottom(entry) {
+try {
+const max = Math.max(0, entry.el.scrollHeight - entry.el.clientHeight);
+return max <= 20 || entry.el.scrollTop >= max - 6;
+} catch (_) { return true; }
 }
 
 function cardsFrameSrcs() {
@@ -1034,6 +1050,12 @@ const win = doc.defaultView;
 if (!win) return;
 const max = Math.max(0, el.scrollHeight - el.clientHeight);
 if (max <= 20) return;
+const isPageScroller = el === doc.scrollingElement || el === doc.documentElement || el === doc.body;
+// 先把这一块内容滚进可视区，模拟“人先看到这一篇，再往下读”
+if (!isPageScroller) {
+try { el.scrollIntoView({ block: 'center' }); } catch (_) {}
+await sleep(180);
+}
 // 分多步缓慢滚动，模拟真实阅读，触发平台（ed_complete.js）的滚动监听
 const steps = Math.min(24, Math.max(8, Math.ceil(max / Math.max(200, el.clientHeight * 0.7))));
 for (let i = 1; i <= steps; i++) {
@@ -1041,10 +1063,68 @@ if (stopped) return;
 el.scrollTop = Math.round((max * i) / steps);
 try { el.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
 try { el.dispatchEvent(new win.WheelEvent('wheel', { deltaY: 320, bubbles: true, cancelable: true })); } catch (_) {}
+// 外层阅读页的监听通常挂在 window 上，元素滚动后同步补一次
+if (isPageScroller) {
+try { win.scrollTo(0, el.scrollTop); } catch (_) {}
+try { win.dispatchEvent(new win.Event('scroll')); } catch (_) {}
+}
 await sleep(220 + Math.floor(Math.random() * 160));
 }
 el.scrollTop = max;
 try { el.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
+if (isPageScroller) {
+try { win.scrollTo(0, max); } catch (_) {}
+try { win.dispatchEvent(new win.Event('scroll')); } catch (_) {}
+}
+}
+
+// 一个任务点里可能叠着多篇图文：外层页面向下滚动 + 每篇自己的阅读器再滚动。
+// 平台是按篇调用 completed(index) 的，所以必须把每个滚动区都推到底、并反复检查新渲染出来的图文。
+async function readThroughDocuments() {
+let rounds = 0;
+let lastSignature = '';
+let stableRounds = 0;
+let sawCompletion = false;
+let containers = 0;
+while (rounds < 8 && !stopped) {
+rounds++;
+const docs = contentFrameDocs();
+if (!docs.length) break;
+const entries = documentScrollables(docs);
+containers = Math.max(containers, entries.length);
+const pending = rounds === 1 ? entries : entries.filter((entry) => !containerAtBottom(entry));
+for (const entry of pending) {
+if (stopped) break;
+await scrollToBottom(entry);
+}
+// 每个内容页面本身也推到底，让折叠在下面的图文有机会渲染出来
+for (const item of docs) {
+if (stopped) break;
+const doc = item.doc;
+const win = doc.defaultView;
+const scroller = doc.scrollingElement || doc.documentElement;
+if (!win || !scroller) continue;
+const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+if (max <= 40 || scroller.scrollTop >= max - 6) continue;
+scroller.scrollTop = max;
+try { win.scrollTo(0, max); } catch (_) {}
+try { scroller.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
+try { win.dispatchEvent(new win.Event('scroll')); } catch (_) {}
+try { scroller.dispatchEvent(new win.WheelEvent('wheel', { deltaY: 600, bubbles: true, cancelable: true })); } catch (_) {}
+await sleep(500);
+}
+await sleep(600);
+const after = documentScrollables(contentFrameDocs());
+const allBottom = after.length > 0 && after.every(containerAtBottom);
+if (documentCompletionShown()) sawCompletion = true;
+const signature = after.map((entry) => `${entry.el.scrollTop}:${entry.el.scrollHeight}:${entry.el.clientHeight}`).join('|');
+if (signature === lastSignature) stableRounds++; else stableRounds = 0;
+lastSignature = signature;
+console.log(`%c第 ${rounds} 轮阅读滚动：滚动区 ${after.length} 个，全部到底=${allBottom}，完成标记=${sawCompletion}`, 'color:#607D8B');
+if (allBottom && (sawCompletion || stableRounds >= 2)) break;
+if (stableRounds >= 3) break;
+}
+return { rounds, containers, sawCompletion };
 }
 
 async function nudgeToBottom(entry) {
@@ -1123,22 +1203,18 @@ try {
 const totalChars = docs.reduce((sum, item) => sum + item.text.length, 0);
 const totalImages = docs.reduce((sum, item) => sum + item.images, 0);
 console.log(`%c检测到阅读/图文任务点（约 ${totalChars} 字，${totalImages} 张图），开始滚动到最底部`, 'color:#2196F3');
-const entries = documentScrollables(docs);
-for (const entry of entries) {
-if (stopped) return true;
-await scrollToBottom(entry);
-}
-let done = await waitForDocumentCompletion(4000);
+const read = await readThroughDocuments();
+let done = read.sawCompletion;
 if (!done) {
 console.log('%c暂未看到完成标记，在底部再轻微滚动一次以确保触发平台检测', 'color:#FF9800');
-for (const entry of entries) {
+for (const entry of documentScrollables(contentFrameDocs())) {
 if (stopped) return true;
 await nudgeToBottom(entry);
 }
 done = await waitForDocumentCompletion(3000);
 }
-if (done) console.log('%c阅读任务点已完成，准备进入下一学习步骤', 'color:#4CAF50');
-else console.warn('%c滚动已到最底部，暂未收到平台完成标记，仍按已完成继续切换（若被弹窗拦下会自动处理）', 'color:#FF9800');
+if (done) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
+else console.warn(`%c已滚动 ${read.rounds} 轮、覆盖 ${read.containers} 个滚动区，暂未收到平台完成标记，仍按已完成继续切换（若被弹窗拦下会自动处理）`, 'color:#FF9800');
 docTaskHandledAt = Date.now();
 } catch (error) {
 console.warn('阅读任务点滚动失败，已跳过本次滚动:', error && error.message ? error.message : error);
@@ -1404,6 +1480,12 @@ if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
 submitDoc = courseDocuments().find((doc) => findButton(doc, '提交'));
 if (submitDoc) break;
+// 图文/阅读任务点被误判成测验时，不要干等 120 秒：8 秒后确认到正文就交回阅读流程
+if (attempt >= 16 && attempt % 16 === 0) {
+let docCount = 0;
+try { docCount = contentFrameDocs().length; } catch (_) { docCount = 0; }
+if (docCount) throw new Error('当前页面是阅读/图文任务点，不是章节测验');
+}
 // 有的章节测验先显示“开始答题/开始测验”入口，点了之后才加载题目
 if (!startClicked) {
 const start = courseDocuments()

@@ -1164,6 +1164,28 @@ await sleep(500);
 return false;
 }
 
+// 当前页面是否还有“没播完的视频”：有就先把视频交给视频流程，视频播完再回到图文
+function pageHasUnfinishedVideo() {
+try {
+if (typeof app._getVideoEl !== 'function') return visibleVideoState().any;
+const video = app._getVideoEl();
+if (!video) return false;
+let visibleNow = false;
+try {
+visibleNow = typeof app._videoIsVisible === 'function' ? app._videoIsVisible(video) : video.getClientRects().length > 0;
+} catch (_) { visibleNow = false; }
+let playingNow = false;
+try { playingNow = !video.paused && !video.ended; } catch (_) { playingNow = false; }
+if (!visibleNow && !playingNow) return false;
+if (typeof app._videoIsDone === 'function') return !app._videoIsDone(video);
+return playingNow;
+} catch (_) { return false; }
+}
+
+function pageHasDocumentTasks() {
+try { return contentFrameDocs().length > 0; } catch (_) { return false; }
+}
+
 app._handleDocumentTask = async function () {
 if (stopped || this._destroyed) return false;
 if (docTaskBusy) {
@@ -1174,12 +1196,16 @@ setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 1500);
 }
 return true;
 }
-if (visibleVideoState().any) return false;
+// 本页还有没播完的视频时不抢活，交给视频流程；视频播完会再回到这里
+if (pageHasUnfinishedVideo()) return false;
 if (this._isChapterTest()) return false;
 const docs = contentFrameDocs();
 if (!docs.length) return false;
 const signature = docs.map((item) => `${String((item.doc.location && item.doc.location.href) || '').slice(0, 120)}|${item.text.slice(0, 80)}`).join('||');
-if (signature && signature === docTaskSignature) {
+const samePage = Boolean(signature && signature === docTaskSignature);
+// 本页图文是否还有没滚到底的：有就继续读；都到底了说明已经读完，跳过重复滚动
+const pendingScroll = samePage && documentScrollables(docs).some((entry) => !containerAtBottom(entry));
+if (pendingScroll) {
 if (Date.now() - docTaskHandledAt < 12000) return true;
 if (docTaskNextAttempts >= 6) {
 console.warn('%c同一篇图文已多次尝试仍未切换，已暂停自动推进，请手动检查', 'color:#FF9800');
@@ -1191,10 +1217,11 @@ console.log('%c仍停留在同一篇图文，重新点击“下一节”', 'colo
 setTimeout(() => { if (!stopped && !app._destroyed) app.nextUnit(); }, 600);
 return true;
 }
+const alreadyRead = samePage && !pendingScroll;
 docTaskBusy = true;
 docTaskSignature = signature;
 docTaskHandledAt = Date.now();
-docTaskNextAttempts = 0;
+if (!alreadyRead) docTaskNextAttempts = 0;
 this._isPlaying = false;
 this._noVideoRetryTimes = 0;
 this._clearCheckInterval();
@@ -1202,19 +1229,23 @@ const startFrameSrcs = cardsFrameSrcs();
 try {
 const totalChars = docs.reduce((sum, item) => sum + item.text.length, 0);
 const totalImages = docs.reduce((sum, item) => sum + item.images, 0);
+let read = { rounds: 0, containers: documentScrollables(docs).length, sawCompletion: documentCompletionShown() };
+if (alreadyRead) {
+console.log('%c本页图文已经滚动到底，跳过重复阅读，检查是否还有视频/下一步', 'color:#607D8B');
+} else {
 console.log(`%c检测到阅读/图文任务点（约 ${totalChars} 字，${totalImages} 张图），开始滚动到最底部`, 'color:#2196F3');
-const read = await readThroughDocuments();
-let done = read.sawCompletion;
-if (!done) {
+read = await readThroughDocuments();
+if (!read.sawCompletion) {
 console.log('%c暂未看到完成标记，在底部再轻微滚动一次以确保触发平台检测', 'color:#FF9800');
 for (const entry of documentScrollables(contentFrameDocs())) {
 if (stopped) return true;
 await nudgeToBottom(entry);
 }
-done = await waitForDocumentCompletion(3000);
+read.sawCompletion = await waitForDocumentCompletion(3000);
 }
-if (done) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
+if (read.sawCompletion) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
 else console.warn(`%c已滚动 ${read.rounds} 轮、覆盖 ${read.containers} 个滚动区，暂未收到平台完成标记，仍按已完成继续切换（若被弹窗拦下会自动处理）`, 'color:#FF9800');
+}
 docTaskHandledAt = Date.now();
 } catch (error) {
 console.warn('阅读任务点滚动失败，已跳过本次滚动:', error && error.message ? error.message : error);
@@ -1229,6 +1260,15 @@ app._nextUnitPending = false;
 setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 600);
 return true;
 }
+// 图文在前、视频在后（或中途穿插）时，读完别急着切走：先看看本页有没有渲染出来的视频
+let pendingVideo = null;
+try { pendingVideo = typeof app._nextPlayableVideo === 'function' ? app._nextPlayableVideo(null) : null; } catch (_) { pendingVideo = null; }
+if (pendingVideo) {
+console.log('%c阅读完成，本页还有待播放的视频，先播放视频', 'color:#4CAF50');
+app._nextUnitPending = false;
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 800);
+return true;
+}
 try {
 console.log('%c阅读任务点处理完毕，点击“下一节”继续', 'color:#4CAF50');
 await goToNextStep();
@@ -1239,6 +1279,8 @@ setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 10000);
 }
 return true;
 };
+
+app._pageHasDocumentTasks = pageHasDocumentTasks;
 
 function letterOf(el) {
 const text = clean(el.textContent).replace(/[.、．:：,，]+$/, '');
@@ -2995,6 +3037,18 @@ return;
 }
 this._allDoneChecks = 0;
 if (!this._canAdvanceAfterVideos()) return;
+// 视频播完后本页可能还叠着图文（先视频后图文/穿插混排），先读完再切下一节
+if (typeof this._handleDocumentTask === 'function' && await this._handleDocumentTask()) return;
+// 图文处理的间隙可能又有新视频渲染出来，别被“已完成”的判断跳过
+const lateVideo = this._nextPlayableVideo(el, true);
+if (lateVideo) {
+console.log('%c发现本页还有待播放的视频，先播放视频', 'color:#4CAF50');
+this._videoEl = lateVideo;
+this._allDoneChecks = 0;
+this._isPlaying = false;
+setTimeout(() => this.play(), 500);
+return;
+}
 console.log('%c本页视频均已完成，自动切换下一节', 'color:#FF9800');
 setTimeout(() => this.nextUnit(), 800);
 return;
@@ -3358,6 +3412,15 @@ return true;
 }
 this._videoNextChecks = 0;
 if (!this._canAdvanceAfterVideos()) return true;
+// 视频播完但本页还叠着图文：先回到统一流程读完再切下一节
+if (typeof this._pageHasDocumentTasks === 'function' && this._pageHasDocumentTasks()) {
+this._allDoneChecks = 2;
+this._isPlaying = false;
+this._clearCheckInterval();
+console.log('%c本页视频已播完，检测到同页还有图文任务点，先完成图文', 'color:#4CAF50');
+setTimeout(() => this.play(), 600);
+return true;
+}
 console.log('%c本页视频已全部播放完成，进入下一节', 'color:#4CAF50');
 this.nextUnit();
 return true;

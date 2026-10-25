@@ -1176,10 +1176,13 @@ if (stopped) throw new Error('脚本已停止');
 if (!findNextButton()) throw new Error('未找到页面下方的“下一节”按钮');
 app._nextUnitPending = true;
 const previousStep = app._currentStepTitle();
-const previousVideo = app._getVideoEl();
-const previousSrc = previousVideo ? (previousVideo.currentSrc || previousVideo.src || '') : '';
+const previousVideos = typeof app._findAllVideos === 'function' ? app._findAllVideos() : [];
+const previousVideoSrcs = previousVideos.map((video) => {
+try { return video.currentSrc || video.getAttribute('src') || ''; } catch (_) { return ''; }
+});
 app._clearCheckInterval();
 app._videoEl = null;
+app._doneVideos = new WeakSet();
 app._isPlaying = false;
 let skipped = 0;
 let emptySince = 0;
@@ -1218,13 +1221,20 @@ if (currentStep === '章节测验' && currentStep !== previousStep) {
 stepReady = true;
 break;
 }
-const video = app._getVideoEl();
-if (video) {
-const src = video.currentSrc || video.src || '';
-if (video !== previousVideo || (src && src !== previousSrc)) {
+let videos = [];
+try { videos = app._findAllVideos(); } catch (_) { videos = []; }
+const videoLoaded = videos.some((item) => {
+let src = '';
+try { src = item.currentSrc || item.getAttribute('src') || ''; } catch (_) {}
+const oldIndex = previousVideos.indexOf(item);
+if (oldIndex === -1) return true;
+const oldSrc = previousVideoSrcs[oldIndex];
+if (!oldSrc) return false;
+return Boolean(src) && src !== oldSrc;
+});
+if (videoLoaded) {
 stepReady = true;
 break;
-}
 }
 if (pageShowsNoContent()) {
 if (!emptySince) emptySince = Date.now();
@@ -1233,7 +1243,7 @@ emptySince = 0;
 }
 const waited = Date.now() - clickedAt;
 const emptyFor = emptySince ? Date.now() - emptySince : 0;
-const emptyConfirmed = emptyFor >= 6000 || (currentStep === '视频' && !video && waited >= 45000);
+const emptyConfirmed = emptyFor >= 6000 || (currentStep === '视频' && !videos.length && waited >= 45000);
 if (emptyConfirmed) {
 if (skipped >= 10) throw new Error('连续跳过 10 个“暂无内容”小节后仍未找到可学习内容，已停止，请手动检查');
 skipped++;
@@ -1253,6 +1263,7 @@ console.log(`下一学习步骤仍在加载，已等待 ${Math.round(waited / 10
 if (!stepReady) throw new Error(`点击“下一节”后等待超时，新学习步骤仍未加载完成；当前页签：${currentStep || '未显示'}`);
 app._nextUnitPending = false;
 app._videoEl = null;
+app._doneVideos = new WeakSet();
 app._initCellData();
 app.play();
 }
@@ -1675,6 +1686,7 @@ scheduleVideoEndedNext(2000, attempt + 1);
 return;
 }
 app._videoEndedDuringQuiz = false;
+if (typeof app._continueWithNextVideo === 'function' && app._continueWithNextVideo('视频弹题已处理完')) return;
 console.log('%c视频弹题已处理完，继续切换下一节', 'color:#2196F3');
 if (typeof app.nextUnit === 'function') app.nextUnit();
 }, delay);
@@ -2183,7 +2195,10 @@ if (video.ended && this._isPlaying) {
 console.log("%c检测到视频结束，准备切换下一个...", "color:#9C27B0");
 this._isPlaying = false;
 this._nearEndSince = 0;
+this._markVideoDone(video);
+if (!this._continueWithNextVideo('本段视频已结束')) {
 setTimeout(() => this.nextUnit(), 1000);
+}
 } else if (this._isPlaying) {
 const duration = Number(video.duration || 0);
 const current = Number(video.currentTime || 0);
@@ -2194,10 +2209,13 @@ this._nearEndSince = Date.now();
 console.log(`%c视频已停在结尾（${current.toFixed(1)}/${duration.toFixed(1)} 秒），等待结束事件...`, "color:#FF9800");
 } else if (Date.now() - this._nearEndSince >= 6000) {
 this._nearEndSince = 0;
-console.log("%c长时间未收到视频结束事件，自动切换下一节", "color:#FF9800");
+console.log("%c长时间未收到视频结束事件，自动切换下一节或下一段视频", "color:#FF9800");
 this._isPlaying = false;
 this._clearCheckInterval();
+this._markVideoDone(video);
+if (!this._continueWithNextVideo('本段视频已停在结尾')) {
 setTimeout(() => this.nextUnit(), 800);
+}
 }
 } else {
 this._nearEndSince = 0;
@@ -2264,6 +2282,35 @@ console.warn('%c当前小节未发现视频或可识别的学习步骤，已安�
 return;
 }
 this._noVideoRetryTimes = 0;
+if (typeof this._videoIsDone === 'function' && this._videoIsDone(el)) {
+const nextVideo = this._nextPlayableVideo(el);
+if (nextVideo) {
+this._allDoneChecks = 0;
+console.log('%c当前视频已完成，先播放本页下一段视频', 'color:#4CAF50');
+this._videoEl = nextVideo;
+try {
+nextVideo.muted = true;
+nextVideo.defaultMuted = true;
+nextVideo.volume = 0;
+} catch (_) {}
+this._isPlaying = false;
+setTimeout(() => this.play(), 300);
+return;
+}
+this._allDoneChecks = (this._allDoneChecks || 0) + 1;
+this._isPlaying = false;
+this._clearCheckInterval();
+if (this._allDoneChecks <= 2) {
+console.log(`%c本页视频均已完成，等待确认是否还有待加载的视频 (${this._allDoneChecks}/2)`, 'color:#FF9800');
+setTimeout(() => this.play(), 2000);
+return;
+}
+this._allDoneChecks = 0;
+console.log('%c本页视频均已完成，自动切换下一节', 'color:#FF9800');
+setTimeout(() => this.nextUnit(), 800);
+return;
+}
+this._allDoneChecks = 0;
 this._isPlaying = true;
 this._videoEventHandle();
 try {
@@ -2469,40 +2516,114 @@ this._treeContainerEl = el;
 }
 return this._treeContainerEl;
 },
-_getVideoEl() {
-if (!this._videoEl) {
+_findAllVideos() {
+const preferred = [];
+const fallback = [];
+const seenDocs = new Set();
+const seenVideos = new Set();
+const addVideo = (video, inFrame) => {
+if (!video || seenVideos.has(video)) return;
+seenVideos.add(video);
+let src = '';
+try { src = video.currentSrc || video.getAttribute('src') || ''; } catch (_) {}
+let hasSource = false;
+try { hasSource = Boolean(video.querySelector('source')); } catch (_) {}
+if (!src && !hasSource) return;
+let rects = null;
+try { rects = video.getClientRects(); } catch (_) {}
+if (!rects || !rects.length) return;
+let isPlayer = false;
 try {
-const findVideo = (frame, depth) => {
-if (depth > 2) return null;
-const frameDocument = frame.contentDocument || frame.contentWindow?.document;
-if (!frameDocument) return null;
-const $frameDocument = $(frameDocument);
-const directVideo = $frameDocument.find('video#video_html5_api, video[id*="video_html5"]').get(0);
-if (directVideo) return directVideo;
-const nestedFrames = $frameDocument.find('iframe.ans-insertvideo-online, iframe[src*="video"]');
-for (const nestedFrame of nestedFrames.toArray()) {
-const nestedVideo = findVideo(nestedFrame, depth + 1);
-if (nestedVideo) return nestedVideo;
+isPlayer = /video_html5/i.test(video.id || '') || /video_html5/i.test(String(video.className || ''));
+} catch (_) {}
+if (inFrame || isPlayer) preferred.push(video);
+else fallback.push(video);
+};
+const visit = (doc, depth, inFrame) => {
+if (!doc || depth > 3 || seenDocs.has(doc)) return;
+seenDocs.add(doc);
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('video')); } catch (_) { nodes = []; }
+for (const video of nodes) addVideo(video, inFrame);
+let frames = [];
+try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) { frames = []; }
+for (const frame of frames) {
+let childDoc = null;
+try { childDoc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document); } catch (_) { continue; }
+visit(childDoc, depth + 1, true);
+}
+};
+visit(document, 0, false);
+return preferred.length ? preferred.concat(fallback) : fallback;
+},
+_videoIsDone(video) {
+if (!video) return true;
+try {
+if (this._doneVideos && this._doneVideos.has(video)) return true;
+if (video.ended) return true;
+const duration = Number(video.duration);
+const current = Number(video.currentTime);
+if (Number.isFinite(duration) && duration > 0 && current > 0 && duration - current <= 1.5) return true;
+} catch (_) {}
+return false;
+},
+_markVideoDone(video) {
+if (!video) return;
+if (!this._doneVideos) this._doneVideos = new WeakSet();
+try { this._doneVideos.add(video); } catch (_) {}
+},
+_nextPlayableVideo(exclude) {
+let videos = [];
+try { videos = this._findAllVideos(); } catch (_) { return null; }
+for (const video of videos) {
+if (exclude && video === exclude) continue;
+if (!this._videoIsDone(video)) return video;
 }
 return null;
-};
-for (const frame of $('iframe').toArray()) {
-const video = findVideo(frame, 0);
-if (video) {
+},
+_switchToVideo(video, reason) {
+if (!video) return false;
+const current = this._videoEl;
+if (current && current !== video) this._markVideoDone(current);
 this._videoEl = video;
+this._isPlaying = false;
+this._nearEndSince = 0;
+this._guardLastTime = 0;
+this._guardLastWallTs = 0;
+this._guardLastResumeTs = 0;
+this._detachVideoEvents();
+try {
 video.muted = true;
 video.defaultMuted = true;
 video.volume = 0;
-break;
-}
+} catch (_) {}
+let total = 1;
+try { total = this._findAllVideos().length || 1; } catch (_) {}
+console.log(`%c${reason || '本段视频已结束'}，继续播放本页下一段视频（本页共 ${total} 段）`, 'color:#4CAF50');
+setTimeout(() => this.play(), 800);
+return true;
+},
+_continueWithNextVideo(reason) {
+const next = this._nextPlayableVideo(this._videoEl);
+if (!next) return false;
+return this._switchToVideo(next, reason);
+},
+_getVideoEl() {
+if (this._videoEl && this._videoEl.isConnected) return this._videoEl;
+try {
+const videos = this._findAllVideos();
+const active = videos.find((video) => !this._videoIsDone(video)) || videos[0] || null;
+if (active) {
+this._videoEl = active;
+active.muted = true;
+active.defaultMuted = true;
+active.volume = 0;
 }
 } catch (e) {
 console.error("获取视频元素失败:", e);
 return null;
 }
-}
-if (!this._videoEl) return null;
-return this._videoEl;
+return this._videoEl || null;
 },
 _videoEventHandle() {
 const el = this._videoEl;
@@ -2538,6 +2659,8 @@ const title = this._cellData.currentVideoTitle;
 console.warn(`%c============'${title}' 播放完成=============`, "color:#4CAF50;font-weight:bold");
 this._isPlaying = false;
 this._clearCheckInterval();
+const endedVideo = e && e.target && e.target.tagName === 'VIDEO' ? e.target : this._videoEl;
+this._markVideoDone(endedVideo);
 setTimeout(() => {
 const quizVisible = typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow();
 if (this._videoQuizActive || this._videoQuizPending || quizVisible) {
@@ -2546,6 +2669,7 @@ console.log('%c视频已结束，但弹题还没处理完，等弹题结束后�
 if (typeof this._scheduleVideoEndedNext === 'function') this._scheduleVideoEndedNext(2000);
 return;
 }
+if (typeof this._continueWithNextVideo === 'function' && this._continueWithNextVideo('本段视频已结束')) return;
 this.nextUnit();
 }, 1500);
 },

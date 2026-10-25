@@ -1182,7 +1182,7 @@ try { return video.currentSrc || video.getAttribute('src') || ''; } catch (_) { 
 });
 app._clearCheckInterval();
 app._videoEl = null;
-app._doneVideos = new WeakSet();
+app._doneVideos = new Map();
 app._isPlaying = false;
 let skipped = 0;
 let emptySince = 0;
@@ -1263,7 +1263,8 @@ console.log(`下一学习步骤仍在加载，已等待 ${Math.round(waited / 10
 if (!stepReady) throw new Error(`点击“下一节”后等待超时，新学习步骤仍未加载完成；当前页签：${currentStep || '未显示'}`);
 app._nextUnitPending = false;
 app._videoEl = null;
-app._doneVideos = new WeakSet();
+app._doneVideos = new Map();
+app._videoNextChecks = 0;
 app._initCellData();
 app.play();
 }
@@ -1686,7 +1687,12 @@ scheduleVideoEndedNext(2000, attempt + 1);
 return;
 }
 app._videoEndedDuringQuiz = false;
-if (typeof app._continueWithNextVideo === 'function' && app._continueWithNextVideo('视频弹题已处理完')) return;
+const endedDuringQuiz = app._endedVideoDuringQuiz || app._videoEl;
+app._endedVideoDuringQuiz = null;
+if (typeof app._proceedAfterVideo === 'function') {
+app._proceedAfterVideo('视频弹题已处理完', endedDuringQuiz);
+return;
+}
 console.log('%c视频弹题已处理完，继续切换下一节', 'color:#2196F3');
 if (typeof app.nextUnit === 'function') app.nextUnit();
 }, delay);
@@ -2196,9 +2202,7 @@ console.log("%c检测到视频结束，准备切换下一个...", "color:#9C27B0
 this._isPlaying = false;
 this._nearEndSince = 0;
 this._markVideoDone(video);
-if (!this._continueWithNextVideo('本段视频已结束')) {
-setTimeout(() => this.nextUnit(), 1000);
-}
+this._proceedAfterVideo('本段视频已结束', video);
 } else if (this._isPlaying) {
 const duration = Number(video.duration || 0);
 const current = Number(video.currentTime || 0);
@@ -2213,9 +2217,7 @@ console.log("%c长时间未收到视频结束事件，自动切换下一节或�
 this._isPlaying = false;
 this._clearCheckInterval();
 this._markVideoDone(video);
-if (!this._continueWithNextVideo('本段视频已停在结尾')) {
-setTimeout(() => this.nextUnit(), 800);
-}
+this._proceedAfterVideo('本段视频已停在结尾', video);
 }
 } else {
 this._nearEndSince = 0;
@@ -2556,10 +2558,17 @@ visit(childDoc, depth + 1, true);
 visit(document, 0, false);
 return preferred.length ? preferred.concat(fallback) : fallback;
 },
+_videoSrcOf(video) {
+try { return video.currentSrc || video.getAttribute('src') || ''; } catch (_) { return ''; }
+},
 _videoIsDone(video) {
 if (!video) return true;
 try {
-if (this._doneVideos && this._doneVideos.has(video)) return true;
+if (this._doneVideos && this._doneVideos.has(video)) {
+const markedSrc = this._doneVideos.get(video);
+const currentSrc = this._videoSrcOf(video);
+if (!currentSrc || currentSrc === markedSrc) return true;
+}
 if (video.ended) return true;
 const duration = Number(video.duration);
 const current = Number(video.currentTime);
@@ -2569,8 +2578,8 @@ return false;
 },
 _markVideoDone(video) {
 if (!video) return;
-if (!this._doneVideos) this._doneVideos = new WeakSet();
-try { this._doneVideos.add(video); } catch (_) {}
+if (!this._doneVideos) this._doneVideos = new Map();
+try { this._doneVideos.set(video, this._videoSrcOf(video)); } catch (_) {}
 },
 _nextPlayableVideo(exclude) {
 let videos = [];
@@ -2586,6 +2595,7 @@ if (!video) return false;
 const current = this._videoEl;
 if (current && current !== video) this._markVideoDone(current);
 this._videoEl = video;
+this._videoNextChecks = 0;
 this._isPlaying = false;
 this._nearEndSince = 0;
 this._guardLastTime = 0;
@@ -2607,6 +2617,36 @@ _continueWithNextVideo(reason) {
 const next = this._nextPlayableVideo(this._videoEl);
 if (!next) return false;
 return this._switchToVideo(next, reason);
+},
+_proceedAfterVideo(reason, endedVideo) {
+if (endedVideo && this._videoEl && this._videoEl !== endedVideo) return true;
+if (endedVideo && endedVideo.isConnected && this._doneVideos) {
+const markedSrc = this._doneVideos.get(endedVideo);
+const currentSrc = this._videoSrcOf(endedVideo);
+if (markedSrc && currentSrc && currentSrc !== markedSrc && !endedVideo.ended) {
+console.log('%c播放器已在同一个视频元素里换入下一段，继续播放', 'color:#4CAF50');
+try { this._doneVideos.delete(endedVideo); } catch (_) {}
+this._videoEl = endedVideo;
+this._videoNextChecks = 0;
+this._isPlaying = false;
+setTimeout(() => this.play(), 500);
+return true;
+}
+}
+if (this._continueWithNextVideo(reason)) {
+this._videoNextChecks = 0;
+return true;
+}
+this._videoNextChecks = (this._videoNextChecks || 0) + 1;
+if (this._videoNextChecks <= 2) {
+console.log(`%c本页暂未发现其他视频，${this._videoNextChecks}/2 次确认后进入下一节`, 'color:#FF9800');
+setTimeout(() => this._proceedAfterVideo(reason, endedVideo), 1500);
+return true;
+}
+this._videoNextChecks = 0;
+console.log('%c本页视频已全部播放完成，进入下一节', 'color:#4CAF50');
+this.nextUnit();
+return true;
 },
 _getVideoEl() {
 if (this._videoEl && this._videoEl.isConnected) return this._videoEl;
@@ -2665,12 +2705,13 @@ setTimeout(() => {
 const quizVisible = typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow();
 if (this._videoQuizActive || this._videoQuizPending || quizVisible) {
 this._videoEndedDuringQuiz = true;
+this._endedVideoDuringQuiz = endedVideo;
 console.log('%c视频已结束，但弹题还没处理完，等弹题结束后再切换下一节', 'color:#FF9800');
 if (typeof this._scheduleVideoEndedNext === 'function') this._scheduleVideoEndedNext(2000);
 return;
 }
-if (typeof this._continueWithNextVideo === 'function' && this._continueWithNextVideo('本段视频已结束')) return;
-this.nextUnit();
+if (typeof this._proceedAfterVideo === 'function') this._proceedAfterVideo('本段视频已结束', endedVideo);
+else this.nextUnit();
 }, 1500);
 },
 _handleVideoLoaded(e) {

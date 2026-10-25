@@ -2807,6 +2807,8 @@ videoCheckInterval: 1000,
 guardNoProgressMs: 7000,
 guardResumeCooldownMs: 1500,
 autoAdvanceNoVideo: false,
+autoMaxSpeed: true,
+maxSpeedCandidates: [2, 1.75, 1.5, 1.25],
 },
 _videoEl: null,
 _treeContainerEl: null,
@@ -2821,6 +2823,7 @@ _quizSkipAttempts: 0,
 _checkInterval: null,
 _eventVideoEl: null,
 _boundVideoHandlers: null,
+_speedStates: null,
 _nextUnitPending: false,
 _destroyed: false,
 _chapterAdvanceTimes: 0,
@@ -2957,6 +2960,8 @@ if (!video) return;
 video.muted = true;
 video.defaultMuted = true;
 video.volume = 0;
+this._keepMaxPlaybackRate(video);
+this._applyMaxPlaybackRate(video, '播放中').catch(() => {});
 if (video.paused && this._isPlaying) {
 console.log("%c检测到视频暂停，尝试恢复播放...", "color:#FF5722");
 this._tryResumePlayback("paused");
@@ -3140,8 +3145,9 @@ el.volume = 0;
 await el.play();
 this._tryTimes = 0;
 this._taskDialogResumes = 0;
-console.log('%c视频开始播放，保持页面默认播放速度', 'color:#4CAF50');
+console.log('%c视频开始播放', 'color:#4CAF50');
 this._startVideoMonitoring();
+this._applyMaxPlaybackRate(el, '开始播放').catch(() => {});
 } catch (playError) {
 console.error("视频播放失败:", playError);
 this._handlePlayError(playError);
@@ -3601,6 +3607,100 @@ this._eventVideoEl.removeEventListener('pause', this._boundVideoHandlers.pause);
 this._eventVideoEl = null;
 this._boundVideoHandlers = null;
 },
+// —— 自动最高倍速：能调就调到最高，调不动就放弃 ——
+_speedCandidates() {
+const configured = Array.isArray(this.configs.maxSpeedCandidates) ? this.configs.maxSpeedCandidates : [];
+const list = configured
+.map((value) => Number(value))
+.filter((value) => Number.isFinite(value) && value > 1);
+if (!list.length) return [2, 1.75, 1.5, 1.25];
+return list.sort((a, b) => b - a);
+},
+_readPlaybackRate(video) {
+try { return Number(video.playbackRate) || 0; } catch (_) { return 0; }
+},
+_speedStateOf(video) {
+if (!this._speedStates) this._speedStates = new Map();
+let state = this._speedStates.get(video);
+if (!state) {
+state = { src: '', applied: 0, busy: false, givenUp: false, drift: 0, lastTryAt: 0 };
+this._speedStates.set(video, state);
+}
+// 同一个播放器换了视频源时重新判断，别沿用上一段的结论
+const src = this._videoSrcOf(video);
+if (state.src !== src) {
+state.src = src;
+state.applied = 0;
+state.busy = false;
+state.givenUp = false;
+state.drift = 0;
+state.lastTryAt = 0;
+}
+return state;
+},
+async _applyMaxPlaybackRate(video, reason) {
+if (!video || this._destroyed) return 0;
+if (!this.configs || this.configs.autoMaxSpeed === false) return 0;
+const state = this._speedStateOf(video);
+if (state.givenUp) return 0;
+const current = this._readPlaybackRate(video);
+if (state.applied && current >= state.applied - 0.01) return state.applied;
+if (state.busy) return state.applied;
+if (Date.now() - state.lastTryAt < 2500) return state.applied;
+state.busy = true;
+state.lastTryAt = Date.now();
+try {
+for (const target of this._speedCandidates()) {
+let wrote = false;
+try {
+video.defaultPlaybackRate = target;
+video.playbackRate = target;
+wrote = true;
+} catch (_) {
+wrote = false;
+}
+// 赋值被拒绝、或被浏览器夹到别的数值，换低一档再试
+if (!wrote || Math.abs(this._readPlaybackRate(video) - target) > 0.01) continue;
+await sleep(600);
+if (this._destroyed || !video.isConnected) return 0;
+// 设置后 0.6 秒仍保持不变才算真的可调
+if (Math.abs(this._readPlaybackRate(video) - target) <= 0.01) {
+state.applied = target;
+state.drift = 0;
+console.log(`%c视频已调到最高 ${target}x 倍速${reason ? `（${reason}）` : ''}`, 'color:#4CAF50');
+return target;
+}
+}
+state.givenUp = true;
+state.applied = 0;
+try {
+video.defaultPlaybackRate = 1;
+video.playbackRate = 1;
+} catch (_) {}
+console.log('%c这个视频不允许调倍速（设置后会被还原），保持默认速度', 'color:#9E9E9E');
+return 0;
+} finally {
+state.busy = false;
+}
+},
+_keepMaxPlaybackRate(video) {
+if (!video || this._destroyed) return;
+const state = this._speedStateOf(video);
+if (state.givenUp || !state.applied || state.busy) return;
+if (this._readPlaybackRate(video) >= state.applied - 0.01) {
+state.drift = 0;
+return;
+}
+// 播放器中途把倍速改回默认：先补回来，连续多次被改回去就判定不可调
+state.drift += 1;
+if (state.drift >= 4) {
+state.givenUp = true;
+state.applied = 0;
+console.log('%c播放器反复把倍速改回默认，判定这个视频不可调倍速，保持默认速度', 'color:#9E9E9E');
+return;
+}
+try { video.playbackRate = state.applied; } catch (_) {}
+},
 _handleVideoEnded(e) {
 if (this._destroyed) return;
 const target = e && e.target && e.target.tagName === 'VIDEO' ? e.target : null;
@@ -3628,6 +3728,7 @@ else this.nextUnit();
 },
 _handleVideoLoaded(e) {
 console.log(`%c============视频加载完成=============`, "color:#2196F3");
+this._applyMaxPlaybackRate(this._videoEl, '加载完成').catch(() => {});
 if (this.configs.autoplay && !this._isPlaying) {
 this.play();
 }
@@ -3641,6 +3742,7 @@ this._stepSwitchPending = false;
 const video = this._getVideoEl();
 this._guardLastTime = Number(video?.currentTime || 0);
 this._guardLastWallTs = Date.now();
+this._applyMaxPlaybackRate(video, '开始播放').catch(() => {});
 if (this._delayedNextUnitTimer) {
 clearTimeout(this._delayedNextUnitTimer);
 this._delayedNextUnitTimer = null;

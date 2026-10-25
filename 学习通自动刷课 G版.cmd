@@ -836,6 +836,8 @@ return el ? clean(el.textContent || el.innerText) : '';
 }
 
 const QUIZ_TEXT_PATTERN = /[\[【](单选题|多选题|判断题|填空题|简答题)[\]】]|共\s*\d+\s*题|题量\s*[:：]\s*\d+|开始(答题|测验|考试)|继续(答题|作答)/;
+// 页面整体像不像测验：题干、题量、满分、交卷这类只有试卷页才有的字眼
+const QUIZ_PAGE_PATTERN = /[\[【](单选题|多选题|判断题|填空题|简答题)[\]】]|共\s*\d+\s*题|题量\s*[:：]\s*\d+|满分\s*[:：]?\s*\d+|我的答案|参考答案|开始答题|继续答题|重新答题|交卷|提交试卷/;
 // 注意：.mark_item 是“任务点”区块的样式，图文页里每个任务点都有一个，绝不能当作题目结构
 const QUIZ_DOM_SELECTOR = '.TiMu,.questionLi,.subject,.question-item,.questionBox,.stem';
 
@@ -899,21 +901,56 @@ if (crossOrigin) return 'unknown';
 return 'none';
 }
 
+// 页面内容本身是不是一份试卷：不看 iframe 的 num、不看 URL 规则，只看页面上有什么
+function quizPageEvidence() {
+let strong = false;
+let sawInputs = false;
+let textAll = '';
+for (const doc of courseDocuments()) {
+try {
+const body = doc.body;
+if (!body) continue;
+let text = '';
+try { text = String(body.innerText || body.textContent || ''); } catch (_) { text = ''; }
+if (text) textAll += `${text.slice(0, 6000)}\n`;
+if (doc.querySelector(QUIZ_DOM_SELECTOR)) strong = true;
+if (doc.querySelectorAll('input[type="radio"],input[type="checkbox"]').length >= 2) sawInputs = true;
+} catch (_) { /* 跨域或页面正在重建 */ }
+}
+if (QUIZ_PAGE_PATTERN.test(textAll)) strong = true;
+if (sawInputs && /(单选题|多选题|判断题|题量|共\s*\d+\s*题|交卷)/.test(textAll)) strong = true;
+if (strong) return true;
+// 题目框架跨域读不到文字时，退一步看可见内容框架的地址（作业/考试页）
+for (const frame of document.querySelectorAll('iframe[src]')) {
+let rect = null;
+try { rect = frame.getClientRects()[0]; } catch (_) {}
+if (!rect || rect.width < 400 || rect.height < 250) continue;
+let src = '';
+try { src = frame.getAttribute('src') || ''; } catch (_) { src = ''; }
+if (/(\/exam\/|reVersionTestStartNew|\/mooc2\/work|\/work\/doHomeWork|examId=|workId=)/i.test(src)) return true;
+}
+return false;
+}
+
 function stepProbe() {
 if (Date.now() - stepProbeAt < 800) return stepProbeState;
 stepProbeAt = Date.now();
 const video = visibleVideoState();
-stepProbeState = { videoAny: video.any, videoPlaying: video.playing, quiz: quizFrameEvidence() };
+stepProbeState = { videoAny: video.any, videoPlaying: video.playing, quiz: quizFrameEvidence(), quizPage: quizPageEvidence() };
 return stepProbeState;
 }
 
 const originalStepTitle = app._currentStepTitle.bind(app);
 app._currentStepTitle = function () {
 const title = originalStepTitle();
-if (title !== '章节测验') return title;
 const probe = stepProbe();
 const label = activeCatalogLabel();
 const labelSaysQuiz = /测验|考试|测试|答题/.test(label);
+// 内容优先：页面上确实是一份试卷（题干、题量、交卷…），
+// 不管入口叫什么名字、iframe 带不带 num，都按测验处理。
+// 页面有可见视频时不抢，避免把“视频上的弹题”当成整章测验。
+if (probe.quizPage && !probe.videoAny && !probe.videoPlaying) return '章节测验';
+if (title !== '章节测验') return title;
 // 1) 视频还在播：绝不可能是章节测验
 if (probe.videoPlaying) return '视频';
 // 2) 内容框架里确实是文章/图片、又没有真正的题目结构：这是阅读/图文任务点
@@ -946,6 +983,13 @@ const hasGrade = /本次成绩\s*\d+(?:\.\d+)?\s*分/.test(text);
 return hasGrade && (/章节测验\s*已完成/.test(text) || /我的答案\s*[:：]/.test(text));
 });
 if (scoreShown) return true;
+// 非标准入口的作业/考试页：只要明确提示提交成功，也算完成
+const submitted = courseDocuments().some((doc) => {
+let text = '';
+try { text = clean(doc.body?.innerText); } catch (_) { text = ''; }
+return /提交成功|交卷成功|试卷已提交|作答已提交|提交试卷成功/.test(text);
+});
+if (submitted) return true;
 const cardsFrame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
 .find((frame) => frame.getClientRects().length > 0);
 const isQuizFrame = cardsFrame && new URL(cardsFrame.getAttribute('src'), location.href).searchParams.get('num') === '1';
@@ -972,6 +1016,15 @@ if (!frameEl) continue;
 let rect = null;
 try { rect = frameEl.getClientRects()[0]; } catch (_) {}
 if (!rect || rect.width < 200 || rect.height < 150) continue;
+// 右侧的讨论/笔记/消息这类边栏框架也有正文，但绝不是任务点内容，不能去滚它
+let frameSrc = '';
+try { frameSrc = String(frameEl.getAttribute('src') || ''); } catch (_) { frameSrc = ''; }
+const knownContent = /(\/knowledge\/cards|\/exam\/|reVersionTestStartNew|\/work\/)/i.test(frameSrc);
+const sidePanel = /(discuss|note|chat|comment|reply|message|group|answer-card)/i.test(frameSrc);
+const winWidth = window.innerWidth || 1280;
+const inMainArea = rect.left < winWidth * 0.35 && rect.left + rect.width > winWidth * 0.3;
+if (sidePanel && !knownContent) continue;
+if (!knownContent && !inMainArea) continue;
 let text = '';
 let images = 0;
 try { text = clean(doc.body ? doc.body.innerText : ''); } catch (_) { text = ''; }
@@ -984,7 +1037,9 @@ if (r && r.width >= 60 && r.height >= 40) images++;
 if (text.length < 30 && images === 0) continue;
 // 空页面和测验框架都不按图文处理
 if (/暂无内容|暂无学习内容|暂无任务点/.test(text) && text.length < 200) continue;
-if (QUIZ_TEXT_PATTERN.test(text)) continue;
+// 试卷页（题干/题量/满分/交卷）不管出现在哪个框架里，都不能当图文去滚
+if (QUIZ_PAGE_PATTERN.test(text)) continue;
+try { if (doc.querySelector(QUIZ_DOM_SELECTOR)) continue; } catch (_) {}
 // 视频页（哪怕播放器还没渲染完）不按图文处理，交给视频逻辑
 let hasVideo = false;
 try {
@@ -1392,6 +1447,16 @@ return candidates.find((el) => /^(BUTTON|A|INPUT)$/.test(el.tagName)) ||
 candidates.find((el) => !Array.from(el.children).some((child) => clean(child.innerText) === label)) || null;
 }
 
+// 不同课程/作业页的提交按钮叫法不一样，统一找一遍
+const QUIZ_SUBMIT_LABELS = ['提交', '交卷', '提交答案', '提交试卷', '交卷并查看结果'];
+function findQuizSubmit(doc) {
+for (const label of QUIZ_SUBMIT_LABELS) {
+const button = findButton(doc, label);
+if (button) return button;
+}
+return null;
+}
+
 function findNextButton() {
 for (const doc of courseDocuments()) {
 const known = doc.querySelector('#prevNextFocusNext, #right1, .nextChapter');
@@ -1490,7 +1555,7 @@ return found.label;
 
 async function revealQuizQuestions() {
 const docs = courseDocuments();
-const submit = docs.map((doc) => findButton(doc, '提交')).find(Boolean);
+const submit = docs.map((doc) => findQuizSubmit(doc)).find(Boolean);
 if (!submit) return;
 let scroller = submit.parentElement;
 while (scroller && scroller !== submit.ownerDocument.body) {
@@ -1520,7 +1585,7 @@ let startClicked = false;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
-submitDoc = courseDocuments().find((doc) => findButton(doc, '提交'));
+submitDoc = courseDocuments().find((doc) => findQuizSubmit(doc));
 if (submitDoc) break;
 // 图文/阅读任务点被误判成测验时，不要干等 120 秒：8 秒后确认到正文就交回阅读流程
 if (attempt >= 16 && attempt % 16 === 0) {
@@ -1690,7 +1755,9 @@ await sleep(250);
 
 async function submitQuiz(doc) {
 if (stopped) throw new Error('脚本已停止');
-const submit = findButton(doc, '提交');
+// 提交按钮可能在题干框架里，也可能在外层页面，两个地方都找
+const submitDoc = findQuizSubmit(doc) ? doc : courseDocuments().find((item) => findQuizSubmit(item));
+const submit = submitDoc ? findQuizSubmit(submitDoc) : null;
 if (!submit) throw new Error('未找到测验提交按钮');
 submit.scrollIntoView({ block: 'center' });
 console.log('选项已选择，点击章节测验的提交按钮');
@@ -1702,6 +1769,15 @@ while (!stopped) {
 await sleep(500);
 elapsedHalfSeconds++;
 if (quizCompleted()) return;
+// 提交后页面往往会直接切换，按钮消失说明已经交上去了，不用无限等成绩
+if (elapsedHalfSeconds >= 20 && !findQuizSubmit(submitDoc)) {
+console.log('%c提交按钮已消失，按“已提交”继续', 'color:#4CAF50');
+return;
+}
+if (elapsedHalfSeconds >= 240) {
+console.warn('%c等待成绩页超过 120 秒，按“已提交”继续，请稍后确认成绩是否生成', 'color:#FF9800');
+return;
+}
 if (elapsedHalfSeconds % 30 === 0) console.log(`成绩页仍在加载，已等待 ${elapsedHalfSeconds / 2} 秒`);
 }
 throw new Error('脚本已停止');
@@ -1890,6 +1966,7 @@ console.log('章节测验判定依据:', {
 可见视频: entryProbe.videoAny,
 视频播放中: entryProbe.videoPlaying,
 测验框架: entryProbe.quiz,
+试卷内容: entryProbe.quizPage,
 });
 console.log('已进入章节测验，等待题目和提交按钮加载');
 let questions;

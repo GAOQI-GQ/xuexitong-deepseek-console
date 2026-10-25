@@ -748,6 +748,7 @@ const videoQuizFailures = new Map();
 const videoQuizStates = new Map();
 const MAX_VIDEO_QUIZ_ATTEMPTS = 3;
 let quizBusy = false;
+let quizLoadRetries = 0;
 let videoQuizBusy = false;
 let videoQuizTimer = null;
 let videoQuizRetryAt = 0;
@@ -804,6 +805,75 @@ return false;
 }
 
 app._pageShowsNoContent = pageShowsNoContent;
+
+// 判断当前步骤时不能只看 iframe 的 num=1：平台切换步骤时，测验框架常常会预加载或残留为空白，
+// 此时页面其实还在视频上。结合“是否有可见视频”和“测验框架里是否真有测验内容”来判定更稳。
+let stepProbeAt = 0;
+let stepProbeState = { hasVideo: false, hasQuiz: false };
+
+function visibleVideoExists() {
+for (const doc of courseDocuments()) {
+try {
+for (const video of doc.querySelectorAll('video')) {
+const rects = video.getClientRects();
+if (rects.length && rects[0].width >= 80 && rects[0].height >= 40) return true;
+}
+} catch (_) { /* 跨域或页面正在重建 */ }
+}
+return false;
+}
+
+function quizFrameHasContent() {
+let frame = null;
+try {
+frame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]')).find((item) => {
+try {
+const rects = item.getClientRects();
+if (!rects.length || rects[0].width < 60 || rects[0].height < 60) return false;
+return new URL(item.getAttribute('src'), location.href).searchParams.get('num') === '1';
+} catch (_) { return false; }
+}) || null;
+} catch (_) { frame = null; }
+if (!frame) return false;
+const docs = [];
+const collect = (doc, depth) => {
+if (!doc || depth > 3) return;
+docs.push(doc);
+for (const child of doc.querySelectorAll('iframe')) {
+try { collect(child.contentDocument, depth + 1); } catch (_) { /* 跨域子框架 */ }
+}
+};
+try {
+collect(frame.contentDocument, 0);
+} catch (_) {
+// 测验框架本身跨域、读不到内容时只能信任 num=1
+return true;
+}
+for (const doc of docs) {
+try {
+if (findButton(doc, '提交') || findButton(doc, '提交答案')) return true;
+if (!doc.body) continue;
+if (/[\[【](单选题|多选题|判断题)[\]】]|共\s*\d+\s*题|题量\s*[:：]\s*\d+|开始(答题|测验|考试)|继续(答题|作答)/.test(String(doc.body.textContent || ''))) return true;
+} catch (_) { /* 忽略单个框架读取失败 */ }
+}
+return false;
+}
+
+function stepProbe() {
+if (Date.now() - stepProbeAt < 800) return stepProbeState;
+stepProbeAt = Date.now();
+stepProbeState = { hasVideo: visibleVideoExists(), hasQuiz: quizFrameHasContent() };
+return stepProbeState;
+}
+
+const originalStepTitle = app._currentStepTitle.bind(app);
+app._currentStepTitle = function () {
+const title = originalStepTitle();
+if (title !== '章节测验') return title;
+const probe = stepProbe();
+if (!probe.hasQuiz && probe.hasVideo) return '视频';
+return title;
+};
 
 function quizCompleted() {
 const scoreShown = courseDocuments().some((doc) => {
@@ -1048,13 +1118,29 @@ await sleep(120);
 }
 }
 
+const QUIZ_START_LABELS = ['开始答题', '开始测验', '开始考试', '进入答题', '继续答题', '继续作答'];
+
 async function waitForQuizQuestions() {
 let submitDoc = null;
+let startClicked = false;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
 submitDoc = courseDocuments().find((doc) => findButton(doc, '提交'));
 if (submitDoc) break;
+// 有的章节测验先显示“开始答题/开始测验”入口，点了之后才加载题目
+if (!startClicked) {
+const start = courseDocuments()
+.map((doc) => findTextControl(doc.documentElement, QUIZ_START_LABELS))
+.find(Boolean);
+if (start) {
+startClicked = true;
+console.log('%c检测到测验入口，点击“开始答题”', 'color:#2196F3');
+fireClick(start);
+await sleep(800);
+continue;
+}
+}
 if (attempt > 0 && attempt % 30 === 0) console.log(`测验提交按钮仍在加载，已等待 ${attempt / 2} 秒`);
 await sleep(500);
 }
@@ -1391,7 +1477,37 @@ await goToNextStep();
 return;
 }
 console.log('已进入章节测验，等待题目和提交按钮加载');
-const questions = await waitForQuizQuestions();
+let questions;
+try {
+questions = await waitForQuizQuestions();
+} catch (error) {
+if (stopped) return;
+// 没等到测验内容时先复查步骤：平台经常把空白/预加载的测验框架留在页面上，
+// 此时页面其实还在视频上，直接回到视频流程，不要整段脚本卡死。
+if (app._currentStepTitle() !== '章节测验') {
+console.warn(`%c没有进入真正的章节测验（${error.message}），已回到视频流程继续`, 'color:#FF9800');
+app._nextUnitPending = false;
+app._quizVideo = null;
+app._videoEl = null;
+app._isPlaying = false;
+app._videoNextChecks = 0;
+app._allDoneChecks = 0;
+if (typeof app._clearCheckInterval === 'function') app._clearCheckInterval();
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 1200);
+return;
+}
+// 确实停在测验页，但题目一直没出现：稍后重试几次，仍然不行就安静停下（不再抛错终止脚本）
+if (quizLoadRetries < 3) {
+quizLoadRetries++;
+console.warn(`%c章节测验内容仍未加载出来（第 ${quizLoadRetries}/3 次重试，30 秒后再试）`, 'color:#FF9800');
+setTimeout(() => { if (!stopped && !app._destroyed) app._advanceChapterTest(); }, 30000);
+return;
+}
+console.error('章节测验自动作答停止:', error);
+console.warn('%c自动答题已暂停，但脚本本身仍在运行；手动完成本章测验后可执行 app.nextUnit() 继续', 'color:#FF9800');
+return;
+}
+quizLoadRetries = 0;
 if (questions === null) {
 console.log('检测到当前章节测验已完成，点击“下一节”进入新视频');
 await goToNextStep();

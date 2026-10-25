@@ -806,24 +806,39 @@ return false;
 
 app._pageShowsNoContent = pageShowsNoContent;
 
-// 判断当前步骤时不能只看 iframe 的 num=1：平台切换步骤时，测验框架常常会预加载或残留为空白，
-// 此时页面其实还在视频上。结合“是否有可见视频”和“测验框架里是否真有测验内容”来判定更稳。
+// 判断当前步骤不能只看 iframe 的 num：num 只是“第几个任务点”，不是步骤类型。
+// 例如 1.2 学习天地有两个视频时，第二个视频同样是 num=1，旧逻辑却会当成章节测验。
+// 这里叠加多个依据：有没有正在播放的视频、测验框架里是否真有题目、目录高亮的是不是测验节点。
 let stepProbeAt = 0;
-let stepProbeState = { hasVideo: false, hasQuiz: false };
+let stepProbeState = { videoAny: false, videoPlaying: false, quiz: 'none' };
 
-function visibleVideoExists() {
+function visibleVideoState() {
+const state = { any: false, playing: false };
 for (const doc of courseDocuments()) {
 try {
 for (const video of doc.querySelectorAll('video')) {
 const rects = video.getClientRects();
-if (rects.length && rects[0].width >= 80 && rects[0].height >= 40) return true;
+if (!rects.length || rects[0].width < 80 || rects[0].height < 40) continue;
+state.any = true;
+try {
+if (!video.paused && !video.ended) state.playing = true;
+} catch (_) { /* 播放器状态暂时读不到 */ }
 }
 } catch (_) { /* 跨域或页面正在重建 */ }
 }
-return false;
+return state;
 }
 
-function quizFrameHasContent() {
+function activeCatalogLabel() {
+let el = null;
+try { el = document.querySelector('.posCatalog_active'); } catch (_) { el = null; }
+return el ? clean(el.textContent || el.innerText) : '';
+}
+
+const QUIZ_TEXT_PATTERN = /[\[【](单选题|多选题|判断题|填空题|简答题)[\]】]|共\s*\d+\s*题|题量\s*[:：]\s*\d+|开始(答题|测验|考试)|继续(答题|作答)/;
+const QUIZ_DOM_SELECTOR = '.TiMu,.questionLi,.mark_item,.subject,input[type="radio"],input[type="checkbox"]';
+
+function quizFrameEvidence() {
 let frame = null;
 try {
 frame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]')).find((item) => {
@@ -834,35 +849,58 @@ return new URL(item.getAttribute('src'), location.href).searchParams.get('num') 
 } catch (_) { return false; }
 }) || null;
 } catch (_) { frame = null; }
-if (!frame) return false;
+if (!frame) return 'none';
 const docs = [];
+let crossOrigin = false;
 const collect = (doc, depth) => {
 if (!doc || depth > 3) return;
 docs.push(doc);
 for (const child of doc.querySelectorAll('iframe')) {
-try { collect(child.contentDocument, depth + 1); } catch (_) { /* 跨域子框架 */ }
+try { collect(child.contentDocument, depth + 1); } catch (_) { crossOrigin = true; }
 }
 };
+let frameDoc = null;
 try {
-collect(frame.contentDocument, 0);
+frameDoc = frame.contentDocument;
 } catch (_) {
-// 测验框架本身跨域、读不到内容时只能信任 num=1
-return true;
+frameDoc = null;
 }
+// 浏览器对跨域框架的 contentDocument 会返回 null，读不到内容
+if (!frameDoc) return 'unknown';
+try {
+collect(frameDoc, 0);
+} catch (_) {
+return 'unknown';
+}
+let sawText = false;
+let sawDom = false;
+let videoInside = false;
 for (const doc of docs) {
 try {
-if (findButton(doc, '提交') || findButton(doc, '提交答案')) return true;
 if (!doc.body) continue;
-if (/[\[【](单选题|多选题|判断题)[\]】]|共\s*\d+\s*题|题量\s*[:：]\s*\d+|开始(答题|测验|考试)|继续(答题|作答)/.test(String(doc.body.textContent || ''))) return true;
+if (QUIZ_TEXT_PATTERN.test(String(doc.body.textContent || ''))) sawText = true;
+if (doc.querySelector(QUIZ_DOM_SELECTOR)) sawDom = true;
+for (const video of doc.querySelectorAll('video')) {
+const rects = video.getClientRects();
+if (rects.length && rects[0].width >= 80 && rects[0].height >= 40) {
+videoInside = true;
+break;
+}
+}
 } catch (_) { /* 忽略单个框架读取失败 */ }
 }
-return false;
+// 框架里放的是视频、又没有任何题目时，不可能是章节测验（num=1 只是第二个视频任务点）
+if (videoInside && !sawText && !sawDom) return 'none';
+if (sawText || sawDom) return 'quiz';
+if (crossOrigin) return 'unknown';
+return 'none';
 }
 
 function stepProbe() {
 if (Date.now() - stepProbeAt < 800) return stepProbeState;
 stepProbeAt = Date.now();
-stepProbeState = { hasVideo: visibleVideoExists(), hasQuiz: quizFrameHasContent() };
+const video = visibleVideoState();
+stepProbeState = { videoAny: video.any, videoPlaying: video.playing, quiz: quizFrameEvidence() };
 return stepProbeState;
 }
 
@@ -871,7 +909,16 @@ app._currentStepTitle = function () {
 const title = originalStepTitle();
 if (title !== '章节测验') return title;
 const probe = stepProbe();
-if (!probe.hasQuiz && probe.hasVideo) return '视频';
+const label = activeCatalogLabel();
+const labelSaysQuiz = /测验|考试|测试|答题/.test(label);
+// 1) 视频还在播：绝不可能是章节测验
+if (probe.videoPlaying) return '视频';
+// 2) 测验框架里明确没有题目：有视频就继续按视频处理
+if (probe.quiz === 'none') return probe.videoAny ? '视频' : title;
+// 3) 测验框架跨域读不到：页面还有视频、目录高亮也不是测验节点时，按视频处理
+if (probe.quiz === 'unknown' && probe.videoAny && !labelSaysQuiz) return '视频';
+// 4) 有题目痕迹，但目录高亮明确不是测验节点（例如 1.2 学习天地）：仍按视频处理
+if (label && !labelSaysQuiz && probe.videoAny) return '视频';
 return title;
 };
 
@@ -884,8 +931,10 @@ return hasGrade && (/章节测验\s*已完成/.test(text) || /我的答案\s*[:�
 if (scoreShown) return true;
 const cardsFrame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
 .find((frame) => frame.getClientRects().length > 0);
-const isQuizStep = cardsFrame && new URL(cardsFrame.getAttribute('src'), location.href).searchParams.get('num') === '1';
-return Boolean(isQuizStep && document.querySelector('.posCatalog_active .icon_Completed'));
+const isQuizFrame = cardsFrame && new URL(cardsFrame.getAttribute('src'), location.href).searchParams.get('num') === '1';
+// 目录高亮节点本身就是测验时，图标才代表“测验已完成”；视频节点的完成图标不能算
+const quizLabel = /测验|考试|测试|答题/.test(activeCatalogLabel());
+return Boolean(isQuizFrame && quizLabel && document.querySelector('.posCatalog_active .icon_Completed'));
 }
 
 function letterOf(el) {
@@ -1476,6 +1525,14 @@ console.log('检测到当前章节测验已完成，点击“下一节”进入�
 await goToNextStep();
 return;
 }
+const entryProbe = stepProbe();
+console.log('章节测验判定依据:', {
+页签: app._currentStepTitle(),
+目录高亮: activeCatalogLabel() || '未识别',
+可见视频: entryProbe.videoAny,
+视频播放中: entryProbe.videoPlaying,
+测验框架: entryProbe.quiz,
+});
 console.log('已进入章节测验，等待题目和提交按钮加载');
 let questions;
 try {

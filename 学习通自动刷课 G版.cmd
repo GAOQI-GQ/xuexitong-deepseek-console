@@ -747,6 +747,7 @@ let videoQuizContinueAt = 0;
 let videoEndedNextTimer = 0;
 let activeVideoQuiz = null;
 let leaveDialogClickedAt = 0;
+let leaveDialogSeenAt = 0;
 let stopped = false;
 const originalDestroy = app.destroy.bind(app);
 app.destroy = function () {
@@ -964,12 +965,41 @@ if (/下一节|跳过|取消|关闭/.test(text)) return null;
 return { button: primary, label: text || '主按钮' };
 }
 
+// 弹窗只有“下一节”时，用右上角关闭按钮取消本次跳节，既不跳过任务点也不会一直卡住
+function findLeaveChapterDialogClose(dialog) {
+for (const selector of ['.layui-layer-close', '.layui-layer-setwin a', '[aria-label*="关闭"]', '[title*="关闭"]', '[class*="close"]']) {
+for (const el of dialog.querySelectorAll(selector)) {
+if (!visible(el)) continue;
+if (clean(el.innerText || '').length > 4) continue;
+return el;
+}
+}
+return null;
+}
+
 function confirmLeaveChapterDialog() {
 if (Date.now() - leaveDialogClickedAt < 2000) return null;
 const dialog = findLeaveChapterDialog();
-if (!dialog) return null;
+if (!dialog) {
+leaveDialogSeenAt = 0;
+return null;
+}
 const found = findLeaveChapterDialogButton(dialog);
-if (!found) return null;
+if (!found) {
+if (!leaveDialogSeenAt) leaveDialogSeenAt = Date.now();
+if (Date.now() - leaveDialogSeenAt < 3000) return null;
+const closer = findLeaveChapterDialogClose(dialog);
+if (!closer) return null;
+leaveDialogClickedAt = Date.now();
+leaveDialogSeenAt = 0;
+console.warn('%c平台弹窗只有“下一节”，已点击右上角关闭取消本次跳节，继续完成本页剩余任务点', 'color:#FF9800');
+closer.click();
+if (typeof app !== 'undefined' && app && typeof app._resumeAfterTaskDialog === 'function') {
+app._resumeAfterTaskDialog('关闭弹窗');
+}
+return '关闭弹窗';
+}
+leaveDialogSeenAt = 0;
 leaveDialogClickedAt = Date.now();
 console.log(`%c检测到“当前章节还有任务点未完成”弹窗，自动点击“${found.label}”去完成剩余任务点`, 'color:#FF9800');
 found.button.scrollIntoView({ block: 'center' });
@@ -1421,10 +1451,13 @@ return text.length >= 6 && options.every((option) => option.text && option.text.
 }
 
 function findButtonIn(card, label) {
+// 平台按钮文字可能带空格、换行或多个图标子节点，按去掉空白后的文字比较更稳
+const compact = (value) => clean(value).replace(/\s+/g, '');
+const target = compact(label);
 const candidates = Array.from(card.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],div,span'))
-.filter((el) => visible(el) && clean(el.value || el.innerText) === label);
+.filter((el) => visible(el) && compact(el.value || el.innerText) === target);
 return candidates.find((el) => /^(BUTTON|A|INPUT)$/.test(el.tagName)) ||
-candidates.find((el) => !Array.from(el.children).some((child) => clean(child.innerText) === label)) || null;
+candidates.find((el) => !Array.from(el.children).some((child) => compact(child.innerText) === target)) || null;
 }
 
 const CONTINUE_LABELS = ['继续学习', '继续播放', '继续观看', '继续'];
@@ -2251,6 +2284,7 @@ if (typeof this._proceedAfterVideo === 'function') this._proceedAfterVideo('当�
 else this.nextUnit();
 return;
 }
+if (typeof this._videoEventHandle === 'function') this._videoEventHandle();
 video.muted = true;
 video.defaultMuted = true;
 video.volume = 0;
@@ -2278,6 +2312,7 @@ return;
 this._videoEl = quizVideo;
 this._videoNextChecks = 0;
 this._isPlaying = true;
+if (typeof this._videoEventHandle === 'function') this._videoEventHandle();
 }
 this._tryResumePlayback('video-quiz-done');
 },
@@ -2360,6 +2395,25 @@ this._clearCheckInterval();
 this._advanceChapterTest();
 return;
 }
+if (this._nextUnitPending) {
+if (!this._pendingWaitLoggedAt || Date.now() - this._pendingWaitLoggedAt > 10000) {
+this._pendingWaitLoggedAt = Date.now();
+console.log('%c正在切换学习小节，暂缓播放', 'color:#607D8B');
+}
+setTimeout(() => this.play(), 1500);
+return;
+}
+// 弹题还开着时不要先开始播，避免在弹题遮罩后面把视频播过去
+if (this._videoQuizPending && typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow()) {
+this._isPlaying = false;
+this._clearCheckInterval();
+if (!this._quizWaitLoggedAt || Date.now() - this._quizWaitLoggedAt > 10000) {
+this._quizWaitLoggedAt = Date.now();
+console.log('%c检测到视频弹题，暂缓播放，等待弹题处理完成', 'color:#FF9800');
+}
+setTimeout(() => this.play(), 2000);
+return;
+}
 const el = this._getVideoEl();
 if (el == null) {
 if (this._advanceLearningStep()) {
@@ -2400,7 +2454,8 @@ return;
 }
 this._noVideoRetryTimes = 0;
 if (typeof this._videoIsDone === 'function' && this._videoIsDone(el)) {
-const nextVideo = this._nextPlayableVideo(el);
+// 第一次严格找可见视频，确认阶段允许播放暂时隐藏（还没渲染出来）的下一段
+const nextVideo = this._nextPlayableVideo(el, (this._allDoneChecks || 0) >= 1);
 if (nextVideo) {
 this._allDoneChecks = 0;
 console.log('%c当前视频已完成，先播放本页下一段视频', 'color:#4CAF50');
@@ -2520,6 +2575,7 @@ return;
 this._stepNavigationBound = true;
 const reenterVideoMode = () => {
 this._videoEl = null;
+this._quizVideo = null;
 this._isPlaying = false;
 this._stepSwitchPending = true;
 this._stepSwitchAt = Date.now();
@@ -2755,6 +2811,7 @@ if (!next) return false;
 return this._switchToVideo(next, reason);
 },
 _proceedAfterVideo(reason, endedVideo) {
+if (this._nextUnitPending) return true;
 if (endedVideo && this._videoEl && this._videoEl !== endedVideo) return true;
 if (endedVideo && endedVideo.isConnected && this._doneVideos) {
 const markedSrc = this._doneVideos.get(endedVideo);
@@ -2795,9 +2852,9 @@ return true;
 },
 _resumeAfterTaskDialog(label) {
 if (this._isPlaying) return;
-const now = Date.now();
-if (now - (this._lastTaskResumeAt || 0) > 8000) this._taskDialogResumes = (this._taskDialogResumes || 0) + 1;
-this._lastTaskResumeAt = now;
+// 每次被弹窗退回都计数，只有真正恢复播放（或视频播完）时才清零，防止弹窗来回循环
+this._taskDialogResumes = (this._taskDialogResumes || 0) + 1;
+this._lastTaskResumeAt = Date.now();
 this._nextUnitPending = false;
 this._videoEl = null;
 this._quizVideo = null;
@@ -2809,7 +2866,29 @@ console.log(`%c已点击“${label}”，1.5 秒后继续完成本页剩余任�
 setTimeout(() => this.play(), 1500);
 },
 _getVideoEl() {
-if (this._videoEl && this._videoEl.isConnected) return this._videoEl;
+if (this._videoEl && this._videoEl.isConnected) {
+// 平台把上一段播放器隐藏、又渲染出新的可见视频时，跟随新的那一段
+let cachedVisible = true;
+try { cachedVisible = this._videoIsVisible(this._videoEl); } catch (_) {}
+if (!cachedVisible) {
+let stillPlaying = false;
+try { stillPlaying = !this._videoEl.paused && !this._videoEl.ended; } catch (_) {}
+if (!stillPlaying) {
+const alt = this._nextPlayableVideo(this._videoEl);
+if (alt) {
+console.log('%c上一段播放器已隐藏，切换到本页新出现的视频', 'color:#4CAF50');
+this._videoEl = alt;
+try {
+alt.muted = true;
+alt.defaultMuted = true;
+alt.volume = 0;
+} catch (_) {}
+return alt;
+}
+}
+}
+return this._videoEl;
+}
 try {
 const allowHidden = (this._noVideoRetryTimes || 0) >= 6;
 const videos = this._findAllVideos(allowHidden);
@@ -2863,11 +2942,15 @@ this._eventVideoEl = null;
 this._boundVideoHandlers = null;
 },
 _handleVideoEnded(e) {
+const target = e && e.target && e.target.tagName === 'VIDEO' ? e.target : null;
+// 迟到的旧视频结束事件、或正在切换小节的过渡期，都不参与推进
+if (target && this._videoEl && target !== this._videoEl) return;
+if (this._nextUnitPending) return;
 const title = this._cellData.currentVideoTitle;
 console.warn(`%c============'${title}' 播放完成=============`, "color:#4CAF50;font-weight:bold");
 this._isPlaying = false;
 this._clearCheckInterval();
-const endedVideo = e && e.target && e.target.tagName === 'VIDEO' ? e.target : this._videoEl;
+const endedVideo = target || this._videoEl;
 this._markVideoDone(endedVideo);
 setTimeout(() => {
 const quizVisible = typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow();
@@ -2889,6 +2972,7 @@ this.play();
 }
 },
 _handleVideoPlay(e) {
+if (e && e.target && e.target.tagName === 'VIDEO' && this._videoEl && e.target !== this._videoEl) return;
 const title = this._cellData.currentVideoTitle;
 console.info(`%c============'${title}' 开始播放=============`, "color:#4CAF50");
 this._isPlaying = true;

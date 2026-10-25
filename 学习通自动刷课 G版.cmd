@@ -1004,7 +1004,13 @@ let docTaskBusy = false;
 let docTaskWakeAt = 0;
 let docTaskSignature = '';
 let docTaskHandledAt = 0;
-let docTaskNextAttempts = 0;
+// —— 完成情况保险：一个任务点里常叠着多篇图文，平台是逐篇记完成的 ——
+// 记下每节图文的阅读结果，切到下一节时回头核对目录有没有打勾，没打勾就回去补做。
+const docProgress = new Map();
+let docLastSection = '';
+let docAuditAt = 0;
+let docPageAttempts = 0;
+let docPageAttemptsSignature = '';
 
 function contentFrameDocs() {
 const items = [];
@@ -1241,6 +1247,140 @@ function pageHasDocumentTasks() {
 try { return contentFrameDocs().length > 0; } catch (_) { return false; }
 }
 
+// 整页正文的指纹：只比对开头几十个字很容易把“同系列的两篇图文”当成同一页，
+// 那样第二篇会被直接跳过，所以这里按全文长度 + 全文哈希 + 图片数一起算。
+function textFingerprint(text) {
+const value = String(text || '');
+let hash = 5381;
+for (let i = 0; i < value.length; i++) hash = ((hash * 33) ^ value.charCodeAt(i)) >>> 0;
+return `${value.length}-${hash.toString(36)}`;
+}
+
+function documentPageSignature(docs) {
+const parts = [];
+for (const item of docs) parts.push(`${textFingerprint(item.text)}/${item.images}`);
+return `${cardsFrameSrcs()}#${parts.join('||')}`;
+}
+
+// 左侧目录里每一节（含完成标记），用于核对“这一节到底打没打勾”
+function catalogItems() {
+const items = [];
+try {
+const root = document.querySelector('#coursetree') || document;
+for (const node of root.querySelectorAll('.posCatalog_select')) {
+if (node.classList.contains('firstLayer')) continue;
+const nameEl = node.querySelector('.posCatalog_name');
+const label = clean((nameEl && (nameEl.getAttribute('title') || nameEl.textContent)) || node.textContent);
+if (!label || label.length > 80) continue;
+if (items.some((item) => item.label === label)) continue;
+let done = false;
+try { done = Boolean(node.querySelector('.icon_Completed')); } catch (_) { done = false; }
+items.push({ label, done, el: node, active: node.classList.contains('posCatalog_active') });
+}
+} catch (_) { /* 目录结构变化时忽略 */ }
+return items;
+}
+
+// 小节标识优先用目录节点的标题，保证和后面核对时用的是同一个键
+function activeSectionKey() {
+try {
+const entry = catalogItems().find((item) => item.active);
+if (entry) return entry.label;
+} catch (_) { /* 忽略 */ }
+try {
+return typeof activeCatalogLabel === 'function' ? clean(activeCatalogLabel()) : '';
+} catch (_) { return ''; }
+}
+
+function catalogSectionDone(label) {
+const target = clean(label);
+if (!target) return null;
+const item = catalogItems().find((entry) => entry.label === target);
+return item ? item.done : null;
+}
+
+// 只有目录里已经出现过“打勾”的节点，才能相信“没打勾＝没完成”；
+// 否则说明这个页面的完成标记不是这么显示的，不要拿它去做回跳判断。
+function catalogMarkerUsable() {
+return catalogItems().some((item) => item.done);
+}
+
+function noteDocumentRead(label, verified) {
+const key = clean(label);
+if (!key) return;
+const state = docProgress.get(key) || { attempts: 0, verified: false, redos: 0, warned: false, at: 0 };
+state.attempts += 1;
+state.verified = state.verified || Boolean(verified);
+state.at = Date.now();
+docProgress.set(key, state);
+docLastSection = key;
+}
+
+function goBackToSection(label) {
+const item = catalogItems().find((entry) => entry.label === label);
+if (!item) return false;
+const clickable = item.el.querySelector('.posCatalog_name') || item.el;
+const state = docProgress.get(label);
+if (state) state.redos += 1;
+const redos = state ? state.redos : 1;
+docAuditAt = Date.now();
+docLastSection = '';
+// 清掉“这页读过了”的标记，回去以后要老老实实重读，而不是直接又点下一节
+docTaskSignature = '';
+docPageAttempts = 0;
+docPageAttemptsSignature = '';
+console.log(`%c完成情况保险：目录里“${label}”还没打勾，返回该节补做，避免漏做（第 ${redos} 次）`, 'color:#FF9800');
+app._nextUnitPending = false;
+app._videoEl = null;
+app._quizVideo = null;
+app._isPlaying = false;
+app._allDoneChecks = 0;
+if (typeof app._clearCheckInterval === 'function') app._clearCheckInterval();
+try {
+clickable.click();
+} catch (_) {
+return false;
+}
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 3500);
+return true;
+}
+
+// 切到新小节时核对上一个图文小节：读过但没看到完成标记、目录也没打勾，就回去补做
+function docProgressAudit() {
+if (stopped) return false;
+if (docTaskBusy) return false;
+if (!docLastSection) return false;
+if (Date.now() - docAuditAt < 6000) return false;
+let label = '';
+try { label = activeSectionKey(); } catch (_) { label = ''; }
+if (!label || label === docLastSection) return false;
+// 视频还在播、或者已经进入测验页时不回跳，等这一段结束再核对
+let playing = false;
+try { playing = typeof visibleVideoState === 'function' && visibleVideoState().playing; } catch (_) { playing = false; }
+if (playing) return false;
+if (typeof app._isChapterTest === 'function' && app._isChapterTest()) return false;
+if (app._videoQuizActive || app._videoQuizPending) return false;
+const state = docProgress.get(docLastSection);
+if (!state || state.verified) {
+docLastSection = label;
+return false;
+}
+if (state.redos >= 2) {
+if (!state.warned) {
+state.warned = true;
+console.warn(`%c“${docLastSection}”已回补 2 次仍未确认完成，先继续后面的内容，结束后请手动检查这一节`, 'color:#F44336');
+}
+docLastSection = label;
+return false;
+}
+if (!catalogMarkerUsable()) return false;
+if (catalogSectionDone(docLastSection) !== false) {
+docLastSection = label;
+return false;
+}
+return goBackToSection(docLastSection);
+}
+
 app._handleDocumentTask = async function () {
 if (stopped || this._destroyed) return false;
 if (docTaskBusy) {
@@ -1256,50 +1396,75 @@ if (pageHasUnfinishedVideo()) return false;
 if (this._isChapterTest()) return false;
 const docs = contentFrameDocs();
 if (!docs.length) return false;
-const signature = docs.map((item) => `${String((item.doc.location && item.doc.location.href) || '').slice(0, 120)}|${item.text.slice(0, 80)}`).join('||');
+const signature = documentPageSignature(docs);
+if (docPageAttemptsSignature !== signature) {
+docPageAttemptsSignature = signature;
+docPageAttempts = 0;
+}
 const samePage = Boolean(signature && signature === docTaskSignature);
-// 本页图文是否还有没滚到底的：有就继续读；都到底了说明已经读完，跳过重复滚动
-const pendingScroll = samePage && documentScrollables(docs).some((entry) => !containerAtBottom(entry));
-if (pendingScroll) {
-if (Date.now() - docTaskHandledAt < 12000) return true;
-if (docTaskNextAttempts >= 6) {
-console.warn('%c同一篇图文已多次尝试仍未切换，已暂停自动推进，请手动检查', 'color:#FF9800');
-return true;
+const scrollables = documentScrollables(docs);
+const sectionDone = documentCompletionShown();
+const pendingScroll = scrollables.some((entry) => !containerAtBottom(entry));
+let alreadyRead = samePage && (!pendingScroll || sectionDone);
+if (samePage && pendingScroll && !sectionDone) {
+// 同一个任务点里又渲染出了后面的图文：接着读，绝不能在这里点“下一节”把它跳过去
+if (docPageAttempts >= 4) {
+console.warn('%c同一处图文反复滚动仍未确认完成，先进入下一步；完成情况保险会在下一节回头核对', 'color:#FF9800');
+alreadyRead = true;
+} else {
+docPageAttempts += 1;
+console.log(`%c本页还有没读到底的图文（可能是刚渲染出的下一篇），继续补读（第 ${docPageAttempts} 次）`, 'color:#2196F3');
 }
-docTaskNextAttempts++;
-docTaskHandledAt = Date.now();
-console.log('%c仍停留在同一篇图文，重新点击“下一节”', 'color:#FF9800');
-setTimeout(() => { if (!stopped && !app._destroyed) app.nextUnit(); }, 600);
-return true;
+} else if (samePage && pendingScroll && sectionDone) {
+console.log('%c本页图文已确认完成（没到底只是阅读器回滚到顶部），跳过重复阅读', 'color:#607D8B');
 }
-const alreadyRead = samePage && !pendingScroll;
 docTaskBusy = true;
-docTaskSignature = signature;
+if (!samePage) docTaskSignature = signature;
 docTaskHandledAt = Date.now();
-if (!alreadyRead) docTaskNextAttempts = 0;
 this._isPlaying = false;
 this._noVideoRetryTimes = 0;
 this._clearCheckInterval();
 const startFrameSrcs = cardsFrameSrcs();
+// 先记下“现在读的是哪一节”，滚动过程中平台自动跳节也不会记到下一节头上
+const sectionKey = activeSectionKey();
+let verified = sectionDone;
 try {
 const totalChars = docs.reduce((sum, item) => sum + item.text.length, 0);
 const totalImages = docs.reduce((sum, item) => sum + item.images, 0);
-let read = { rounds: 0, containers: documentScrollables(docs).length, sawCompletion: documentCompletionShown() };
+let read = { rounds: 0, containers: scrollables.length, sawCompletion: sectionDone };
 if (alreadyRead) {
 console.log('%c本页图文已经滚动到底，跳过重复阅读，检查是否还有视频/下一步', 'color:#607D8B');
+noteDocumentRead(sectionKey, verified);
 } else {
 console.log(`%c检测到阅读/图文任务点（约 ${totalChars} 字，${totalImages} 张图），开始滚动到最底部`, 'color:#2196F3');
 read = await readThroughDocuments();
-if (!read.sawCompletion) {
+verified = read.sawCompletion || documentCompletionShown();
+if (!verified) {
 console.log('%c暂未看到完成标记，在底部再轻微滚动一次以确保触发平台检测', 'color:#FF9800');
 for (const entry of documentScrollables(contentFrameDocs())) {
 if (stopped) return true;
 await nudgeToBottom(entry);
 }
-read.sawCompletion = await waitForDocumentCompletion(3000);
+verified = await waitForDocumentCompletion(5000);
 }
-if (read.sawCompletion) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
-else console.warn(`%c已滚动 ${read.rounds} 轮、覆盖 ${read.containers} 个滚动区，暂未收到平台完成标记，仍按已完成继续切换（若被弹窗拦下会自动处理）`, 'color:#FF9800');
+// 多篇图文里，后面那篇可能滚到下面才渲染出来：读完再核对一次内容有没有变多
+let latestSignature = documentPageSignature(contentFrameDocs());
+for (let extra = 0; extra < 2 && !stopped && latestSignature !== signature; extra++) {
+console.log('%c滚动后本页又出现了新的图文内容，继续补读', 'color:#2196F3');
+const more = await readThroughDocuments();
+read.rounds += more.rounds;
+read.containers = Math.max(read.containers, more.containers);
+if (more.sawCompletion) verified = true;
+if (!verified) verified = await waitForDocumentCompletion(3000);
+const nextSignature = documentPageSignature(contentFrameDocs());
+if (nextSignature === latestSignature) break;
+latestSignature = nextSignature;
+}
+read.sawCompletion = verified;
+docTaskSignature = latestSignature;
+noteDocumentRead(sectionKey, verified);
+if (verified) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
+else console.warn(`%c已滚动 ${read.rounds} 轮、覆盖 ${read.containers} 个滚动区，暂未收到平台完成标记，仍按已完成继续切换（下一节会回头核对是否漏做）`, 'color:#FF9800');
 }
 docTaskHandledAt = Date.now();
 } catch (error) {
@@ -1336,6 +1501,25 @@ return true;
 };
 
 app._pageHasDocumentTasks = pageHasDocumentTasks;
+
+// 被“任务点未完成”弹窗退回，说明这一页没做完整：清掉“已读过”的标记，回去重新读，
+// 否则会照着旧标记直接再点一次“下一节”，永远补不上漏掉的那一篇。
+app._resetDocReading = function () {
+docTaskSignature = '';
+docTaskHandledAt = 0;
+docPageAttempts = 0;
+docPageAttemptsSignature = '';
+if (docLastSection) {
+const state = docProgress.get(docLastSection);
+if (state) {
+state.verified = false;
+state.attempts = 0;
+}
+}
+};
+
+app._docProgressAudit = docProgressAudit;
+app._goBackToSection = goBackToSection;
 
 function letterOf(el) {
 const text = clean(el.textContent).replace(/[.、．:：,，]+$/, '');
@@ -3041,6 +3225,8 @@ console.log('%c正在切换学习小节，暂缓播放', 'color:#607D8B');
 setTimeout(() => this.play(), 1500);
 return;
 }
+// 完成情况保险：上一节图文在目录里没打勾就回头补做，避免多篇图文时跳着做漏掉内容
+if (typeof this._docProgressAudit === 'function' && this._docProgressAudit()) return;
 // 弹题还开着时不要先开始播，避免在弹题遮罩后面把视频播过去
 if (this._videoQuizPending && typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow()) {
 this._isPlaying = false;
@@ -3528,6 +3714,8 @@ this._videoNextChecks = 0;
 this._allDoneChecks = 0;
 this._isPlaying = false;
 this._clearCheckInterval();
+// 平台说这一页还有任务点没完成：把“已读过”的标记清掉，回去重新读一遍
+if (typeof this._resetDocReading === 'function') this._resetDocReading();
 console.log(`%c已点击“${label}”，1.5 秒后继续完成本页剩余任务点`, 'color:#FF9800');
 setTimeout(() => this.play(), 1500);
 },

@@ -913,10 +913,18 @@ const label = activeCatalogLabel();
 const labelSaysQuiz = /测验|考试|测试|答题/.test(label);
 // 1) 视频还在播：绝不可能是章节测验
 if (probe.videoPlaying) return '视频';
-// 2) 测验框架里明确没有题目：有视频就继续按视频处理
-if (probe.quiz === 'none') return probe.videoAny ? '视频' : title;
-// 3) 测验框架跨域读不到：页面还有视频、目录高亮也不是测验节点时，按视频处理
-if (probe.quiz === 'unknown' && probe.videoAny && !labelSaysQuiz) return '视频';
+// 2) 框架里明确没有题目：有视频按视频，没有视频就交给阅读/图文逻辑
+if (probe.quiz === 'none') {
+if (probe.videoAny) return '视频';
+if (labelSaysQuiz) return title;
+return '';
+}
+// 3) 框架跨域读不到：目录高亮不是测验时，不再当作测验
+if (probe.quiz === 'unknown') {
+if (!labelSaysQuiz && label) return probe.videoAny ? '视频' : '';
+if (probe.videoAny && !labelSaysQuiz) return '视频';
+return title;
+}
 // 4) 有题目痕迹，但目录高亮明确不是测验节点（例如 1.2 学习天地）：仍按视频处理
 if (label && !labelSaysQuiz && probe.videoAny) return '视频';
 return title;
@@ -936,6 +944,225 @@ const isQuizFrame = cardsFrame && new URL(cardsFrame.getAttribute('src'), locati
 const quizLabel = /测验|考试|测试|答题/.test(activeCatalogLabel());
 return Boolean(isQuizFrame && quizLabel && document.querySelector('.posCatalog_active .icon_Completed'));
 }
+
+// —— 阅读/图文任务点：平台要求把内容区滚动到最底部才会记为完成 ——
+// 一个节点里可能有多篇图文（num 0、1、2…），完成一篇后点“下一节”继续下一篇。
+let docTaskBusy = false;
+let docTaskWakeAt = 0;
+let docTaskSignature = '';
+let docTaskHandledAt = 0;
+let docTaskNextAttempts = 0;
+
+function contentFrameDocs() {
+const items = [];
+for (const doc of courseDocuments()) {
+let frameEl = null;
+try { frameEl = doc.defaultView && doc.defaultView.frameElement; } catch (_) { frameEl = null; }
+// 只处理可见的内容框架，跳过顶层目录页和隐藏框架
+if (!frameEl) continue;
+let rect = null;
+try { rect = frameEl.getClientRects()[0]; } catch (_) {}
+if (!rect || rect.width < 200 || rect.height < 150) continue;
+let text = '';
+let images = 0;
+try { text = clean(doc.body ? doc.body.innerText : ''); } catch (_) { text = ''; }
+try {
+for (const img of doc.querySelectorAll('img')) {
+const r = img.getClientRects()[0];
+if (r && r.width >= 60 && r.height >= 40) images++;
+}
+} catch (_) {}
+if (text.length < 30 && images === 0) continue;
+// 空页面和测验框架都不按图文处理
+if (/暂无内容|暂无学习内容|暂无任务点/.test(text) && text.length < 200) continue;
+if (QUIZ_TEXT_PATTERN.test(text)) continue;
+// 视频页（哪怕播放器还没渲染完）不按图文处理，交给视频逻辑
+let hasVideo = false;
+try {
+hasVideo = Boolean(doc.querySelector('video,.vjs-tech,.vjs-big-play-button,#video_html5_api,.ans-video'));
+} catch (_) { hasVideo = false; }
+if (hasVideo) continue;
+items.push({ doc, text, images });
+}
+return items;
+}
+
+function documentScrollables(docs) {
+const list = [];
+for (const item of docs) {
+const doc = item.doc;
+const win = doc.defaultView;
+if (!win) continue;
+const add = (el) => {
+if (!el || list.some((entry) => entry.el === el)) return;
+let r = null;
+try { r = el.getClientRects()[0]; } catch (_) {}
+if (r && (r.width < 160 || r.height < 80)) return;
+list.push({ el, doc });
+};
+try {
+const scroller = doc.scrollingElement || doc.documentElement;
+if (scroller && scroller.scrollHeight - scroller.clientHeight > 40) add(scroller);
+for (const el of doc.querySelectorAll('div,section,article,main')) {
+if (list.length >= 8) break;
+const style = win.getComputedStyle(el);
+if (!/(auto|scroll|overlay)/.test(style.overflowY)) continue;
+if (el.scrollHeight - el.clientHeight <= 40 || el.scrollHeight < 400) continue;
+add(el);
+}
+} catch (_) { /* 忽略单个框架 */ }
+}
+return list;
+}
+
+function cardsFrameSrcs() {
+const srcs = [];
+try {
+for (const frame of document.querySelectorAll('iframe[src*="/knowledge/cards"]')) {
+try {
+if (!frame.getClientRects().length) continue;
+srcs.push(frame.getAttribute('src') || '');
+} catch (_) { /* 忽略单个框架 */ }
+}
+} catch (_) { /* 忽略整体失败 */ }
+return srcs.join('||');
+}
+
+async function scrollToBottom(entry) {
+const { el, doc } = entry;
+const win = doc.defaultView;
+if (!win) return;
+const max = Math.max(0, el.scrollHeight - el.clientHeight);
+if (max <= 20) return;
+// 分多步缓慢滚动，模拟真实阅读，触发平台（ed_complete.js）的滚动监听
+const steps = Math.min(24, Math.max(8, Math.ceil(max / Math.max(200, el.clientHeight * 0.7))));
+for (let i = 1; i <= steps; i++) {
+if (stopped) return;
+el.scrollTop = Math.round((max * i) / steps);
+try { el.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
+try { el.dispatchEvent(new win.WheelEvent('wheel', { deltaY: 320, bubbles: true, cancelable: true })); } catch (_) {}
+await sleep(220 + Math.floor(Math.random() * 160));
+}
+el.scrollTop = max;
+try { el.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
+}
+
+async function nudgeToBottom(entry) {
+const { el, doc } = entry;
+const win = doc.defaultView;
+if (!win) return;
+const max = Math.max(0, el.scrollHeight - el.clientHeight);
+if (max <= 20) return;
+for (let i = 0; i < 3; i++) {
+if (stopped) return;
+el.scrollTop = Math.max(0, max - 120 - i * 40);
+try { el.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
+await sleep(160);
+el.scrollTop = max;
+try { el.dispatchEvent(new win.Event('scroll', { bubbles: true })); } catch (_) {}
+await sleep(160);
+}
+}
+
+function documentCompletionShown() {
+try {
+if (document.querySelector('.posCatalog_active .icon_Completed')) return true;
+} catch (_) {}
+for (const item of contentFrameDocs()) {
+if (/任务点已完成|阅读已完成|已完成阅读|本篇已完成/.test(item.text)) return true;
+}
+return false;
+}
+
+async function waitForDocumentCompletion(ms) {
+const until = Date.now() + ms;
+while (Date.now() < until) {
+if (stopped) return false;
+if (documentCompletionShown()) return true;
+await sleep(500);
+}
+return false;
+}
+
+app._handleDocumentTask = async function () {
+if (stopped || this._destroyed) return false;
+if (docTaskBusy) {
+// 滚动任务正在进行，避免重复触发；稍后再确认下一步（限制排队，避免定时器堆积）
+if (!docTaskWakeAt || Date.now() - docTaskWakeAt > 3000) {
+docTaskWakeAt = Date.now();
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 1500);
+}
+return true;
+}
+if (visibleVideoState().any) return false;
+if (this._isChapterTest()) return false;
+const docs = contentFrameDocs();
+if (!docs.length) return false;
+const signature = docs.map((item) => `${String((item.doc.location && item.doc.location.href) || '').slice(0, 120)}|${item.text.slice(0, 80)}`).join('||');
+if (signature && signature === docTaskSignature) {
+if (Date.now() - docTaskHandledAt < 12000) return true;
+if (docTaskNextAttempts >= 6) {
+console.warn('%c同一篇图文已多次尝试仍未切换，已暂停自动推进，请手动检查', 'color:#FF9800');
+return true;
+}
+docTaskNextAttempts++;
+docTaskHandledAt = Date.now();
+console.log('%c仍停留在同一篇图文，重新点击“下一节”', 'color:#FF9800');
+setTimeout(() => { if (!stopped && !app._destroyed) app.nextUnit(); }, 600);
+return true;
+}
+docTaskBusy = true;
+docTaskSignature = signature;
+docTaskHandledAt = Date.now();
+docTaskNextAttempts = 0;
+this._isPlaying = false;
+this._noVideoRetryTimes = 0;
+this._clearCheckInterval();
+const startFrameSrcs = cardsFrameSrcs();
+try {
+const totalChars = docs.reduce((sum, item) => sum + item.text.length, 0);
+const totalImages = docs.reduce((sum, item) => sum + item.images, 0);
+console.log(`%c检测到阅读/图文任务点（约 ${totalChars} 字，${totalImages} 张图），开始滚动到最底部`, 'color:#2196F3');
+const entries = documentScrollables(docs);
+for (const entry of entries) {
+if (stopped) return true;
+await scrollToBottom(entry);
+}
+let done = await waitForDocumentCompletion(4000);
+if (!done) {
+console.log('%c暂未看到完成标记，在底部再轻微滚动一次以确保触发平台检测', 'color:#FF9800');
+for (const entry of entries) {
+if (stopped) return true;
+await nudgeToBottom(entry);
+}
+done = await waitForDocumentCompletion(3000);
+}
+if (done) console.log('%c阅读任务点已完成，准备进入下一学习步骤', 'color:#4CAF50');
+else console.warn('%c滚动已到最底部，暂未收到平台完成标记，仍按已完成继续切换（若被弹窗拦下会自动处理）', 'color:#FF9800');
+docTaskHandledAt = Date.now();
+} catch (error) {
+console.warn('阅读任务点滚动失败，已跳过本次滚动:', error && error.message ? error.message : error);
+} finally {
+docTaskBusy = false;
+}
+// 有的课程在阅读完成后会自动切到下一步，这时不要再点“下一节”，否则会跳过内容
+const endFrameSrcs = cardsFrameSrcs();
+if (endFrameSrcs && startFrameSrcs && endFrameSrcs !== startFrameSrcs) {
+console.log('%c页面已自动进入下一学习步骤', 'color:#4CAF50');
+app._nextUnitPending = false;
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 600);
+return true;
+}
+try {
+console.log('%c阅读任务点处理完毕，点击“下一节”继续', 'color:#4CAF50');
+await goToNextStep();
+} catch (error) {
+app._nextUnitPending = false;
+console.warn('%c切换下一学习步骤失败，10 秒后重试：' + (error && error.message ? error.message : error), 'color:#FF9800');
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 10000);
+}
+return true;
+};
 
 function letterOf(el) {
 const text = clean(el.textContent).replace(/[.、．:：,，]+$/, '');
@@ -1367,6 +1594,8 @@ const previousVideos = typeof app._findAllVideos === 'function' ? app._findAllVi
 const previousVideoSrcs = previousVideos.map((video) => {
 try { return video.currentSrc || video.getAttribute('src') || ''; } catch (_) { return ''; }
 });
+// 阅读/图文任务点切换时页面里没有视频，靠内容框架的 src（num/chapterId 变化）判断是否已切换
+const previousFrameSrcs = cardsFrameSrcs();
 app._clearCheckInterval();
 app._videoEl = null;
 app._quizVideo = null;
@@ -1407,6 +1636,11 @@ return;
 }
 currentStep = app._currentStepTitle();
 if (currentStep === '章节测验' && currentStep !== previousStep) {
+stepReady = true;
+break;
+}
+const frameSrcs = cardsFrameSrcs();
+if (frameSrcs && previousFrameSrcs && frameSrcs !== previousFrameSrcs) {
 stepReady = true;
 break;
 }
@@ -2614,6 +2848,8 @@ return;
 }
 const el = this._getVideoEl();
 if (el == null) {
+// 阅读/图文任务点：先把内容区滚动到最底部，完成后再点“下一节”
+if (typeof this._handleDocumentTask === 'function' && await this._handleDocumentTask()) return;
 if (this._advanceLearningStep()) {
 console.log("%c当前不在视频页，已尝试切到下一学习步骤，2秒后重试", "color:#607D8B");
 setTimeout(() => {

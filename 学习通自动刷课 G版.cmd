@@ -1188,6 +1188,7 @@ try { return video.currentSrc || video.getAttribute('src') || ''; } catch (_) { 
 });
 app._clearCheckInterval();
 app._videoEl = null;
+app._quizVideo = null;
 app._doneVideos = new Map();
 app._isPlaying = false;
 let skipped = 0;
@@ -1269,6 +1270,7 @@ console.log(`下一学习步骤仍在加载，已等待 ${Math.round(waited / 10
 if (!stepReady) throw new Error(`点击“下一节”后等待超时，新学习步骤仍未加载完成；当前页签：${currentStep || '未显示'}`);
 app._nextUnitPending = false;
 app._videoEl = null;
+app._quizVideo = null;
 app._doneVideos = new Map();
 app._videoNextChecks = 0;
 app._initCellData();
@@ -1643,6 +1645,7 @@ videoQuizSkipAt = Date.now();
 videoQuizStuckSince = 0;
 app._videoQuizPending = false;
 app._videoEndedDuringQuiz = false;
+app._quizVideo = null;
 console.warn(`%c视频弹题${reason}，自动点击“下一节”继续`, 'color:#FF9800');
 button.scrollIntoView({ block: 'center' });
 button.click();
@@ -1889,6 +1892,35 @@ if (cleared) console.log(`%c多选题重答前已清空 ${cleared} 个已勾选�
 return cleared;
 }
 
+// 多段视频页面里，弹题属于哪一段：优先“和弹题同一文档、正在播放、尚未完成”的那一段
+function videoForQuiz(question) {
+const doc = question && question.doc ? question.doc : null;
+const candidates = [];
+const push = (video) => {
+if (!video || !video.isConnected || candidates.includes(video)) return;
+candidates.push(video);
+};
+if (typeof app._findAllVideos === 'function') {
+try { app._findAllVideos(true).forEach(push); } catch (_) { /* 忽略 */ }
+}
+push(app._videoEl);
+if (!candidates.length) {
+try { push(app._getVideoEl()); } catch (_) { /* 忽略 */ }
+}
+const isDone = (video) => {
+try { return typeof app._videoIsDone === 'function' ? app._videoIsDone(video) : false; } catch (_) { return false; }
+};
+const score = (video) => (doc && video.ownerDocument === doc ? 4 : 0) + (video.paused ? 0 : 2) + (isDone(video) ? 0 : 1);
+return candidates.slice().sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+// 弹题签名带上所属视频地址，保证同一道题出现在不同视频里时各自独立计次
+function videoQuizScope(video) {
+let src = '';
+try { src = typeof app._videoSrcOf === 'function' ? app._videoSrcOf(video) : ''; } catch (_) { src = ''; }
+return src ? src.replace(/[?#].*$/, '') : 'no-src';
+}
+
 async function handleVideoQuiz() {
 if (stopped || videoQuizBusy || app._isChapterTest()) return;
 if (videoQuizSuccessVisible()) {
@@ -1935,14 +1967,15 @@ return;
 activeVideoQuiz = question;
 app._videoQuizPending = true;
 videoQuizStuckSince = 0;
-const video = typeof app._getVideoEl === 'function' ? app._getVideoEl() : null;
+const video = videoForQuiz(question);
+if (video) app._quizVideo = video;
 const signatureTitle = question.title
 .replace(/共\s*\d+\s*题[，,]\s*已答对\s*\d+\s*题/g, '')
 .replace(/真遗憾[，,]?再?再接再厉[！!。]?/g, '')
 .replace(/回答(?:错误|正确)[\s\S]*$/, '')
 .replace(/正确答案\s*[：:][A-H\s、,，]*/g, '')
 .trim();
-const signature = `${question.kind}:${signatureTitle}:${question.options.map((option) => option.letter).join('')}`;
+const signature = `${videoQuizScope(video)}|${question.kind}:${signatureTitle}:${question.options.map((option) => option.letter).join('')}`;
 const state = videoQuizState(signature);
 state.signature = signature;
 state.question = question;
@@ -1984,7 +2017,8 @@ if (app._videoEndedDuringQuiz) scheduleVideoEndedNext(1500);
 console.warn('%c视频弹题已答对，但暂时没找到“继续学习”按钮，2 秒后重试', 'color:#FF9800');
 }
 setTimeout(() => {
-if (typeof app._tryResumePlayback === 'function') app._tryResumePlayback('video-quiz-done');
+if (typeof app._resumeAfterVideoQuiz === 'function') app._resumeAfterVideoQuiz();
+else if (typeof app._tryResumePlayback === 'function') app._tryResumePlayback('video-quiz-done');
 }, 600);
 return;
 }
@@ -2201,6 +2235,14 @@ if (this._videoQuizActive || this._videoQuizPending) return;
 if (typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow()) return;
 const video = this._getVideoEl();
 if (!video || !this._isPlaying) return;
+if (typeof this._videoIsDone === 'function' && this._videoIsDone(video)) {
+console.log('%c当前视频已经完成，不再重播，继续查找本页下一段视频', 'color:#4CAF50');
+this._isPlaying = false;
+this._clearCheckInterval();
+if (typeof this._proceedAfterVideo === 'function') this._proceedAfterVideo('当前视频已完成', video);
+else this.nextUnit();
+return;
+}
 video.muted = true;
 video.defaultMuted = true;
 video.volume = 0;
@@ -2212,6 +2254,24 @@ video.play().catch((err) => {
 console.error("静音恢复播放失败:", err);
 });
 });
+},
+// 弹题答完后回到“弹题所属的那一段视频”，而不是回到本页第一段或已完成的视频
+_resumeAfterVideoQuiz() {
+const quizVideo = this._quizVideo;
+this._quizVideo = null;
+if (quizVideo && quizVideo.isConnected) {
+if (typeof this._videoIsDone === 'function' && this._videoIsDone(quizVideo)) {
+this._isPlaying = false;
+this._clearCheckInterval();
+if (typeof this._proceedAfterVideo === 'function') this._proceedAfterVideo('弹题结束，本段视频已完成', quizVideo);
+else this.nextUnit();
+return;
+}
+this._videoEl = quizVideo;
+this._videoNextChecks = 0;
+this._isPlaying = true;
+}
+this._tryResumePlayback('video-quiz-done');
 },
 _checkVideoStatus() {
 if (this._videoQuizActive || this._videoQuizPending) return;
@@ -2662,6 +2722,7 @@ if (!video) return false;
 const current = this._videoEl;
 if (current && current !== video) this._markVideoDone(current);
 this._videoEl = video;
+this._quizVideo = null;
 this._videoNextChecks = 0;
 this._isPlaying = false;
 this._nearEndSince = 0;
@@ -2731,6 +2792,7 @@ if (now - (this._lastTaskResumeAt || 0) > 8000) this._taskDialogResumes = (this.
 this._lastTaskResumeAt = now;
 this._nextUnitPending = false;
 this._videoEl = null;
+this._quizVideo = null;
 this._videoNextChecks = 0;
 this._allDoneChecks = 0;
 this._isPlaying = false;

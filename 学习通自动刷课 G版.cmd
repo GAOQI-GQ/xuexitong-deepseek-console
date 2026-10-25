@@ -590,6 +590,16 @@ function openChaoxingPage() {
     }
 }
 
+// 端口被旧实例占用时给出可读提示，而不是抛出 Node 堆栈
+server.on('error', (error) => {
+    if (error && error.code === 'EADDRINUSE') {
+        console.error(`端口 ${PORT} 已被占用：可能之前启动的服务窗口还没关闭。请关闭旧的 DeepSeek Local Service 窗口后重新启动。`);
+    } else {
+        console.error('本地服务启动失败：', error && error.message ? error.message : error);
+    }
+    if (!server.listening) process.exit(1);
+});
+
 server.listen(PORT, '127.0.0.1', () => {
     console.log(`本地服务已启动：http://127.0.0.1:${PORT}`);
     console.log(`可视化设置页：http://127.0.0.1:${PORT}/setup`);
@@ -625,16 +635,17 @@ console.error('请先启动 DeepSeek 本地服务，再点击书签注入');
 return;
 }
 
-const previousApp = PAGE[APP_KEY];
-if (previousApp && typeof previousApp.destroy === 'function') {
-previousApp.destroy();
+// 清理旧实例失败也不能影响本次注入
+const destroyQuietly = (instance) => {
+try {
+if (instance && typeof instance.destroy === 'function') instance.destroy();
+} catch (error) {
+console.warn('清理旧实例失败，已忽略:', error);
 }
-if (PAGE.__xuexitongPlayerV3 && typeof PAGE.__xuexitongPlayerV3.destroy === 'function') {
-PAGE.__xuexitongPlayerV3.destroy();
-}
-if (PAGE.__xuexitongPlayerV800DeepSeek && typeof PAGE.__xuexitongPlayerV800DeepSeek.destroy === 'function') {
-PAGE.__xuexitongPlayerV800DeepSeek.destroy();
-}
+};
+destroyQuietly(PAGE[APP_KEY]);
+destroyQuietly(PAGE.__xuexitongPlayerV3);
+destroyQuietly(PAGE.__xuexitongPlayerV800DeepSeek);
 if (PAGE[BOOT_TIMER_KEY]) {
 clearInterval(PAGE[BOOT_TIMER_KEY]);
 PAGE[BOOT_TIMER_KEY] = null;
@@ -664,7 +675,7 @@ console.log('jQuery loaded.');
 waitForCoursePage();
 };
 script.onerror = () => console.error('jQuery 加载失败，脚本无法启动');
-document.head.appendChild(script);
+(document.head || document.documentElement).appendChild(script);
 } else {
 waitForCoursePage();
 }
@@ -752,6 +763,8 @@ let stopped = false;
 const originalDestroy = app.destroy.bind(app);
 app.destroy = function () {
 stopped = true;
+// 标记已销毁：销毁前排队的一次性定时器（重试播放、结束事件）即使触发也不再操作页面
+app._destroyed = true;
 clearInterval(videoQuizTimer);
 originalDestroy();
 };
@@ -878,6 +891,7 @@ return Array.from(found.values()).sort((a, b) => a.letter.localeCompare(b.letter
 function extractQuestions() {
 const questions = [];
 for (const doc of courseDocuments()) {
+if (!doc.body) continue;
 const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
 const seenCards = new Set();
 let node;
@@ -1212,6 +1226,8 @@ if (stopped) throw new Error('脚本已停止');
 if (!findNextButton()) throw new Error('未找到页面下方的“下一节”按钮');
 app._nextUnitPending = true;
 const previousStep = app._currentStepTitle();
+// 被“任务点未完成”弹窗退回时仍在原页面，需要恢复已完成视频标记，避免重播已经看完的段落
+const previousDoneVideos = app._doneVideos;
 const previousVideos = typeof app._findAllVideos === 'function' ? app._findAllVideos() : [];
 const previousVideoSrcs = previousVideos.map((video) => {
 try { return video.currentSrc || video.getAttribute('src') || ''; } catch (_) { return ''; }
@@ -1250,6 +1266,7 @@ if (!app._nextUnitPending) return;
 const dialogAction = confirmLeaveChapterDialog();
 if (dialogAction) {
 app._nextUnitPending = false;
+app._doneVideos = previousDoneVideos;
 console.log(`%c平台提示本章还有任务点未完成，已点击“${dialogAction}”，取消切换下一节，回到本页继续完成`);
 return;
 }
@@ -2162,7 +2179,11 @@ text: clean(doc.body?.innerText || '').slice(0, 500),
 
 videoQuizTimer = setInterval(() => {
 if (stopped) return;
+try {
 confirmLeaveChapterDialog();
+} catch (error) {
+console.error('处理“任务点未完成”弹窗时出错:', error);
+}
 if (videoQuizBusy) return;
 handleVideoQuiz().catch((error) => console.error('视频弹题检测失败:', error));
 }, 2000);
@@ -2193,6 +2214,7 @@ _checkInterval: null,
 _eventVideoEl: null,
 _boundVideoHandlers: null,
 _nextUnitPending: false,
+_destroyed: false,
 _chapterAdvanceTimes: 0,
 _cellData: {
 cells: 0,
@@ -2267,6 +2289,7 @@ this._checkVideoStatus();
 }, this.configs.videoCheckInterval);
 },
 _tryResumePlayback(reason) {
+if (this._destroyed) return;
 const now = Date.now();
 if (now - this._guardLastResumeTs < this.configs.guardResumeCooldownMs) {
 return;
@@ -2317,6 +2340,7 @@ if (typeof this._videoEventHandle === 'function') this._videoEventHandle();
 this._tryResumePlayback('video-quiz-done');
 },
 _checkVideoStatus() {
+if (this._destroyed) return;
 if (this._videoQuizActive || this._videoQuizPending) return;
 if (typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow()) return;
 try {
@@ -2388,6 +2412,7 @@ _guardLastResumeTs: 0,
 _nearEndSince: 0,
 async play() {
 try {
+if (this._destroyed) return;
 if (this._isChapterTest()) {
 this._videoEl = null;
 this._isPlaying = false;
@@ -2682,7 +2707,10 @@ console.warn("%c未找到当前激活的视频节点，可能需要手动选择"
 console.log(`%c课程信息: ${this._cellData.cells}章, ${this._cellData.nCells}节, 当前: 第${this._cellData.currentCellIndex + 1}章第${this._cellData.currentNCellIndex + 1}节`, "color:#607D8B");
 },
 _getTreeContainer() {
-if (!this._treeContainerEl) {
+// 页面局部刷新可能替换课程目录节点，旧的 jQuery 引用失效时重新获取
+const cached = this._treeContainerEl;
+const cachedRoot = cached && cached[0];
+if (!cached || cached.length <= 0 || !cachedRoot || !cachedRoot.isConnected) {
 const el = $('#coursetree');
 if (el.length <= 0) {
 throw new Error("找不到视频列表");
@@ -2811,6 +2839,7 @@ if (!next) return false;
 return this._switchToVideo(next, reason);
 },
 _proceedAfterVideo(reason, endedVideo) {
+if (this._destroyed) return true;
 if (this._nextUnitPending) return true;
 if (endedVideo && this._videoEl && this._videoEl !== endedVideo) return true;
 if (endedVideo && endedVideo.isConnected && this._doneVideos) {
@@ -2942,6 +2971,7 @@ this._eventVideoEl = null;
 this._boundVideoHandlers = null;
 },
 _handleVideoEnded(e) {
+if (this._destroyed) return;
 const target = e && e.target && e.target.tagName === 'VIDEO' ? e.target : null;
 // 迟到的旧视频结束事件、或正在切换小节的过渡期，都不参与推进
 if (target && this._videoEl && target !== this._videoEl) return;

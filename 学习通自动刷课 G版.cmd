@@ -953,25 +953,31 @@ return null;
 }
 
 function findLeaveChapterDialogButton(dialog) {
-for (const label of ['去完成', '确定', '确认', '继续学习', '下一节']) {
+for (const label of ['去完成', '去学习', '继续学习', '继续完成', '确定', '确认']) {
 const button = findButtonIn(dialog, label);
-if (button) return button;
+if (button) return { button, label };
 }
 const primary = dialog.querySelector('.layui-layer-btn0, .bluebtn, .sure, [role="dialog"] button');
-return visible(primary) ? primary : null;
+if (!visible(primary)) return null;
+const text = clean(primary.value || primary.innerText || '').replace(/\s+/g, '');
+if (/下一节|跳过|取消|关闭/.test(text)) return null;
+return { button: primary, label: text || '主按钮' };
 }
 
 function confirmLeaveChapterDialog() {
-if (Date.now() - leaveDialogClickedAt < 2000) return false;
+if (Date.now() - leaveDialogClickedAt < 2000) return null;
 const dialog = findLeaveChapterDialog();
-if (!dialog) return false;
-const button = findLeaveChapterDialogButton(dialog);
-if (!button) return false;
+if (!dialog) return null;
+const found = findLeaveChapterDialogButton(dialog);
+if (!found) return null;
 leaveDialogClickedAt = Date.now();
-console.log('%c检测到“当前章节还有任务点未完成”弹窗，自动点击“去完成”继续', 'color:#FF9800');
-button.scrollIntoView({ block: 'center' });
-button.click();
-return true;
+console.log(`%c检测到“当前章节还有任务点未完成”弹窗，自动点击“${found.label}”去完成剩余任务点`, 'color:#FF9800');
+found.button.scrollIntoView({ block: 'center' });
+found.button.click();
+if (typeof app !== 'undefined' && app && typeof app._resumeAfterTaskDialog === 'function') {
+app._resumeAfterTaskDialog(found.label);
+}
+return found.label;
 }
 
 async function revealQuizQuestions() {
@@ -1188,7 +1194,6 @@ let skipped = 0;
 let emptySince = 0;
 let clickedAt = 0;
 let nextLogAt = 0;
-let dialogClicks = 0;
 const clickNext = async () => {
 let button = findNextButton();
 for (let retry = 0; !button && retry < 6 && !stopped; retry++) {
@@ -1210,11 +1215,12 @@ let stepReady = false;
 for (let attempt = 0; attempt < 600; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 await sleep(500);
-if (dialogClicks < 5 && confirmLeaveChapterDialog()) {
-dialogClicks++;
-clickedAt = Date.now();
-nextLogAt = clickedAt + 15000;
-emptySince = 0;
+if (!app._nextUnitPending) return;
+const dialogAction = confirmLeaveChapterDialog();
+if (dialogAction) {
+app._nextUnitPending = false;
+console.log(`%c平台提示本章还有任务点未完成，已点击“${dialogAction}”，取消切换下一节，回到本页继续完成`);
+return;
 }
 currentStep = app._currentStepTitle();
 if (currentStep === '章节测验' && currentStep !== previousStep) {
@@ -1283,6 +1289,47 @@ return extractQuestions().map((q, i) => ({
 id: i + 1, type: q.kind, question: q.title,
 options: q.options.map((o) => `${o.letter}. ${o.text}`),
 }));
+};
+
+// 诊断用：列出页面里所有视频（包括隐藏的）和所在框架，便于排查多视频页面
+app.inspectVideos = function () {
+const rows = [];
+const docs = [];
+const visit = (doc, depth) => {
+if (!doc || depth > 4 || docs.includes(doc)) return;
+docs.push(doc);
+try {
+for (const video of doc.querySelectorAll('video')) {
+let rect = null;
+try { rect = video.getClientRects()[0]; } catch (_) {}
+rows.push({
+frame: String((doc.location && doc.location.href) || '').slice(0, 90),
+id: video.id || '',
+src: String(video.currentSrc || video.getAttribute('src') || '').slice(0, 90),
+visible: Boolean(rect),
+size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '0x0',
+ended: video.ended,
+time: Math.round(video.currentTime || 0),
+duration: Math.round(video.duration || 0),
+});
+}
+} catch (_) {}
+try {
+for (const frame of doc.querySelectorAll('iframe')) {
+let child = null;
+try { child = frame.contentDocument; } catch (_) {}
+if (child) visit(child, depth + 1);
+}
+} catch (_) {}
+};
+visit(document, 0);
+const result = {
+step: app._currentStepTitle(),
+playable: app._findAllVideos().length,
+videos: rows,
+};
+console.log('视频诊断结果（请把这一条展开后截图）：', result);
+return result;
 };
 
 app._advanceChapterTest = function () {
@@ -2083,7 +2130,7 @@ get cellData() {
 return this._cellData;
 },
 run() {
-console.log("%c=== 学习通视频与章节测验助手 V4 启动 ===", "color:#4CAF50;font-size:16px;font-weight:bold");
+console.log("%c=== 学习通视频与章节测验助手 V4 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
 this._nextUnitPending = false;
 this._chapterAdvanceTimes = 0;
 this._getTreeContainer();
@@ -2308,6 +2355,7 @@ setTimeout(() => this.play(), 2000);
 return;
 }
 this._allDoneChecks = 0;
+if (!this._canAdvanceAfterVideos()) return;
 console.log('%c本页视频均已完成，自动切换下一节', 'color:#FF9800');
 setTimeout(() => this.nextUnit(), 800);
 return;
@@ -2321,6 +2369,7 @@ el.defaultMuted = true;
 el.volume = 0;
 await el.play();
 this._tryTimes = 0;
+this._taskDialogResumes = 0;
 console.log('%c视频开始播放，保持页面默认播放速度', 'color:#4CAF50');
 this._startVideoMonitoring();
 } catch (playError) {
@@ -2518,7 +2567,7 @@ this._treeContainerEl = el;
 }
 return this._treeContainerEl;
 },
-_findAllVideos() {
+_findAllVideos(includeHidden = false) {
 const preferred = [];
 const fallback = [];
 const seenDocs = new Set();
@@ -2531,9 +2580,11 @@ try { src = video.currentSrc || video.getAttribute('src') || ''; } catch (_) {}
 let hasSource = false;
 try { hasSource = Boolean(video.querySelector('source')); } catch (_) {}
 if (!src && !hasSource) return;
+if (!includeHidden) {
 let rects = null;
 try { rects = video.getClientRects(); } catch (_) {}
 if (!rects || !rects.length) return;
+}
 let isPlayer = false;
 try {
 isPlayer = /video_html5/i.test(video.id || '') || /video_html5/i.test(String(video.className || ''));
@@ -2581,14 +2632,30 @@ if (!video) return;
 if (!this._doneVideos) this._doneVideos = new Map();
 try { this._doneVideos.set(video, this._videoSrcOf(video)); } catch (_) {}
 },
-_nextPlayableVideo(exclude) {
+_videoIsVisible(video) {
+try { return Boolean(video && video.isConnected && video.getClientRects().length); } catch (_) { return false; }
+},
+_doneSrcSet() {
+const srcs = new Set();
+if (!this._doneVideos) return srcs;
+try {
+for (const src of this._doneVideos.values()) if (src) srcs.add(src);
+} catch (_) {}
+return srcs;
+},
+_nextPlayableVideo(exclude, allowHidden = false) {
 let videos = [];
-try { videos = this._findAllVideos(); } catch (_) { return null; }
-for (const video of videos) {
-if (exclude && video === exclude) continue;
-if (!this._videoIsDone(video)) return video;
-}
-return null;
+try { videos = this._findAllVideos(allowHidden); } catch (_) { return null; }
+const doneSrcs = this._doneSrcSet();
+const candidates = videos.filter((video) => {
+if (exclude && video === exclude) return false;
+if (this._videoIsDone(video)) return false;
+const src = this._videoSrcOf(video);
+if (src && doneSrcs.has(src)) return false;
+return true;
+});
+if (!candidates.length) return null;
+return candidates.find((video) => this._videoIsVisible(video)) || (allowHidden ? candidates[0] : null);
 },
 _switchToVideo(video, reason) {
 if (!video) return false;
@@ -2608,13 +2675,13 @@ video.defaultMuted = true;
 video.volume = 0;
 } catch (_) {}
 let total = 1;
-try { total = this._findAllVideos().length || 1; } catch (_) {}
+try { total = this._findAllVideos(true).length || 1; } catch (_) {}
 console.log(`%c${reason || '本段视频已结束'}，继续播放本页下一段视频（本页共 ${total} 段）`, 'color:#4CAF50');
 setTimeout(() => this.play(), 800);
 return true;
 },
-_continueWithNextVideo(reason) {
-const next = this._nextPlayableVideo(this._videoEl);
+_continueWithNextVideo(reason, allowHidden = false) {
+const next = this._nextPlayableVideo(this._videoEl, allowHidden);
 if (!next) return false;
 return this._switchToVideo(next, reason);
 },
@@ -2633,26 +2700,57 @@ setTimeout(() => this.play(), 500);
 return true;
 }
 }
-if (this._continueWithNextVideo(reason)) {
+if (this._continueWithNextVideo(reason, (this._videoNextChecks || 0) >= 2)) {
 this._videoNextChecks = 0;
 return true;
 }
 this._videoNextChecks = (this._videoNextChecks || 0) + 1;
-if (this._videoNextChecks <= 2) {
-console.log(`%c本页暂未发现其他视频，${this._videoNextChecks}/2 次确认后进入下一节`, 'color:#FF9800');
+if (this._videoNextChecks <= 3) {
+console.log(`%c本页暂未发现其他视频，${this._videoNextChecks}/3 次确认后进入下一节`, 'color:#FF9800');
 setTimeout(() => this._proceedAfterVideo(reason, endedVideo), 1500);
 return true;
 }
 this._videoNextChecks = 0;
+if (!this._canAdvanceAfterVideos()) return true;
 console.log('%c本页视频已全部播放完成，进入下一节', 'color:#4CAF50');
 this.nextUnit();
 return true;
 },
+_canAdvanceAfterVideos() {
+if ((this._taskDialogResumes || 0) >= 2) {
+this._taskDialogResumes = 0;
+console.warn('%c已两次返回本页仍未找到可播放的任务点，已停止自动推进，请手动检查剩余任务点。', 'color:#F44336;font-weight:bold');
+return false;
+}
+return true;
+},
+_resumeAfterTaskDialog(label) {
+if (this._isPlaying) return;
+const now = Date.now();
+if (now - (this._lastTaskResumeAt || 0) > 8000) this._taskDialogResumes = (this._taskDialogResumes || 0) + 1;
+this._lastTaskResumeAt = now;
+this._nextUnitPending = false;
+this._videoEl = null;
+this._videoNextChecks = 0;
+this._allDoneChecks = 0;
+this._isPlaying = false;
+this._clearCheckInterval();
+console.log(`%c已点击“${label}”，1.5 秒后继续完成本页剩余任务点`, 'color:#FF9800');
+setTimeout(() => this.play(), 1500);
+},
 _getVideoEl() {
 if (this._videoEl && this._videoEl.isConnected) return this._videoEl;
 try {
-const videos = this._findAllVideos();
-const active = videos.find((video) => !this._videoIsDone(video)) || videos[0] || null;
+const allowHidden = (this._noVideoRetryTimes || 0) >= 6;
+const videos = this._findAllVideos(allowHidden);
+const doneSrcs = this._doneSrcSet();
+const fresh = videos.filter((video) => {
+if (this._videoIsDone(video)) return false;
+const src = this._videoSrcOf(video);
+if (src && doneSrcs.has(src)) return false;
+return true;
+});
+const active = fresh.find((video) => this._videoIsVisible(video)) || fresh[0] || videos[0] || null;
 if (active) {
 this._videoEl = active;
 active.muted = true;

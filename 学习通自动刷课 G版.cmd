@@ -141,22 +141,22 @@ const CONFIG_DIR = process.env.APPDATA
     : join(homedir(), '.xuexitong-deepseek');
 const CONFIG_PATH = join(CONFIG_DIR, 'config.json');
 
-function dpapiEncrypt(value) {
-    const script = 'Add-Type -AssemblyName System.Security; $b=[Text.Encoding]::UTF8.GetBytes($env:XXT_KEY); [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser))';
+function runPowerShell(script, extraEnv) {
     return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-        env: { ...process.env, XXT_KEY: value },
+        env: { ...process.env, ...extraEnv },
         encoding: 'utf8',
         windowsHide: true,
     }).trim();
 }
 
+function dpapiEncrypt(value) {
+    const script = 'Add-Type -AssemblyName System.Security; $b=[Text.Encoding]::UTF8.GetBytes($env:XXT_KEY); [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser))';
+    return runPowerShell(script, { XXT_KEY: value });
+}
+
 function dpapiDecrypt(value) {
     const script = 'Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String($env:XXT_ENC); [Text.Encoding]::UTF8.GetString([Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser))';
-    return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-        env: { ...process.env, XXT_ENC: value },
-        encoding: 'utf8',
-        windowsHide: true,
-    }).trim();
+    return runPowerShell(script, { XXT_ENC: value });
 }
 
 function loadSavedKey() {
@@ -546,20 +546,26 @@ function findEdge() {
     return candidates.find((candidate) => existsSync(candidate));
 }
 
+// 优先用 Edge 打开（--app 是独立小窗口）；没有 Edge 时退回系统默认浏览器
+function launchBrowser(url, appWindow) {
+    const edge = findEdge();
+    if (edge) {
+        spawn(edge, appWindow ? [`--app=${url}`, '--window-size=480,720'] : ['--new-window', url], { detached: true, stdio: 'ignore' }).unref();
+        return 'edge';
+    }
+    if (process.platform === 'win32') {
+        spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+        return 'default';
+    }
+    spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+    return 'default';
+}
+
 function openSetupPage() {
     if (process.env.XXT_NO_BROWSER === '1') return;
     const url = `http://127.0.0.1:${PORT}/setup`;
-    const edge = findEdge();
     try {
-        if (edge) {
-            spawn(edge, [`--app=${url}`, '--window-size=480,720'], { detached: true, stdio: 'ignore' }).unref();
-            return;
-        }
-        if (process.platform === 'win32') {
-            spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-            return;
-        }
-        spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+        launchBrowser(url, true);
     } catch (error) {
         console.warn('无法自动打开设置页，请手动访问：' + url);
     }
@@ -571,19 +577,9 @@ let chaoxingOpened = false;
 function openChaoxingPage() {
     if (process.env.XXT_NO_BROWSER === '1' || chaoxingOpened) return;
     chaoxingOpened = true;
-    const edge = findEdge();
     try {
-        if (edge) {
-            spawn(edge, ['--new-window', CHAOXING_URL], { detached: true, stdio: 'ignore' }).unref();
-            console.log('已在 Edge 打开学习通：' + CHAOXING_URL);
-            return;
-        }
-        if (process.platform === 'win32') {
-            spawn('cmd', ['/c', 'start', '', CHAOXING_URL], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-            console.log('已用默认浏览器打开学习通：' + CHAOXING_URL);
-            return;
-        }
-        spawn('xdg-open', [CHAOXING_URL], { detached: true, stdio: 'ignore' }).unref();
+        if (launchBrowser(CHAOXING_URL, false) === 'edge') console.log('已在 Edge 打开学习通：' + CHAOXING_URL);
+        else console.log('已用默认浏览器打开学习通：' + CHAOXING_URL);
     } catch (error) {
         chaoxingOpened = false;
         console.warn('无法自动打开学习通，请手动访问：' + CHAOXING_URL);
@@ -750,6 +746,9 @@ console.error('%c脚本启动超时：未检测到课程目录（#coursetree）�
 }
 }, 1000);
 }
+// 测验、弹题、图文、小节切换都在这里，负责给 app 补上对应能力。
+// 其中 _currentStepTitle 是“包住”app 原实现、destroy 包在原 destroy 外面、_advanceChapterTest 直接替换，
+// 以后改这几处逻辑请改这里，不要去 app 对象里再写一份同名实现（否则就是两套逻辑并行）。
 function attachQuizAutomation(app) {
 const attemptedQuizzes = new Set();
 const attemptedVideoQuizzes = new Set();
@@ -1765,11 +1764,14 @@ questions.push({ kind, title, options, card, doc });
 return questions;
 }
 
-function findButton(doc, label) {
+// loose：平台按钮文字可能带空格、换行或多个图标子节点，去掉空白再比更稳
+function findButton(doc, label, loose) {
+const compact = (value) => (loose ? clean(value).replace(/\s+/g, '') : clean(value));
+const target = loose ? compact(label) : label;
 const candidates = Array.from(doc.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],div,span'))
-.filter((el) => visible(el) && clean(el.value || el.innerText) === label);
+.filter((el) => visible(el) && compact(el.value || el.innerText) === target);
 return candidates.find((el) => /^(BUTTON|A|INPUT)$/.test(el.tagName)) ||
-candidates.find((el) => !Array.from(el.children).some((child) => clean(child.innerText) === label)) || null;
+candidates.find((el) => !Array.from(el.children).some((child) => compact(child.innerText) === target)) || null;
 }
 
 // 不同课程/作业页的提交按钮叫法不一样，统一找一遍
@@ -2404,13 +2406,7 @@ return text.length >= 6 && options.every((option) => option.text && option.text.
 }
 
 function findButtonIn(card, label) {
-// 平台按钮文字可能带空格、换行或多个图标子节点，按去掉空白后的文字比较更稳
-const compact = (value) => clean(value).replace(/\s+/g, '');
-const target = compact(label);
-const candidates = Array.from(card.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],div,span'))
-.filter((el) => visible(el) && compact(el.value || el.innerText) === target);
-return candidates.find((el) => /^(BUTTON|A|INPUT)$/.test(el.tagName)) ||
-candidates.find((el) => !Array.from(el.children).some((child) => compact(child.innerText) === target)) || null;
+return findButton(card, label, true);
 }
 
 const CONTINUE_LABELS = ['继续学习', '继续播放', '继续观看', '继续'];
@@ -3141,7 +3137,6 @@ maxSpeedCandidates: [2, 1.75, 1.5, 1.25],
 _videoEl: null,
 _treeContainerEl: null,
 _isPlaying: false,
-_currentRetryCount: 0,
 _noVideoRetryTimes: 0,
 _videoQuizActive: false,
 _videoQuizPending: false,
@@ -3154,7 +3149,6 @@ _boundVideoHandlers: null,
 _speedStates: null,
 _nextUnitPending: false,
 _destroyed: false,
-_chapterAdvanceTimes: 0,
 _cellData: {
 cells: 0,
 nCells: 0,
@@ -3162,16 +3156,12 @@ currentCellIndex: 0,
 currentNCellIndex: 0,
 currentVideoTitle: "",
 },
-get cellData() {
-return this._cellData;
-},
 run() {
 console.log("%c=== 学习通视频与章节测验助手 V800 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
 this._installWatchdog();
 this._noteProgress();
 this._safeStopped = false;
 this._nextUnitPending = false;
-this._chapterAdvanceTimes = 0;
 this._getTreeContainer();
 this._initCellData();
 console.log(`当前学习步骤：${this._currentStepTitle() || '等待页面加载'}`);
@@ -3181,45 +3171,17 @@ this._clearCheckInterval();
 this._bindStepNavigation();
 this.play();
 },
-nextUnit() {
-if (this._nextUnitPending) {
-console.warn('%c已有小节切换正在进行，忽略重复请求', 'color:#FF9800');
-return;
-}
-this._nextUnitPending = true;
-this._clearCheckInterval();
-console.log("%c=== 准备切换到下一小节 ===", "color:#2196F3;font-size:14px");
-try {
-const el = this._getTreeContainer();
-const cells = el.children("ul").children("li");
-const nCells = $(cells.get(this._cellData.currentCellIndex)).find('.posCatalog_select:not(.firstLayer)');
-if (nCells.length > this._cellData.currentNCellIndex + 1) {
-const nextNIndex = this._cellData.currentNCellIndex + 1;
-console.log(`%c切换到同章节下一个视频: ${nextNIndex + 1}/${nCells.length}`, "color:#FF9800");
-this.playCurrentIndex(nCells.get(nextNIndex));
-} else {
-const nextIndex = this._cellData.currentCellIndex + 1;
-if (nextIndex >= cells.length) {
-console.log("%c=====================================", "color:#4CAF50;font-size:16px");
-console.log("%c==============本课程学习完成了==============", "color:#4CAF50;font-size:16px;font-weight:bold");
-console.log("%c=====================================", "color:#4CAF50;font-size:16px");
-return;
-}
-console.log(`%c切换到下一个章节: ${nextIndex + 1}/${cells.length}`, "color:#FF9800");
-this._cellData.currentCellIndex = nextIndex;
-this._cellData.currentNCellIndex = 0;
-this.playCurrentIndex();
-}
-} catch (error) {
-this._nextUnitPending = false;
-console.error('切换下一小节失败:', error);
-}
-},
 _clearCheckInterval() {
 if (this._checkInterval) {
 clearInterval(this._checkInterval);
 this._checkInterval = null;
 }
+},
+// 重试播放的延时任务：多处都要“先撤掉旧的再安排新的”，统一在这里处理
+_clearDelayedNextUnit() {
+if (!this._delayedNextUnitTimer) return;
+clearTimeout(this._delayedNextUnitTimer);
+this._delayedNextUnitTimer = null;
 },
 _startVideoMonitoring() {
 this._clearCheckInterval();
@@ -3354,7 +3316,6 @@ console.error("视频状态检查失败:", e);
 }
 },
 _tryTimes: 0,
-_stepAdvanceTimes: 0,
 _stepSwitchAt: 0,
 _stepSwitchPending: false,
 _delayedNextUnitTimer: null,
@@ -3559,21 +3520,6 @@ return text === '视频' || text === '章节测验' ? text : '';
 _isChapterTest() {
 return this._currentStepTitle() === '章节测验';
 },
-_advanceChapterTest() {
-if (this._chapterAdvanceTimes >= 3) {
-console.error('%c章节测验页面连续跳转失败，已停止以避免页面循环。请手动处理后执行 app.run()。', 'color:#F44336;font-weight:bold');
-return;
-}
-const nextButton = $('#prevNextFocusNext:visible, #right1:visible, .nextChapter:visible').first().get(0);
-if (!nextButton) {
-console.warn('%c未找到章节测验的下一步按钮，已停止。', 'color:#FF9800');
-return;
-}
-this._chapterAdvanceTimes++;
-console.log('%c检测到章节测验，尝试进入下一学习步骤', 'color:#607D8B');
-nextButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-setTimeout(() => this.play(), 2000);
-},
 _bindStepNavigation() {
 if (this._stepNavigationBound) {
 return;
@@ -3609,15 +3555,10 @@ video.play().then(() => {
 console.log("%c静音播放成功", "color:#4CAF50");
 this._tryTimes = 0;
 this._startVideoMonitoring();
-if (this._delayedNextUnitTimer) {
-clearTimeout(this._delayedNextUnitTimer);
-this._delayedNextUnitTimer = null;
-}
+this._clearDelayedNextUnit();
 }).catch(e => {
 console.error("静音播放也失败:", e);
-if (this._delayedNextUnitTimer) {
-clearTimeout(this._delayedNextUnitTimer);
-}
+this._clearDelayedNextUnit();
 this._isPlaying = false;
 if (this._tryTimes >= this.configs.maxRetries) {
 console.error('%c静音播放失败，已达到最大重试次数', 'color:#F44336;font-weight:bold', e);
@@ -3630,32 +3571,6 @@ this.play();
 }, this.configs.retryInterval);
 });
 }
-},
-playCurrentIndex(nCell) {
-this._nextUnitPending = false;
-if (!nCell) {
-const el = this._getTreeContainer();
-const cells = el.children("ul").children("li");
-const nCells = $(cells.get(this._cellData.currentCellIndex)).find('.posCatalog_select:not(.firstLayer)');
-nCell = nCells.get(this._cellData.currentNCellIndex);
-}
-const $nCell = $(nCell);
-const clickableSpan = $nCell.find(".posCatalog_name")[0];
-if (!clickableSpan) {
-console.error("%c===========找不到可点击的课程节点，播放下一个视频失败==============", "color:#F44336");
-return;
-}
-console.log(`%c点击切换到: ${$(clickableSpan).attr('title') || '未知标题'}`, "color:#2196F3");
-$(clickableSpan).click();
-this._videoEl = null;
-this._isPlaying = false;
-console.log("%c等待视频加载...", "color:#FF9800");
-setTimeout(() => {
-this._initCellData();
-if (this.configs.autoplay) {
-this.play();
-}
-}, 3000);
 },
 _initCellData() {
 this._noVideoRetryTimes = 0;
@@ -4187,10 +4102,7 @@ const video = this._getVideoEl();
 this._guardLastTime = Number(video?.currentTime || 0);
 this._guardLastWallTs = Date.now();
 this._applyMaxPlaybackRate(video, '开始播放').catch(() => {});
-if (this._delayedNextUnitTimer) {
-clearTimeout(this._delayedNextUnitTimer);
-this._delayedNextUnitTimer = null;
-}
+this._clearDelayedNextUnit();
 },
 _handleVideoPause(e) {
 console.log(`%c============视频暂停=============`, "color:#FF9800");
@@ -4221,7 +4133,7 @@ if (this._watchdogTimer) {
 clearInterval(this._watchdogTimer);
 this._watchdogTimer = null;
 }
-if (this._delayedNextUnitTimer) clearTimeout(this._delayedNextUnitTimer);
+this._clearDelayedNextUnit();
 $(document).off('.xuexitongPlayerV800');
 if (this._pageGuards) {
 const { preventPause, resumePlaybackNow } = this._pageGuards;

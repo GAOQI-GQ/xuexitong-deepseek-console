@@ -702,7 +702,16 @@ keeper.eval(`window.__xuexitongKeeperTimer = setInterval(function () {
                             window.__xuexitongLastInjectionAt = Date.now() - 30000;
                         }
                         if (page.document.readyState !== 'complete' || !page.document.querySelector('#coursetree')) return;
-                        if (page.__xuexitongConsoleDeepSeek || page.__xuexitongConsoleDeepSeekBootTimer) return;
+                        var beat = page.__xuexitongLastBeat || 0;
+                        if (page.__xuexitongConsoleDeepSeek || page.__xuexitongConsoleDeepSeekBootTimer) {
+                            // 脚本还在，但页面可见却 90 秒没有心跳：脚本已经卡死，重新注入把它重启
+                            if (page.document.visibilityState !== 'visible') return;
+                            if (!beat || Date.now() - beat < 90000) return;
+                            if (Date.now() - (window.__xuexitongDeadHandledAt || 0) < 60000) return;
+                            window.__xuexitongDeadHandledAt = Date.now();
+                            window.__xuexitongLastInjectionAt = 0;
+                            try { page.console.warn('GQ提醒您：检测到脚本心跳停止 90 秒，正在自动重启脚本'); } catch (e) {}
+                        }
                         if (Date.now() - window.__xuexitongLastInjectionAt < 30000) return;
                         window.__xuexitongLastInjectionAt = Date.now();
                         page.__xuexitongAutoInjected = true;
@@ -768,6 +777,10 @@ stopped = true;
 app._destroyed = true;
 clearInterval(videoQuizTimer);
 originalDestroy();
+};
+// 测验/弹题正在处理时本来就慢（等题目、等 DeepSeek），停滞自检要跳过这些阶段
+app._quizAutomationBusy = function () {
+return Boolean(quizBusy || videoQuizBusy);
 };
 
 const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -1001,6 +1014,7 @@ return Boolean(isQuizFrame && quizLabel && document.querySelector('.posCatalog_a
 // —— 阅读/图文任务点：平台要求把内容区滚动到最底部才会记为完成 ——
 // 一个节点里可能有多篇图文（num 0、1、2…），完成一篇后点“下一节”继续下一篇。
 let docTaskBusy = false;
+let docTaskBusySince = 0;
 let docTaskWakeAt = 0;
 let docTaskSignature = '';
 let docTaskHandledAt = 0;
@@ -1182,6 +1196,7 @@ const signature = after.map((entry) => `${entry.el.scrollTop}:${entry.el.scrollH
 if (signature === lastSignature) stableRounds++; else stableRounds = 0;
 lastSignature = signature;
 console.log(`%c第 ${rounds} 轮阅读滚动：滚动区 ${after.length} 个，全部到底=${allBottom}，完成标记=${sawCompletion}`, 'color:#607D8B');
+if (typeof app !== 'undefined' && app && typeof app._noteProgress === 'function') app._noteProgress();
 if (allBottom && (sawCompletion || stableRounds >= 2)) break;
 if (stableRounds >= 3) break;
 }
@@ -1385,11 +1400,19 @@ app._handleDocumentTask = async function () {
 if (stopped || this._destroyed) return false;
 if (docTaskBusy) {
 // 滚动任务正在进行，避免重复触发；稍后再确认下一步（限制排队，避免定时器堆积）
+const busyFor = docTaskBusySince ? Date.now() - docTaskBusySince : 0;
+if (busyFor > 20000) {
+// 滚动流程被异常卡住（页面框架被替换、平台报错等）：解除占用，重新从头识别本页
+docTaskBusy = false;
+docTaskBusySince = 0;
+console.warn(`%c图文滚动占用已超过 ${Math.round(busyFor / 1000)} 秒，判定为卡住，已自动解除并重新识别本页`, 'color:#FF9800');
+} else {
 if (!docTaskWakeAt || Date.now() - docTaskWakeAt > 3000) {
 docTaskWakeAt = Date.now();
 setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 1500);
 }
 return true;
+}
 }
 // 本页还有没播完的视频时不抢活，交给视频流程；视频播完会再回到这里
 if (pageHasUnfinishedVideo()) return false;
@@ -1419,6 +1442,7 @@ console.log(`%c本页还有没读到底的图文（可能是刚渲染出的下�
 console.log('%c本页图文已确认完成（没到底只是阅读器回滚到顶部），跳过重复阅读', 'color:#607D8B');
 }
 docTaskBusy = true;
+docTaskBusySince = Date.now();
 if (!samePage) docTaskSignature = signature;
 docTaskHandledAt = Date.now();
 this._isPlaying = false;
@@ -1463,6 +1487,7 @@ latestSignature = nextSignature;
 read.sawCompletion = verified;
 docTaskSignature = latestSignature;
 noteDocumentRead(sectionKey, verified);
+if (typeof app._noteProgress === 'function') app._noteProgress();
 if (verified) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
 else console.warn(`%c已滚动 ${read.rounds} 轮、覆盖 ${read.containers} 个滚动区，暂未收到平台完成标记，仍按已完成继续切换（下一节会回头核对是否漏做）`, 'color:#FF9800');
 }
@@ -1471,6 +1496,7 @@ docTaskHandledAt = Date.now();
 console.warn('阅读任务点滚动失败，已跳过本次滚动:', error && error.message ? error.message : error);
 } finally {
 docTaskBusy = false;
+docTaskBusySince = 0;
 }
 // 有的课程在阅读完成后会自动切到下一步，这时不要再点“下一节”，否则会跳过内容
 const endFrameSrcs = cardsFrameSrcs();
@@ -2068,6 +2094,8 @@ console.log(`下一学习步骤仍在加载，已等待 ${Math.round(waited / 10
 }
 }
 if (!stepReady) throw new Error(`点击“下一节”后等待超时，新学习步骤仍未加载完成；当前页签：${currentStep || '未显示'}`);
+if (typeof app._noteProgress === 'function') app._noteProgress();
+app._safeStopped = false;
 app._nextUnitPending = false;
 app._videoEl = null;
 app._quizVideo = null;
@@ -3023,6 +3051,9 @@ return this._cellData;
 },
 run() {
 console.log("%c=== 学习通视频与章节测验助手 V800 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
+this._installWatchdog();
+this._noteProgress();
+this._safeStopped = false;
 this._nextUnitPending = false;
 this._chapterAdvanceTimes = 0;
 this._getTreeContainer();
@@ -3158,6 +3189,8 @@ this._guardLastTime = current;
 } else {
 const stalled = Math.abs(current - this._guardLastTime) < 0.01;
 const stalledMs = now - this._guardLastWallTs;
+// 视频在走 ＝ 脚本有进展，停滞自检不介入
+if (!stalled) this._noteProgress();
 if (stalled && stalledMs >= this.configs.guardNoProgressMs) {
 this._tryResumePlayback("no-progress");
 this._guardLastWallTs = now;
@@ -3209,7 +3242,13 @@ _guardLastResumeTs: 0,
 _nearEndSince: 0,
 async play() {
 try {
-if (this._destroyed) return;
+if (this._destroyed) {
+if (!this._destroyedLogged) {
+this._destroyedLogged = true;
+console.warn('%c本实例已被新注入的脚本接管，旧实例停止工作', 'color:#9E9E9E');
+}
+return;
+}
 if (this._isChapterTest()) {
 this._videoEl = null;
 this._isPlaying = false;
@@ -3274,11 +3313,15 @@ if (this.configs.autoAdvanceNoVideo || pageEmpty) {
 console.warn(pageEmpty ? '%c当前小节显示“暂无内容”，自动切换到下一小节' : '%c当前小节未发现视频，按配置切换到下一小节', 'color:#FF9800');
 this.nextUnit();
 } else {
+// 这是有意停下的（不是卡住），停滞自检不要在这里反复拉起
+this._safeStopped = true;
 console.warn('%c当前小节未发现视频或可识别的学习步骤，已安全停止。确认无需完成课件后，可执行 app.nextUnit()。', 'color:#FF9800');
 }
 return;
 }
 this._noVideoRetryTimes = 0;
+// 页面上确实有视频了，之前的“安全停止”状态作废
+this._safeStopped = false;
 if (typeof this._videoIsDone === 'function' && this._videoIsDone(el)) {
 // 第一次严格找可见视频，确认阶段允许播放暂时隐藏（还没渲染出来）的下一段
 const nextVideo = this._nextPlayableVideo(el, (this._allDoneChecks || 0) >= 1);
@@ -3519,6 +3562,95 @@ if (!foundCurrent && nCellCounts > 0) {
 console.warn("%c未找到当前激活的视频节点，可能需要手动选择", "color:#FF9800");
 }
 console.log(`%c课程信息: ${this._cellData.cells}章, ${this._cellData.nCells}节, 当前: 第${this._cellData.currentCellIndex + 1}章第${this._cellData.currentNCellIndex + 1}节`, "color:#607D8B");
+},
+// —— 停滞自检 ——
+// 脚本最怕的不是报错，而是“什么都不做也不报错”。这里定期打心跳，
+// 并对卡住的流程自动复位；同时把卡住时的现场状态打进控制台，方便回看。
+_noteProgress() {
+this._lastProgressAt = Date.now();
+},
+_installWatchdog() {
+if (this._watchdogTimer) clearInterval(this._watchdogTimer);
+this._lastProgressAt = Date.now();
+this._pendingSince = 0;
+this._watchdogRestartAt = 0;
+this._watchdogTimer = setInterval(() => this._watchdogTick(), 3000);
+},
+_watchdogTick() {
+try {
+if (this._destroyed) {
+if (this._watchdogTimer) clearInterval(this._watchdogTimer);
+this._watchdogTimer = null;
+return;
+}
+const now = Date.now();
+// 给辅助窗口一个“脚本还活着”的信号：JS 线程真死了心跳才会停
+try { PAGE.__xuexitongLastBeat = now; } catch (_) { /* 忽略 */ }
+if (docTaskBusy) {
+if (docTaskBusySince && now - docTaskBusySince > 20000) {
+docTaskBusy = false;
+docTaskBusySince = 0;
+console.warn('%c图文滚动卡住超过 20 秒，已自动解除占用并重新识别页面', 'color:#FF9800');
+this._watchdogRestart('图文滚动卡住');
+return;
+}
+} else if (docTaskBusySince) {
+docTaskBusySince = 0;
+}
+if (this._nextUnitPending) {
+if (!this._pendingSince) this._pendingSince = now;
+if (now - this._pendingSince > 150000) {
+this._nextUnitPending = false;
+this._pendingSince = 0;
+console.warn('%c切换小节卡住超过 150 秒，已自动复位并重新识别页面', 'color:#FF9800');
+this._watchdogRestart('切换小节卡住');
+return;
+}
+} else if (this._pendingSince) {
+this._pendingSince = 0;
+}
+if (!this._lastProgressAt) { this._lastProgressAt = now; return; }
+if (this._safeStopped) return;
+if (now - this._lastProgressAt < 75000) return;
+if (this._watchdogRestartAt && now - this._watchdogRestartAt < 60000) return;
+// 这些阶段本来就慢（等题目、等 DeepSeek、等测验页、等视频），不算卡住
+if (this._isChapterTest()) return;
+if (this._videoQuizActive || this._videoQuizPending) return;
+if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) return;
+let playing = false;
+try { playing = visibleVideoState().playing; } catch (_) { playing = false; }
+if (playing) { this._lastProgressAt = now; return; }
+let videos = 0;
+let docs = 0;
+let step = '';
+try { videos = this._findAllVideos().length; } catch (_) { videos = 0; }
+try { docs = contentFrameDocs().length; } catch (_) { docs = 0; }
+try { step = this._currentStepTitle() || ''; } catch (_) { step = ''; }
+console.warn(`%c已经 75 秒没有任何进展（步骤：${step || '未识别'}，视频 ${videos} 个，图文框架 ${docs} 个，切换中：${this._nextUnitPending ? '是' : '否'}，图文占用：${docTaskBusy ? '是' : '否'}），自动重新识别页面继续`, 'color:#FF9800');
+this._watchdogRestart('长时间无进展');
+} catch (error) {
+if (!this._watchdogErrorAt || Date.now() - this._watchdogErrorAt > 60000) {
+this._watchdogErrorAt = Date.now();
+console.warn('停滞自检出错，已忽略:', error && error.message ? error.message : error);
+}
+}
+},
+_watchdogRestart(reason) {
+if (this._destroyed) return;
+this._watchdogRestartAt = Date.now();
+this._lastProgressAt = Date.now();
+this._tryTimes = 0;
+this._noVideoRetryTimes = 0;
+this._allDoneChecks = 0;
+this._stepSwitchPending = false;
+this._clearCheckInterval();
+try { this._initCellData(); } catch (_) { /* 目录还没准备好时忽略 */ }
+console.log(`%c停滞自检：已重新识别页面（${reason}）`, 'color:#607D8B');
+setTimeout(() => {
+if (this._destroyed) return;
+this._noteProgress();
+this.play();
+}, 1200);
 },
 _getTreeContainer() {
 // 页面局部刷新可能替换课程目录节点，旧的 jQuery 引用失效时重新获取
@@ -3957,6 +4089,10 @@ destroy() {
 this._isPlaying = false;
 this._clearCheckInterval();
 this._detachVideoEvents();
+if (this._watchdogTimer) {
+clearInterval(this._watchdogTimer);
+this._watchdogTimer = null;
+}
 if (this._delayedNextUnitTimer) clearTimeout(this._delayedNextUnitTimer);
 $(document).off('.xuexitongPlayerV800');
 if (this._pageGuards) {
@@ -3975,13 +4111,28 @@ attachQuizAutomation(app);
 PAGE.app = app;
 PAGE[APP_KEY] = app;
 
+// 启动失败不能一死了之：页面这时常常还在渲染（比如刚整页跳转到新章节），
+// 间隔几秒重试一般就能正常启动。
+let bootFailures = 0;
+const bootUp = () => {
 try {
 app.run();
 app._bindPageGuards();
 } catch (error) {
-console.error("%c脚本运行失败: ", "color:#F44336;font-weight:bold", error.message);
-console.log("请检查是否在正确的课程播放页面，或者页面结构是否再次发生改变。");
+bootFailures += 1;
+console.error("%c脚本运行失败: ", "color:#F44336;font-weight:bold", error);
+if (bootFailures >= 10) {
+console.log("已重试 10 次仍未启动，请检查是否在正确的课程播放页面，或者页面结构是否再次发生改变。");
+return;
 }
+console.warn(`%c3 秒后自动重试启动（第 ${bootFailures}/10 次）`, 'color:#FF9800');
+setTimeout(() => {
+if (PAGE[APP_KEY] !== app) return;
+bootUp();
+}, 3000);
+}
+};
+bootUp();
 }
 })();
 :__XXT_BROWSER_END__

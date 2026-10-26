@@ -854,6 +854,66 @@ if (!video.paused && !video.ended) state.playing = true;
 return state;
 }
 
+// —— 视频任务点还在加载 ——
+// 切换小节时，播放器框架和“任务点/观看时长”标题通常先出来，<video> 要再等一两秒。
+// 这段时间如果按“纯图文”去滚内容区（本页的“知识点”也会被当成图文），视频就会一直停着，
+// 要等人手动点一下才动。所以先认出“这是视频任务点、视频还没就绪”，等它加载。
+function videoTaskLoading() {
+try {
+// 视频元素已经在页面里，只是还没布局好或还没加载出画面
+if (typeof app._findAllVideos === 'function' && app._findAllVideos(true).length) return true;
+} catch (_) { /* 忽略 */ }
+for (const doc of courseDocuments()) {
+try {
+// 外层页面的视频任务标题栏：只有视频任务点才会出现“观看时长”
+if (doc === document) {
+const pageText = clean(doc.body ? doc.body.innerText : '');
+if (pageText.length <= 50000 && /观看时长|视频任务点/.test(pageText)) return true;
+}
+const frames = Array.from(doc.querySelectorAll('iframe'));
+const playerFrame = frames.some((frame) => {
+const src = frame.getAttribute('src') || '';
+if (!/ananas\/modules\/video|modules\/video\/index/i.test(src)) return false;
+try { return frame.getClientRects().length > 0; } catch (_) { return false; }
+});
+if (playerFrame) return true;
+} catch (_) { /* 跨域框架读不到就跳过 */ }
+}
+return false;
+}
+
+// 等视频任务点加载：最多等 15 秒，等不到就交回原流程（滚动图文/切节），绝不死等。
+// 同一节只等一次，避免“等 15 秒 → 滚图文 → 再等 15 秒”来回空转。
+app._waitVideoTaskLoading = function () {
+if (stopped || this._destroyed) return false;
+if (!videoTaskLoading()) {
+this._videoLoadWaitSince = 0;
+return false;
+}
+const now = Date.now();
+let section = '';
+try { section = activeSectionKey(); } catch (_) { section = ''; }
+if (section && this._videoWaitGaveUpSection === section) {
+this._videoLoadWaitSince = 0;
+return false;
+}
+if (!this._videoLoadWaitSince) this._videoLoadWaitSince = now;
+if (now - this._videoLoadWaitSince >= 15000) {
+this._videoLoadWaitSince = 0;
+this._videoWaitGaveUpSection = section;
+console.warn('%c视频任务点等了 15 秒仍没加载出视频，先处理页面上的其它内容', 'color:#FF9800');
+return false;
+}
+if (!this._videoWaitLoggedAt || now - this._videoWaitLoggedAt > 8000) {
+this._videoWaitLoggedAt = now;
+console.log('%c检测到视频任务点还在加载，先等视频就绪（暂不滚动图文）', 'color:#2196F3');
+}
+this._isPlaying = false;
+this._clearCheckInterval();
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 1200);
+return true;
+};
+
 function activeCatalogLabel() {
 let el = null;
 try { el = document.querySelector('.posCatalog_active'); } catch (_) { el = null; }
@@ -1204,6 +1264,8 @@ let stableRounds = 0;
 let sawCompletion = false;
 let containers = 0;
 while (rounds < 8 && !stopped) {
+// 滚动过程中视频才加载出来：视频优先，立刻停下来交给视频流程
+if (pageHasUnfinishedVideo()) break;
 rounds++;
 const docs = contentFrameDocs();
 if (!docs.length) break;
@@ -1547,6 +1609,13 @@ noteDocumentRead(sectionKey, verified);
 } else {
 console.log(`%c检测到阅读/图文任务点（约 ${totalChars} 字，${totalImages} 张图），开始滚动到最底部`, 'color:#2196F3');
 read = await readThroughDocuments();
+// 视频在滚动过程中才就绪：先播视频，剩下的图文等视频播完再补（别把视频一直晾着）
+if (pageHasUnfinishedVideo()) {
+console.log('%c本页视频已就绪，先播放视频，图文稍后继续', 'color:#4CAF50');
+app._nextUnitPending = false;
+setTimeout(() => { if (!stopped && !app._destroyed) app.play(); }, 600);
+return true;
+}
 verified = read.sawCompletion || documentCompletionShown();
 if (!verified) {
 console.log('%c暂未看到完成标记，在底部再轻微滚动一次以确保触发平台检测', 'color:#FF9800');
@@ -2235,6 +2304,9 @@ if (typeof app._noteProgress === 'function') app._noteProgress();
 invalidateDocumentScan();
 app._safeStopped = false;
 app._nextUnitPending = false;
+// 新小节：视频加载等待重新开始计
+app._videoLoadWaitSince = 0;
+app._videoWaitGaveUpSection = '';
 app._videoEl = null;
 app._quizVideo = null;
 app._doneVideos = new Map();
@@ -3384,6 +3456,9 @@ const el = this._getVideoEl();
 if (el == null) {
 // 播放器报“无法加载，试试其他线路”时，先点备用线路，干等是不会好的
 if (typeof this._retryAlternateVideoLine === 'function' && this._retryAlternateVideoLine('找不到可播放视频')) return;
+// 视频任务点刚切过去时，<video> 比页面标题晚一两秒才加载好；
+// 这期间不能当成“纯图文”去滚内容区，否则视频会一直停着等人手动点
+if (typeof this._waitVideoTaskLoading === 'function' && this._waitVideoTaskLoading()) return;
 // 阅读/图文任务点：先把内容区滚动到最底部，完成后再点“下一节”
 if (typeof this._handleDocumentTask === 'function' && await this._handleDocumentTask()) return;
 if (this._advanceLearningStep()) {
@@ -3701,6 +3776,7 @@ this._lastProgressAt = Date.now();
 this._tryTimes = 0;
 this._noVideoRetryTimes = 0;
 this._allDoneChecks = 0;
+this._videoLoadWaitSince = 0;
 this._stepSwitchPending = false;
 this._clearCheckInterval();
 try { this._initCellData(); } catch (_) { /* 目录还没准备好时忽略 */ }

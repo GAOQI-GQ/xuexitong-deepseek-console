@@ -1153,6 +1153,13 @@ srcs.push(frame.getAttribute('src') || '');
 return srcs.join('||');
 }
 
+// 滚动过程中的心跳：还在滚就刷新占用时间。
+// “图文占用超过 20 秒判定卡住”只有在真的没有滚动进展时才成立，
+// 不会把长篇/多篇图文这种正常但耗时的情况误判成卡死。
+function noteDocTaskProgress() {
+if (docTaskBusy) docTaskBusySince = Date.now();
+}
+
 async function scrollToBottom(entry) {
 const { el, doc } = entry;
 const win = doc.defaultView;
@@ -1177,6 +1184,7 @@ if (isPageScroller) {
 try { win.scrollTo(0, el.scrollTop); } catch (_) {}
 try { win.dispatchEvent(new win.Event('scroll')); } catch (_) {}
 }
+noteDocTaskProgress();
 await sleep(220 + Math.floor(Math.random() * 160));
 }
 el.scrollTop = max;
@@ -1223,6 +1231,7 @@ try { scroller.dispatchEvent(new win.WheelEvent('wheel', { deltaY: 600, bubbles:
 await sleep(500);
 }
 await sleep(600);
+noteDocTaskProgress();
 const after = documentScrollables(contentFrameDocs());
 const allBottom = after.length > 0 && after.every(containerAtBottom);
 if (documentCompletionShown()) sawCompletion = true;

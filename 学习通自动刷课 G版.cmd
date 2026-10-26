@@ -1240,6 +1240,47 @@ await sleep(500);
 return false;
 }
 
+// —— 播放线路重试 ——
+// 视频加载失败时，播放器会显示“视频因格式不支持或者服务器或网络的问题无法加载。
+// 您可以尝试其他线路：公网1 公网2”。这种时候点什么都没用，必须去点那条备用线路。
+function videoLoadErrorShown() {
+for (const doc of courseDocuments()) {
+let text = '';
+try { text = doc.body ? String(doc.body.innerText || doc.body.textContent || '') : ''; } catch (_) { text = ''; }
+if (!text || text.length > 30000) continue;
+if (/尝试其他线路|视频因格式不支持|视频无法加载|视频加载失败|该视频无法播放/.test(text)) return true;
+}
+return false;
+}
+
+// 找出“公网1 / 公网2 / 线路1”这类可点击的备用线路，只取最内层节点，避免点到外层容器
+function alternativeLineTargets() {
+const targets = [];
+const seen = new Set();
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('a,button,li,label,span,p,div,strong,em')); } catch (_) { nodes = []; }
+for (const node of nodes) {
+let text = '';
+try { text = clean(node.innerText || node.textContent || ''); } catch (_) { text = ''; }
+if (!text || text.length > 14) continue;
+if (!/^(公网|线路|备用|备选|专线)\s*[0-9一二三四五六七八九]?$/.test(text)) continue;
+if (seen.has(node)) continue;
+seen.add(node);
+let hasInner = false;
+try {
+hasInner = Array.from(node.children).some((child) => clean(child.innerText || child.textContent || '') === text);
+} catch (_) { hasInner = false; }
+if (hasInner) continue;
+let shown = false;
+try { shown = visible(node); } catch (_) { shown = false; }
+if (!shown) continue;
+targets.push({ el: node, text });
+}
+}
+return targets;
+}
+
 // 当前页面是否还有“没播完的视频”：有就先把视频交给视频流程，视频播完再回到图文
 function pageHasUnfinishedVideo() {
 try {
@@ -1546,6 +1587,54 @@ state.attempts = 0;
 
 app._docProgressAudit = docProgressAudit;
 app._goBackToSection = goBackToSection;
+
+// 视频加载不出来时自动点备用线路（公网1/公网2），而不是干等着什么也不做
+app._retryAlternateVideoLine = function (reason) {
+if (stopped || this._destroyed) return false;
+let errorShown = false;
+try { errorShown = videoLoadErrorShown(); } catch (_) { errorShown = false; }
+if (!errorShown) return false;
+const now = Date.now();
+// 换线路后播放器要重新加载视频，同一节里别点得太急
+if (now - (this._lineRetryAt || 0) < 5000) return false;
+let section = '';
+try { section = activeSectionKey(); } catch (_) { section = ''; }
+if (section && section !== this._lineSection) {
+this._lineSection = section;
+this._lineTried = new Set();
+this._lineAttempts = 0;
+this._lineGaveUpAt = 0;
+}
+if (!this._lineTried) this._lineTried = new Set();
+if ((this._lineAttempts || 0) >= 6) {
+if (!this._lineGaveUpAt || now - this._lineGaveUpAt > 60000) {
+this._lineGaveUpAt = now;
+console.warn('%c备用线路已经试了 6 次，视频还是加载不出来；先按原流程处理，稍后再回来试', 'color:#FF9800');
+}
+return false;
+}
+let targets = [];
+try { targets = alternativeLineTargets(); } catch (_) { targets = []; }
+if (!targets.length) return false;
+// 多条线路轮着试：先点还没试过的，都试过了再从第一条重新开始
+let target = targets.find((item) => !this._lineTried.has(item.text));
+if (!target) {
+this._lineTried.clear();
+target = targets[0];
+}
+this._lineTried.add(target.text);
+this._lineAttempts = (this._lineAttempts || 0) + 1;
+this._lineRetryAt = now;
+console.log(`%c视频加载失败${reason ? `（${reason}）` : ''}，自动切换播放线路：${target.text}（第 ${this._lineAttempts} 次）`, 'color:#2196F3');
+try {
+target.el.click();
+} catch (_) {
+try { target.el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window })); } catch (_) {}
+}
+this._noteProgress();
+setTimeout(() => { if (!stopped && !this._destroyed) this.play(); }, 3000);
+return true;
+};
 
 function letterOf(el) {
 const text = clean(el.textContent).replace(/[.、．:：,，]+$/, '');
@@ -3192,6 +3281,12 @@ const stalledMs = now - this._guardLastWallTs;
 // 视频在走 ＝ 脚本有进展，停滞自检不介入
 if (!stalled) this._noteProgress();
 if (stalled && stalledMs >= this.configs.guardNoProgressMs) {
+// 播放器自己报“无法加载、试试其他线路”时，换线比反复 play() 有用
+if (typeof this._retryAlternateVideoLine === 'function' && this._retryAlternateVideoLine('播放停滞')) {
+this._guardLastWallTs = now;
+this._guardLastTime = Number(video.currentTime || 0);
+return;
+}
 this._tryResumePlayback("no-progress");
 this._guardLastWallTs = now;
 this._guardLastTime = Number(video.currentTime || 0);
@@ -3279,6 +3374,8 @@ return;
 }
 const el = this._getVideoEl();
 if (el == null) {
+// 播放器报“无法加载，试试其他线路”时，先点备用线路，干等是不会好的
+if (typeof this._retryAlternateVideoLine === 'function' && this._retryAlternateVideoLine('找不到可播放视频')) return;
 // 阅读/图文任务点：先把内容区滚动到最底部，完成后再点“下一节”
 if (typeof this._handleDocumentTask === 'function' && await this._handleDocumentTask()) return;
 if (this._advanceLearningStep()) {

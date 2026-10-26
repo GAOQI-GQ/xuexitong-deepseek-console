@@ -631,6 +631,16 @@ console.error('请先启动 DeepSeek 本地服务，再点击书签注入');
 return;
 }
 
+// —— 模块级共享工具 / 状态 ——
+// attachQuizAutomation(app) 和 app 自己的方法是同一份脚本里的两套作用域：
+// 写在 attachQuizAutomation 里的 const/let，app 的方法根本看不到（调用时直接 ReferenceError）。
+// 所以两边都要用的东西统一放这一层。
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// 图文占用标记：attachQuizAutomation 里写入/解除，app 的停滞自检负责超时复位并读取状态
+let docTaskBusy = false;
+let docTaskBusySince = 0;
+let docTaskWakeAt = 0;
+
 // 清理旧实例失败也不能影响本次注入
 const destroyQuietly = (instance) => {
 try {
@@ -783,7 +793,6 @@ return Boolean(quizBusy || videoQuizBusy);
 };
 
 const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const visible = (el) => Boolean(el && el.isConnected && el.getClientRects().length &&
 el.ownerDocument.defaultView.getComputedStyle(el).visibility !== 'hidden');
 const kindPattern = /[\[【](单选题|多选题|判断题)[\]】]/;
@@ -817,6 +826,10 @@ return false;
 }
 
 app._pageShowsNoContent = pageShowsNoContent;
+// 停滞自检（app 的方法）判断“视频是否在播”“有几篇图文”时也要用这两个探测函数，
+// 它们只在这个作用域里，所以挂到 app 上，自检里用 this._visibleVideoState() / this._contentFrameDocs()
+app._visibleVideoState = visibleVideoState;
+app._contentFrameDocs = contentFrameDocs;
 
 // 判断当前步骤不能只看 iframe 的 num：num 只是“第几个任务点”，不是步骤类型。
 // 例如 1.2 学习天地有两个视频时，第二个视频同样是 num=1，旧逻辑却会当成章节测验。
@@ -1012,9 +1025,7 @@ return Boolean(isQuizFrame && quizLabel && document.querySelector('.posCatalog_a
 
 // —— 阅读/图文任务点：平台要求把内容区滚动到最底部才会记为完成 ——
 // 一个节点里可能有多篇图文（num 0、1、2…），完成一篇后点“下一节”继续下一篇。
-let docTaskBusy = false;
-let docTaskBusySince = 0;
-let docTaskWakeAt = 0;
+// docTaskBusy / docTaskBusySince / docTaskWakeAt 定义在模块级（app 的停滞自检也要读写）
 let docTaskSignature = '';
 let docTaskHandledAt = 0;
 // —— 完成情况保险：一个任务点里常叠着多篇图文，平台是逐篇记完成的 ——
@@ -3657,13 +3668,13 @@ if (this._isChapterTest()) return;
 if (this._videoQuizActive || this._videoQuizPending) return;
 if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) return;
 let playing = false;
-try { playing = visibleVideoState().playing; } catch (_) { playing = false; }
+try { playing = typeof this._visibleVideoState === 'function' && this._visibleVideoState().playing; } catch (_) { playing = false; }
 if (playing) { this._lastProgressAt = now; return; }
 let videos = 0;
 let docs = 0;
 let step = '';
 try { videos = this._findAllVideos().length; } catch (_) { videos = 0; }
-try { docs = contentFrameDocs().length; } catch (_) { docs = 0; }
+try { docs = typeof this._contentFrameDocs === 'function' ? this._contentFrameDocs().length : 0; } catch (_) { docs = 0; }
 try { step = this._currentStepTitle() || ''; } catch (_) { step = ''; }
 console.warn(`%c已经 75 秒没有任何进展（步骤：${step || '未识别'}，视频 ${videos} 个，图文框架 ${docs} 个，切换中：${this._nextUnitPending ? '是' : '否'}，图文占用：${docTaskBusy ? '是' : '否'}），自动重新识别页面继续`, 'color:#FF9800');
 this._watchdogRestart('长时间无进展');

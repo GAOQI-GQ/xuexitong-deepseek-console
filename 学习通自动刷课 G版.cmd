@@ -1025,8 +1025,27 @@ let docLastSection = '';
 let docAuditAt = 0;
 let docPageAttempts = 0;
 let docPageAttemptsSignature = '';
+// —— 扫描结果缓存 ——
+// 找图文内容要读 innerText、逐个查元素样式，这些都会触发整页重排。
+// play() 每 1~2 秒就会走一遍，页面上元素一多，Edge 就会明显卡顿，
+// 所以同一瞬间的重复扫描直接复用结果（几百毫秒的窗口，不影响判断）。
+let contentDocsCache = { at: 0, items: [] };
+let scrollablesCache = { at: 0, key: '', list: [] };
+const docIdMap = new WeakMap();
+let docIdSeq = 0;
+function docIdOf(doc) {
+if (!doc) return 0;
+if (!docIdMap.has(doc)) docIdMap.set(doc, ++docIdSeq);
+return docIdMap.get(doc);
+}
+function invalidateDocumentScan() {
+contentDocsCache = { at: 0, items: [] };
+scrollablesCache = { at: 0, key: '', list: [] };
+}
 
 function contentFrameDocs() {
+const cachedAt = contentDocsCache.at;
+if (cachedAt && Date.now() - cachedAt < 500) return contentDocsCache.items;
 const items = [];
 for (const doc of courseDocuments()) {
 let frameEl = null;
@@ -1068,10 +1087,14 @@ hasVideo = Boolean(doc.querySelector('video,.vjs-tech,.vjs-big-play-button,#vide
 if (hasVideo) continue;
 items.push({ doc, text, images });
 }
+contentDocsCache = { at: Date.now(), items };
 return items;
 }
 
 function documentScrollables(docs) {
+const now = Date.now();
+const key = docs.map((item) => docIdOf(item.doc)).join('-');
+if (scrollablesCache.at && scrollablesCache.key === key && now - scrollablesCache.at < 1500) return scrollablesCache.list;
 const list = [];
 for (const item of docs) {
 const doc = item.doc;
@@ -1096,6 +1119,7 @@ add(el);
 }
 } catch (_) { /* 忽略单个框架 */ }
 }
+scrollablesCache = { at: now, key, list };
 return list;
 }
 
@@ -1385,6 +1409,7 @@ docLastSection = '';
 docTaskSignature = '';
 docPageAttempts = 0;
 docPageAttemptsSignature = '';
+invalidateDocumentScan();
 console.log(`%c完成情况保险：目录里“${label}”还没打勾，返回该节补做，避免漏做（第 ${redos} 次）`, 'color:#FF9800');
 app._nextUnitPending = false;
 app._videoEl = null;
@@ -1576,6 +1601,7 @@ docTaskSignature = '';
 docTaskHandledAt = 0;
 docPageAttempts = 0;
 docPageAttemptsSignature = '';
+invalidateDocumentScan();
 if (docLastSection) {
 const state = docProgress.get(docLastSection);
 if (state) {
@@ -2184,6 +2210,7 @@ console.log(`下一学习步骤仍在加载，已等待 ${Math.round(waited / 10
 }
 if (!stepReady) throw new Error(`点击“下一节”后等待超时，新学习步骤仍未加载完成；当前页签：${currentStep || '未显示'}`);
 if (typeof app._noteProgress === 'function') app._noteProgress();
+invalidateDocumentScan();
 app._safeStopped = false;
 app._nextUnitPending = false;
 app._videoEl = null;
@@ -4170,6 +4197,10 @@ console.log(`%c============视频暂停=============`, "color:#FF9800");
 },
 _bindPageGuards() {
 const preventPause = (e) => {
+// 只看“真的移出页面/窗口”的情况：鼠标在页面内部从一个元素移到另一个元素也会触发
+// mouseout，以前每次都被拦掉，既费性能又会影响平台自己的悬停菜单。
+const to = e && e.relatedTarget;
+if (to && to.nodeType === 1 && document.contains(to)) return;
 e.stopPropagation();
 e.preventDefault();
 };

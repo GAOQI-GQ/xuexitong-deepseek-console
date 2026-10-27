@@ -764,7 +764,6 @@ const attemptedQuizzes = new Set();
 const attemptedVideoQuizzes = new Set();
 const videoQuizFailures = new Map();
 const videoQuizStates = new Map();
-const MAX_VIDEO_QUIZ_ATTEMPTS = 3;
 let quizBusy = false;
 let quizLoadRetries = 0;
 let videoQuizBusy = false;

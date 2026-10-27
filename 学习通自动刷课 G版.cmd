@@ -1642,6 +1642,7 @@ read.sawCompletion = verified;
 docTaskSignature = latestSignature;
 noteDocumentRead(sectionKey, verified);
 if (typeof app._noteProgress === 'function') app._noteProgress();
+app._stallRestarts = 0;
 if (verified) console.log(`%c阅读任务点已完成（共 ${read.rounds} 轮，覆盖 ${read.containers} 个滚动区），准备进入下一学习步骤`, 'color:#4CAF50');
 else console.warn(`%c已滚动 ${read.rounds} 轮、覆盖 ${read.containers} 个滚动区，暂未收到平台完成标记，仍按已完成继续切换（下一节会回头核对是否漏做）`, 'color:#FF9800');
 }
@@ -2307,6 +2308,7 @@ app._nextUnitPending = false;
 // 新小节：视频加载等待重新开始计
 app._videoLoadWaitSince = 0;
 app._videoWaitGaveUpSection = '';
+app._stallRestarts = 0;
 app._videoEl = null;
 app._quizVideo = null;
 app._doneVideos = new Map();
@@ -3360,7 +3362,10 @@ this._guardLastTime = current;
 const stalled = Math.abs(current - this._guardLastTime) < 0.01;
 const stalledMs = now - this._guardLastWallTs;
 // 视频在走 ＝ 脚本有进展，停滞自检不介入
-if (!stalled) this._noteProgress();
+if (!stalled) {
+this._noteProgress();
+this._stallRestarts = 0;
+}
 if (stalled && stalledMs >= this.configs.guardNoProgressMs) {
 // 播放器自己报“无法加载、试试其他线路”时，换线比反复 play() 有用
 if (typeof this._retryAlternateVideoLine === 'function' && this._retryAlternateVideoLine('播放停滞')) {
@@ -3551,10 +3556,17 @@ try {
 el.muted = true;
 el.defaultMuted = true;
 el.volume = 0;
-await el.play();
+// 平台的播放器偶尔会“收下播放请求但永远不回应”（元素已失效、任务点已完成不让重播等）。
+// 直接 await 会把整条流程永久卡在这里，对外看起来就是“莫名其妙不动了”，
+// 所以最多等 5 秒，超时也继续往下走，交给视频状态检查判断这一页到底什么情况。
+const playStarted = await this._playWithTimeout(el, 5000);
 this._tryTimes = 0;
 this._taskDialogResumes = 0;
+if (playStarted) {
 console.log('%c视频开始播放', 'color:#4CAF50');
+} else {
+console.warn('%c视频播放请求 5 秒没有回应（播放器可能已结束或已失效），先继续检查这一页的状态', 'color:#FF9800');
+}
 this._startVideoMonitoring();
 this._applyMaxPlaybackRate(el, '开始播放').catch(() => {});
 } catch (playError) {
@@ -3573,6 +3585,14 @@ setTimeout(() => {
 this.play();
 }, this.configs.retryInterval);
 }
+},
+// 播放请求加超时：play() 的 Promise 一直不 settle 时，流程也必须能继续往下走。
+// 真播起来了返回 true；超时返回 false；被浏览器拒绝时照常抛出，交给调用处处理。
+_playWithTimeout(el, ms) {
+return Promise.race([
+Promise.resolve().then(() => el.play()).then(() => true),
+new Promise((resolve) => setTimeout(() => resolve(false), ms)),
+]);
 },
 _advanceLearningStep() {
 if (this._stepSwitchPending && Date.now() - this._stepSwitchAt < 4000) {
@@ -3778,12 +3798,24 @@ this._noVideoRetryTimes = 0;
 this._allDoneChecks = 0;
 this._videoLoadWaitSince = 0;
 this._stepSwitchPending = false;
+// “重新识别页面”就要连播放器元素一起重新找：抱着旧元素重启，只会用同一个失效元素再卡一次
+this._videoEl = null;
+this._quizVideo = null;
 this._clearCheckInterval();
 try { this._initCellData(); } catch (_) { /* 目录还没准备好时忽略 */ }
+// 连着几次重启都没有进展，说明反复 play() 解决不了，得换一招
+this._stallRestarts = (this._stallRestarts || 0) + 1;
+const skipPage = this._stallRestarts >= 3;
 console.log(`%c停滞自检：已重新识别页面（${reason}）`, 'color:#607D8B');
 setTimeout(() => {
 if (this._destroyed) return;
 this._noteProgress();
+if (skipPage) {
+this._stallRestarts = 0;
+console.warn('%c这一页连续 3 次没有任何进展，先跳到下一节继续；如果这一节确实还没完成，稍后手动回来检查', 'color:#F44336');
+this.nextUnit();
+return;
+}
 this.play();
 }, 1200);
 },
@@ -4005,6 +4037,26 @@ alt.defaultMuted = true;
 alt.volume = 0;
 } catch (_) {}
 return alt;
+}
+// 旧播放器元素还挂在页面上，但既看不见、也播不动，而页面上唯一可见的视频已经播完：
+// _nextPlayableVideo 会把“播完的视频”排除掉，于是这里一直抱着那个死元素，
+// play() 对它发起的播放请求永远没有回应 —— 表现出来就是整页卡死不再前进。
+// 页面上还有可见视频就用它，播没播完交给 play() 判断（播完就走“已完成”流程）。
+let visibleVideo = null;
+try {
+visibleVideo = this._findAllVideos(false).find((video) => video !== this._videoEl) || null;
+} catch (_) { visibleVideo = null; }
+if (visibleVideo) {
+console.log('%c旧播放器已失效，改用页面上可见的视频', 'color:#4CAF50');
+// 把这个换下来的死元素记为“已完成”，否则后面找“下一段视频”时还会把它翻出来，来回打转
+this._markVideoDone(this._videoEl);
+this._videoEl = visibleVideo;
+try {
+visibleVideo.muted = true;
+visibleVideo.defaultMuted = true;
+visibleVideo.volume = 0;
+} catch (_) {}
+return visibleVideo;
 }
 }
 }

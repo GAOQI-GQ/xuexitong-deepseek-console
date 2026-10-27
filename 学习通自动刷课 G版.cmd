@@ -2664,11 +2664,15 @@ signature,
 question: null,
 attempts: 0,
 tried: [],
+// 页面明确判错的答案（和“提交过”分开：提交过但反馈没认出来的答案，之后还可能再选）
+wrong: [],
 correctBefore: -1,
 lastSubmittedAt: 0,
 skipCount: 0,
 gaveUp: false,
 loggedUnknown: false,
+// 上一次提交后页面没有任何判定时，是否已经把原答案原样重提过一次
+sameRetried: false,
 });
 }
 return videoQuizStates.get(signature);
@@ -2676,7 +2680,12 @@ return videoQuizStates.get(signature);
 
 function videoQuizMaxAttempts(question) {
 const count = question && Array.isArray(question.options) ? question.options.length : 0;
-return Math.max(MAX_VIDEO_QUIZ_ATTEMPTS, Math.min(8, count + 1));
+if (question && question.kind === '多选题') {
+// 多选题：按组合穷举，留足把所有组合试一遍的余地（组合太多时封顶，别真的问到天荒地老）
+return Math.min(Math.pow(2, Math.max(count, 2)) - 1, 20);
+}
+// 单选/判断：每个选项都能试一遍，再留出“提交没被接住、原样重提”和“回头补试”的余量
+return Math.max(4, Math.min(10, count * 2 + 2));
 }
 
 function findVisibleVideoQuizResult() {
@@ -2876,11 +2885,42 @@ const letters = Array.from(new Set(match[1].match(/[A-H]/g) || []));
 return letters.length ? letters : null;
 }
 
+// 记下“页面明确判错”的答案，和“提交过”分开存
+function markVideoQuizWrongAnswer(state, letters) {
+if (!state || !Array.isArray(letters) || !letters.length) return;
+if (!Array.isArray(state.wrong)) state.wrong = [];
+if (state.wrong.some((entry) => Array.isArray(entry) && sameLetters(entry, letters))) return;
+state.wrong.push([...letters]);
+}
+
+// 排除法：只排除“页面明确判错”的选项，提交过但没确认错的答案仍然可以再选。
+// 以前这里把“提交过的”全都当成不能再用，两个选项（对/错）的题只要第一遍没被
+// 识别成通过，第二轮就必然报“所有选项都已尝试过”，然后停下来等人手动做。
 function fallbackLetters(question, state) {
-const tried = new Set(state.tried.flat());
-const untried = question.options.map((option) => option.letter).filter((letter) => !tried.has(letter));
-if (!untried.length) return null;
-return question.kind === '多选题' ? untried : [untried[0]];
+const options = question.options.map((option) => option.letter);
+if (!options.length) return null;
+const tried = (Array.isArray(state.tried) ? state.tried : []).filter((entry) => Array.isArray(entry) && entry.length);
+const wrong = (Array.isArray(state.wrong) ? state.wrong : []).filter((entry) => Array.isArray(entry) && entry.length);
+if (question.kind !== '多选题') {
+// 单选/判断：判错的那一项一定不是答案，剩下的按“没试过的优先”挑一个
+const wrongLetters = new Set();
+for (const entry of wrong) if (entry.length === 1) wrongLetters.add(entry[0]);
+const usable = options.filter((letter) => !wrongLetters.has(letter));
+const pool = usable.length ? usable : options;
+const untried = pool.filter((letter) => !tried.some((entry) => entry.length === 1 && entry[0] === letter));
+return [(untried.length ? untried : pool)[0]];
+}
+// 多选：把所有非空组合从小到大排好，先避开判错的组合，再优先没试过的组合
+const combos = [];
+const total = Math.pow(2, options.length);
+for (let mask = 1; mask < total; mask++) {
+combos.push(options.filter((_, index) => mask & Math.pow(2, index)));
+}
+combos.sort((a, b) => a.length - b.length || a.join('').localeCompare(b.join('')));
+const notWrong = combos.filter((combo) => !wrong.some((entry) => sameLetters(entry, combo)));
+const pool = notWrong.length ? notWrong : combos;
+const untried = pool.filter((combo) => !tried.some((entry) => sameLetters(entry, combo)));
+return (untried.length ? untried : pool)[0] || null;
 }
 
 function videoQuizFeedbackText(text) {
@@ -2895,30 +2935,44 @@ console.log(`%c使用页面提示的正确答案：${letters.join('')}`, 'color:
 return letters;
 }
 const tried = state.tried.filter((entry) => Array.isArray(entry) && entry.length);
+const wrong = (Array.isArray(state.wrong) ? state.wrong : []).filter((entry) => Array.isArray(entry) && entry.length);
 if (!tried.length) {
 const answers = validateAnswers([question], await askDeepSeek([question]));
-return answers.get(1);
+return answers.get(1) || fallbackLetters(question, state);
 }
-const triedText = tried.map((entry) => entry.join('、')).join('；');
+// 只有两个选项（判断题/二选一）：页面判错的那一项一定不是答案，直接选另一个。
+// 这类题不用再问 AI —— 它很可能把同一个答案再给一遍，白白耗掉作答次数。
+if (question.kind !== '多选题' && question.options.length <= 2) {
+const deductive = fallbackLetters(question, state);
+if (deductive) {
+console.log(`%c按排除法作答：${deductive.join('')}`, 'color:#2196F3');
+return deductive;
+}
+}
+// 避免重复：优先避开页面判错的答案；还没看到明确判错时，避开已经提交过的
+const avoid = wrong.length ? wrong : tried;
+const avoidedText = avoid.map((entry) => entry.join('、')).join('；');
 const feedback = videoQuizFeedbackText(feedbackText);
 const feedbackHint = feedback ? `页面反馈：“${feedback}”。` : '';
 const multiHint = question.kind === '多选题' ? '；多选题判错可能是多选了某一项，也可能是漏选了某一项，请逐项重新核对，并选全所有正确项' : '';
-const hint = `（注意：以下选择都已被判为错误：${triedText}。${feedbackHint}请重新审题，必须换一个没有试过的答案，不要重复这些选择${multiHint}。）`;
+// 只提交过、页面没认出来判错的那些，别在提示里说成“判错了”，免得把 AI 带偏
+const avoidedLabel = wrong.length ? '已被判为错误' : '已经提交过、页面没有判对';
+const hint = `（注意：以下选择${avoidedLabel}：${avoidedText}。${feedbackHint}请重新审题，必须换一个不同于这些的答案${multiHint}。）`;
 const hinted = { ...question, title: `${question.title}${hint}`.slice(0, 500) };
 let letters = null;
 try {
 letters = validateAnswers([question], await askDeepSeek([hinted])).get(1);
-if (letters && tried.some((entry) => sameLetters(letters, entry))) letters = null;
+if (letters && avoid.some((entry) => sameLetters(letters, entry))) letters = null;
 } catch (error) {
 console.warn('视频弹题重答请求失败，改用排除法:', error);
 }
 if (!letters) {
 // AI 仍给出旧答案时，再问一次，并明确要求“与之前所有尝试不同”
 try {
-const strictHint = `（这是一道${question.kind}。上一次提交的答案 ${triedText} 已被页面判错，必须给出与之前所有尝试都不同的答案${multiHint}。）`;
+const strictHint = `（这是一道${question.kind}。答案 ${avoidedText} 已经不能再用，必须给出与它不同的答案${multiHint}。）`;
 const strict = { ...question, title: `${question.title}${strictHint}`.slice(0, 500) };
 const second = validateAnswers([question], await askDeepSeek([strict])).get(1);
-if (second && !tried.some((entry) => sameLetters(second, entry))) {
+if (second && !avoid.some((entry) => sameLetters(second, entry))) {
 console.log(`%cAI 重新判断后给出新答案：${second.join('')}`, 'color:#2196F3');
 letters = second;
 }
@@ -2927,8 +2981,11 @@ console.warn('视频弹题第二次重答请求失败，改用排除法:', error
 }
 }
 if (letters) return letters;
+// AI 实在给不出新答案就穷举：单选挨个试、多选按组合试；
+// 判错的排除掉，只是提交过、没确认错的仍然可以再试一次。
 const fallback = fallbackLetters(question, state);
-if (!fallback) throw new Error('所有选项都已尝试过，仍未答对，请手动完成');
+if (!fallback) throw new Error('弹题没有可选的选项，无法自动作答');
+console.log(`%cAI 没有给出新答案，改用穷举：${fallback.join('')}`, 'color:#FF9800');
 return fallback;
 }
 
@@ -3119,8 +3176,18 @@ state.loggedUnknown = true;
 console.log(`%c未识别的弹题反馈，仍会按“未通过”继续重答：${text.slice(-80)}`, 'color:#9E9E9E');
 }
 if (state.attempts > 0 && (isVideoQuizWrong(text) || Boolean(result && result.wrong))) {
+// 页面明确判错：把上一次提交的答案记下来，之后不再原样重复它
+markVideoQuizWrongAnswer(state, state.tried[state.tried.length - 1]);
 console.warn('%c检测到上一次回答错误，准备重新作答', 'color:#FF9800');
 }
+// 上一次提交之后，页面上连“对/错”都没出现：多半是这次提交没被平台接住（按钮没触发、
+// 被遮罩挡住、网络慢），而不是答案不对。这种情况换答案等于把可能正确的答案丢掉，
+// 所以先按原答案再提交一次；只重提一次，免得在一个交不上去的答案上打转。
+const lastTried = state.tried[state.tried.length - 1];
+const noFeedbackYet = state.attempts > 0 && Array.isArray(lastTried) && lastTried.length > 0 &&
+!isVideoQuizWrong(text) && !(result && result.wrong) && !(result && result.success);
+const retrySameAnswer = noFeedbackYet && !state.sameRetried;
+if (retrySameAnswer) state.sameRetried = true;
 const shownLetters = state.attempts > 0 ? shownCorrectLetters(text) : null;
 videoQuizBusy = true;
 app._videoQuizActive = true;
@@ -3141,7 +3208,13 @@ question = findVideoQuizCard() || question;
 state.question = question;
 activeVideoQuiz = question;
 if (state.attempts === 0 && currentCorrect >= 0) state.correctBefore = currentCorrect;
-const letters = await chooseVideoQuizLetters(question, state, shownLetters, text);
+let letters;
+if (retrySameAnswer) {
+letters = [...lastTried];
+console.log(`%c上一次提交没有看到任何判定结果，先按原答案再提交一次：${letters.join('')}`, 'color:#FF9800');
+} else {
+letters = await chooseVideoQuizLetters(question, state, shownLetters, text);
+}
 const targetLetters = new Set(letters);
 const stale = question.options.filter((option) => !targetLetters.has(option.letter) && videoQuizOptionChecked(option));
 if (state.attempts > 0 && stale.length) throw new Error(`多选题旧选项未能取消（${stale.map((option) => option.letter).join('、')}），暂不提交`);

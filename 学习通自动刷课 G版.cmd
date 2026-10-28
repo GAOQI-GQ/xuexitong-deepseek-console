@@ -766,6 +766,10 @@ const videoQuizFailures = new Map();
 const videoQuizStates = new Map();
 let quizBusy = false;
 let quizLoadRetries = 0;
+// 连续跳过多少个“目录里是测验、内容区却是空的”小节（真答上一份测验就清零）
+let emptyQuizSkips = 0;
+// 上一次跳过的是哪一节、什么时候跳的：同一节刚跳过又被平台拉回来，说明这里确实有未完成任务点
+let lastSkippedQuiz = { label: '', at: 0 };
 let videoQuizBusy = false;
 let videoQuizTimer = null;
 let videoQuizRetryAt = 0;
@@ -825,6 +829,23 @@ return false;
 }
 
 app._pageShowsNoContent = pageShowsNoContent;
+
+// 目录里标着测验、内容区却什么都没有：测验已经做过，或者这一节压根没放题目。
+// 这种小节永远不会再出现“提交”按钮，以前会干等 120 秒、重试 3 次，最后停下来等人手动处理。
+// 判断要保守：主页面明确写着“暂无内容”，并且没有题目、没有提交按钮、没有图文框架、没有视频，
+// 免得把“题目还在加载”的正常测验误判成空节直接跳过。
+function quizSectionLooksEmpty() {
+try {
+if (!pageShowsNoContent()) return false;
+if (courseDocuments().some((doc) => findQuizSubmit(doc))) return false;
+if (extractQuestions().length) return false;
+if (contentFrameDocs().length) return false;
+if (app._findAllVideos().length) return false;
+return true;
+} catch (_) {
+return false;
+}
+}
 // 停滞自检（app 的方法）判断“视频是否在播”“有几篇图文”时也要用这两个探测函数，
 // 它们只在这个作用域里，所以挂到 app 上，自检里用 this._visibleVideoState() / this._contentFrameDocs()
 app._visibleVideoState = visibleVideoState;
@@ -1998,6 +2019,7 @@ const QUIZ_START_LABELS = ['开始答题', '开始测验', '开始考试', '进�
 async function waitForQuizQuestions() {
 let submitDoc = null;
 let startClicked = false;
+let emptySince = 0;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
@@ -2008,6 +2030,18 @@ if (attempt >= 16 && attempt % 16 === 0) {
 let docCount = 0;
 try { docCount = contentFrameDocs().length; } catch (_) { docCount = 0; }
 if (docCount) throw new Error('当前页面是阅读/图文任务点，不是章节测验');
+}
+// 这一节是空的（“暂无内容”，没有题目、没有图文、没有视频）：不会再出现“提交”按钮，
+// 稳定 10 秒就交回调用处去点“下一节”。留 10 秒是为了不误伤“题目只是加载慢”的测验。
+if (quizSectionLooksEmpty()) {
+if (!emptySince) emptySince = Date.now();
+else if (Date.now() - emptySince >= 10000) {
+const emptyError = new Error('这一节是空的（页面显示“暂无内容”），没有题目可答');
+emptyError.emptyQuizSection = true;
+throw emptyError;
+}
+} else {
+emptySince = 0;
 }
 // 有的章节测验先显示“开始答题/开始测验”入口，点了之后才加载题目
 if (!startClicked) {
@@ -2373,6 +2407,33 @@ console.log('视频诊断结果（请把这一条展开后截图）：', result)
 return result;
 };
 
+// 这一节没法自动作答（内容是空的 / 题目一直加载不出来）时，跳过它继续往下学。
+// 用户要的是全自动，所以不停下来等人：点“下一节”就走。
+// 两种情况下不再硬跳：同一节刚跳过又被平台带回来（说明这里确实有未完成任务点），
+// 或者已经连着跳了 10 节，避免在空小节之间无限打转。
+async function skipQuizSection(reason) {
+const label = activeCatalogLabel() || app._currentStepTitle() || '';
+const recent = lastSkippedQuiz.label && lastSkippedQuiz.label === label && Date.now() - lastSkippedQuiz.at < 180000;
+if (recent) {
+console.warn(`%c这一节（${label}）刚跳过一次又被带回来了，说明平台认为这里还有未完成任务点；自动答题暂停，手动完成后可执行 app.nextUnit() 继续`, 'color:#FF9800');
+return;
+}
+if (emptyQuizSkips >= 10) {
+console.error('连续跳过 10 个没能自动作答的小节，仍未找到可学习内容，已停止，请手动检查章节');
+return;
+}
+emptyQuizSkips++;
+lastSkippedQuiz = { label, at: Date.now() };
+console.warn(`%c这一节没法自动作答（${reason}），自动点击“下一节”跳过（第 ${emptyQuizSkips} 次）`, 'color:#FF9800');
+quizBusy = false;
+try {
+await goToNextStep();
+} catch (error) {
+app._nextUnitPending = false;
+console.error('跳过没法作答的小节时出错:', error);
+}
+}
+
 app._advanceChapterTest = function () {
 if (stopped || quizBusy) return;
 quizBusy = true;
@@ -2397,6 +2458,13 @@ try {
 questions = await waitForQuizQuestions();
 } catch (error) {
 if (stopped) return;
+// 目录里标着测验、内容区却是空的（测验已经做完，或这一节没有题目）：
+// 这一节不会再有任何内容，以前重试 3 次后停下来等人手动处理，现在直接点“下一节”继续。
+if (error.emptyQuizSection) {
+quizLoadRetries = 0;
+await skipQuizSection('内容是空的');
+return;
+}
 // 没等到测验内容时先复查步骤：平台经常把空白/预加载的测验框架留在页面上，
 // 此时页面其实还在视频上，直接回到视频流程，不要整段脚本卡死。
 if (app._currentStepTitle() !== '章节测验') {
@@ -2418,11 +2486,17 @@ console.warn(`%c章节测验内容仍未加载出来（第 ${quizLoadRetries}/3 
 setTimeout(() => { if (!stopped && !app._destroyed) app._advanceChapterTest(); }, 30000);
 return;
 }
+// 重试 3 次（约 2 分半）还是没有题目：不再停下等人，跳过这一节继续往下学。
+// 真要是一份需要手动做的测验，跳过时平台会弹出“还有任务点未完成”把我们带回来，
+// skipQuizSection 会识别出“同一节刚跳过一次”，那时才停下来提示。
 console.error('章节测验自动作答停止:', error);
-console.warn('%c自动答题已暂停，但脚本本身仍在运行；手动完成本章测验后可执行 app.nextUnit() 继续', 'color:#FF9800');
+quizLoadRetries = 0;
+await skipQuizSection(`等不到题目：${error.message}`);
 return;
 }
 quizLoadRetries = 0;
+emptyQuizSkips = 0;
+lastSkippedQuiz = { label: '', at: 0 };
 if (questions === null) {
 console.log('检测到当前章节测验已完成，点击“下一节”进入新视频');
 await goToNextStep();

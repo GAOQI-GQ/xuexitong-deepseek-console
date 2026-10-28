@@ -1486,6 +1486,24 @@ function catalogMarkerUsable() {
 return catalogItems().some((item) => item.done);
 }
 
+// 这一节是不是已经全部做完了。
+// 只认目录里“整节打勾”：平台的勾代表这一节的所有任务点（多个视频、多篇图文、视频+测验混排）都完成了；
+// 页面上那句“任务点已完成”只代表当前显示的那一个任务点，多任务点的小节里它先亮也不能算整节完成。
+// 目录里根本没有勾这个标记时（catalogMarkerUsable 为假）一律不信，避免误跳。
+let doneSectionSkipped = { label: '', at: 0 };
+function sectionAlreadyCompleted() {
+if (!catalogMarkerUsable()) return false;
+const label = activeSectionKey();
+if (!label) return false;
+if (catalogSectionDone(label) !== true) return false;
+// 同一节 60 秒内只跳一次：万一“下一节”没点动，也别原地疯狂重试
+const now = Date.now();
+if (doneSectionSkipped.label === label && now - doneSectionSkipped.at < 60000) return false;
+doneSectionSkipped = { label, at: now };
+return true;
+}
+app._sectionAlreadyCompleted = sectionAlreadyCompleted;
+
 function noteDocumentRead(label, verified) {
 const key = clean(label);
 if (!key) return;
@@ -2438,6 +2456,13 @@ app._advanceChapterTest = function () {
 if (stopped || quizBusy) return;
 quizBusy = true;
 (async () => {
+// 目录里这一节已经打勾：不管它是纯测验、还是视频+测验混排，整节任务点都已完成，
+// 不要再等题目、也不要再提交，直接进下一节（play() 里同一判断会更早拦住，这里兜底直接调用的路径）
+if (sectionAlreadyCompleted()) {
+console.log('%c这一节在目录里已经打勾（全部任务点已完成），跳过测验直接进入下一节', 'color:#4CAF50');
+await goToNextStep();
+return;
+}
 if (quizCompleted()) {
 console.log('检测到当前章节测验已完成，点击“下一节”进入新视频');
 await goToNextStep();
@@ -3575,13 +3600,6 @@ console.warn('%c本实例已被新注入的脚本接管，旧实例停止工作'
 }
 return;
 }
-if (this._isChapterTest()) {
-this._videoEl = null;
-this._isPlaying = false;
-this._clearCheckInterval();
-this._advanceChapterTest();
-return;
-}
 if (this._nextUnitPending) {
 if (!this._pendingWaitLoggedAt || Date.now() - this._pendingWaitLoggedAt > 10000) {
 this._pendingWaitLoggedAt = Date.now();
@@ -3592,6 +3610,26 @@ return;
 }
 // 完成情况保险：上一节图文在目录里没打勾就回头补做，避免多篇图文时跳着做漏掉内容
 if (typeof this._docProgressAudit === 'function' && this._docProgressAudit()) return;
+// 这一节在目录里已经打勾 = 平台认定这一节的全部任务点都完成了（多个视频、多篇图文、
+// 视频+测验混排都算在这个勾里）。这种情况不要再从头播一遍视频、也不用再进测验流程，
+// 直接进下一节。放在章节测验判断之前：已经做完的测验小节同样按这个勾跳过。
+if (typeof this._sectionAlreadyCompleted === 'function' && this._sectionAlreadyCompleted()) {
+this._videoEl = null;
+this._quizVideo = null;
+this._isPlaying = false;
+this._allDoneChecks = 0;
+this._clearCheckInterval();
+console.warn('%c这一节在目录里已经打勾（全部任务点已完成），跳过它直接切换下一节', 'color:#4CAF50');
+setTimeout(() => this.nextUnit(), 800);
+return;
+}
+if (this._isChapterTest()) {
+this._videoEl = null;
+this._isPlaying = false;
+this._clearCheckInterval();
+this._advanceChapterTest();
+return;
+}
 // 弹题还开着时不要先开始播，避免在弹题遮罩后面把视频播过去
 if (this._videoQuizPending && typeof this._videoQuizVisibleNow === 'function' && this._videoQuizVisibleNow()) {
 this._isPlaying = false;

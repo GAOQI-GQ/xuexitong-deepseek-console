@@ -2872,6 +2872,8 @@ correctBefore: -1,
 lastSubmittedAt: 0,
 skipCount: 0,
 gaveUp: false,
+// 放弃的时间：跳节被“还有任务点未完成”弹窗拉回来之后，过一段时间要重新作答，不能一直停着
+gaveUpAt: 0,
 loggedUnknown: false,
 // 上一次提交后页面没有任何判定时，是否已经把原答案原样重提过一次
 sameRetried: false,
@@ -3262,6 +3264,41 @@ try { src = typeof app._videoSrcOf === 'function' ? app._videoSrcOf(video) : '';
 return src ? src.replace(/[?#].*$/, '') : 'no-src';
 }
 
+// 目标选项之外、页面还勾着的旧选项
+function staleVideoQuizSelections(question, letters) {
+const target = new Set(letters || []);
+if (!question || !Array.isArray(question.options)) return [];
+return question.options.filter((option) => !target.has(option.letter) && videoQuizOptionChecked(option));
+}
+
+// 判断题/单选题在有些页面上被画成勾选框，点新选项时旧的不会自己取消：
+// 补点一次把它关掉；关不掉就返回剩下的旧选项，由调用处决定不提交
+async function clearStaleVideoQuizSelections(question, letters) {
+let stale = staleVideoQuizSelections(question, letters);
+for (const option of stale) {
+const el = option && option.element;
+if (!el || !el.isConnected) continue;
+try { el.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+// 勾选框可能在选项包装里，也可能在旁边的 label 上：挨个点，点掉了就停
+const targets = [];
+const addTarget = (target) => {
+if (target && !targets.includes(target)) targets.push(target);
+};
+let input = null;
+try { input = el.matches('input') ? el : el.querySelector('input'); } catch (_) { input = null; }
+addTarget(input);
+addTarget(el);
+try { addTarget(el.closest('label') || el.querySelector('label')); } catch (_) { /* 忽略 */ }
+for (const target of targets) {
+fireClick(target);
+await sleep(150);
+if (!videoQuizOptionChecked(option)) break;
+}
+}
+stale = staleVideoQuizSelections(question, letters);
+return stale;
+}
+
 async function handleVideoQuiz() {
 if (stopped || videoQuizBusy || app._isChapterTest()) return;
 if (videoQuizSuccessVisible()) {
@@ -3324,6 +3361,21 @@ if (attemptedVideoQuizzes.has(signature)) {
 if (state.gaveUp && state.skipCount < 3) {
 state.skipCount++;
 skipVideoQuizToNext('已放弃重答');
+return;
+}
+// 跳节也点过了，平台的“还有任务点未完成”弹窗又把页面拉回这一节：
+// 不能就这么停住不动，隔一分钟清掉失败计数重新作答（这时排除法通常已经能给出另一个选项）
+if (state.gaveUp && Date.now() - (state.gaveUpAt || 0) >= 60000) {
+state.gaveUp = false;
+state.gaveUpAt = 0;
+state.skipCount = 0;
+// 作答次数也归零，否则一进来就撞上“已试满次数”又放弃
+state.attempts = 0;
+state.sameRetried = false;
+state.loggedUnknown = false;
+videoQuizFailures.delete(signature);
+attemptedVideoQuizzes.delete(signature);
+console.log('%c这道弹题停顿超过一分钟，重新开始作答（换一个答案再试）', 'color:#FF9800');
 }
 return;
 }
@@ -3365,6 +3417,7 @@ return;
 }
 if (state.attempts >= videoQuizMaxAttempts(question)) {
 state.gaveUp = true;
+state.gaveUpAt = Date.now();
 attemptedVideoQuizzes.add(signature);
 console.error(`视频弹题已尝试 ${state.attempts} 次仍未通过`);
 if (state.skipCount < 3) {
@@ -3417,11 +3470,18 @@ console.log(`%c上一次提交没有看到任何判定结果，先按原答案�
 } else {
 letters = await chooseVideoQuizLetters(question, state, shownLetters, text);
 }
-const targetLetters = new Set(letters);
-const stale = question.options.filter((option) => !targetLetters.has(option.letter) && videoQuizOptionChecked(option));
-if (state.attempts > 0 && stale.length) throw new Error(`多选题旧选项未能取消（${stale.map((option) => option.letter).join('、')}），暂不提交`);
+// 多选：不选的旧选项必须清干净，否则平台的提交里会带上它们；
+// 单选/判断是互斥的，点新选项时平台自己会取消旧的，套用这条只会卡住（A 永远取消不掉，就不肯提交 B）
+if (question.kind === '多选题' && state.attempts > 0) {
+const stale = staleVideoQuizSelections(question, letters);
+if (stale.length) throw new Error(`多选题旧选项未能取消（${stale.map((option) => option.letter).join('、')}），暂不提交`);
+}
 console.log(`%c视频弹题第 ${state.attempts + 1} 次作答：${letters.join('')}`, 'color:#2196F3');
 await selectAnswers([question], new Map([[1, letters]]));
+if (question.kind !== '多选题') {
+const stillStale = await clearStaleVideoQuizSelections(question, letters);
+if (stillStale.length) throw new Error(`旧选项未能取消（${stillStale.map((option) => option.letter).join('、')}），暂不提交`);
+}
 const submit = findButtonIn(question.card, '提交');
 if (!submit) throw new Error('视频弹题中未找到提交按钮');
 submit.scrollIntoView({ block: 'center' });
@@ -3437,6 +3497,7 @@ const failures = (videoQuizFailures.get(signature) || 0) + 1;
 videoQuizFailures.set(signature, failures);
 if (failures >= 3) {
 state.gaveUp = true;
+state.gaveUpAt = Date.now();
 attemptedVideoQuizzes.add(signature);
 console.error(`视频弹题自动作答失败（已尝试 ${failures} 次），准备点击“下一节”跳过:`, error);
 if (state.skipCount < 3) {

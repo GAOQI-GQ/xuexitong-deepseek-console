@@ -756,6 +756,44 @@ console.error('%c脚本启动超时：未检测到课程目录（#coursetree）�
 }
 }, 1000);
 }
+// 页面里常常同时留着好几个任务点框架（视频 num=0、测验 num=1 都在 DOM 里），
+// 只按“第一个有尺寸的框架”判断会把当前步骤认错：明明屏幕上是已完成的视频，
+// 却被当成章节测验去等永远不会出现的题目。这里按“内容区真正显示的是哪个框架”来选：
+// 先用内容区中心点最上层命中谁（浏览器真实布局），读不到坐标（例如测试环境）再退回面积最大的那个。
+function displayedCardsFrame() {
+const isCards = (frame) => {
+try { return Boolean(frame) && frame.tagName === 'IFRAME' && /\/knowledge\/cards/.test(frame.getAttribute('src') || ''); } catch (_) { return false; }
+};
+try {
+const cx = Math.floor((window.innerWidth || 1280) * 0.35);
+const cy = Math.floor((window.innerHeight || 800) * 0.45);
+let el = document.elementFromPoint(cx, cy);
+while (el && el !== document.body) {
+if (isCards(el)) return el;
+el = el.parentElement;
+}
+} catch (_) { /* jsdom 或页面重建时读不到坐标 */ }
+let best = null;
+let bestArea = 0;
+try {
+for (const frame of document.querySelectorAll('iframe[src*="/knowledge/cards"]')) {
+let rect = null;
+try { rect = frame.getClientRects()[0]; } catch (_) { rect = null; }
+if (!rect) continue;
+const area = (rect.width || 0) * (rect.height || 0);
+if (!best || area > bestArea) {
+best = frame;
+bestArea = area;
+}
+}
+} catch (_) { /* 忽略 */ }
+if (best) return best;
+try {
+return Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
+.find((frame) => frame.getClientRects().length > 0) || null;
+} catch (_) { return null; }
+}
+
 // 测验、弹题、图文、小节切换都在这里，负责给 app 补上对应能力。
 // 其中 _currentStepTitle 是“包住”app 原实现、destroy 包在原 destroy 外面、_advanceChapterTest 直接替换，
 // 以后改这几处逻辑请改这里，不要去 app 对象里再写一份同名实现（否则就是两套逻辑并行）。
@@ -1520,16 +1558,34 @@ return new URL(frame.getAttribute('src'), location.href).searchParams.get('num')
 // 框架里出现这句标记，说明整个任务点平台已经记为完成——再从头播一遍毫无意义。
 // 整节完成的判断在 sectionAlreadyCompleted；这里管的是“这个任务点已完成、但这一节还有别的任务点（比如章节测验）”。
 // 同一节同一个任务点 60 秒内只跳一次：万一“下一节”没点动或被平台拦回来，就回去正常播放，别原地打转。
-let doneTaskPointSkipped = { key: '', at: 0 };
-function videoTaskPointCompleted(el) {
-if (!el) return false;
-let doc = null;
-try { doc = el.ownerDocument; } catch (_) { return false; }
+// 这个框架里是不是已经有平台打上的“任务点已完成”标记
+function docShowsTaskPointDone(doc) {
 if (!doc || !doc.body) return false;
 let text = '';
 try { text = clean(doc.body.innerText || doc.body.textContent || ''); } catch (_) { return false; }
 if (!text || text.length > 30000) return false;
-if (!/任务点已完成|视频任务点已完成|视频已完成/.test(text)) return false;
+return /任务点已完成|视频任务点已完成|视频已完成/.test(text);
+}
+
+// 页面上有没有“平台已标记完成”的视频任务点（内容区那行绿字，不是目录里的勾）
+function completedVideoTaskPointShown() {
+try {
+for (const doc of courseDocuments()) {
+let hasVideo = false;
+try { hasVideo = Boolean(doc.querySelector('video')); } catch (_) { hasVideo = false; }
+if (hasVideo && docShowsTaskPointDone(doc)) return true;
+}
+} catch (_) { /* 跨域或页面正在重建 */ }
+return false;
+}
+
+let doneTaskPointSkipped = { key: '', at: 0 };
+function videoTaskPointCompleted(el) {
+if (!el) return false;
+let doc = null;
+try { doc = el.ownerDocument; } catch (_) { doc = null; }
+// 标记可能就在视频自己的框架里，也可能在播放器外层的页面里，两处都认
+if (!docShowsTaskPointDone(doc) && !completedVideoTaskPointShown()) return false;
 const key = `${activeSectionKey()}|${currentTaskPointNum()}`;
 const now = Date.now();
 if (doneTaskPointSkipped.key === key && now - doneTaskPointSkipped.at < 60000) return false;
@@ -2072,6 +2128,8 @@ async function waitForQuizQuestions() {
 let submitDoc = null;
 let startClicked = false;
 let emptySince = 0;
+// 页面上是已完成的视频任务点、测验框架里却没有试卷痕迹：连续这么多毫秒都如此就按“没法作答”处理
+let videoInsteadSince = 0;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
@@ -2094,6 +2152,19 @@ throw emptyError;
 }
 } else {
 emptySince = 0;
+}
+// 页面上真正显示的是“已经完成的视频任务点”，而测验这边既没有题目、也没有任何试卷痕迹：
+// 说明这个“章节测验”只是平台预加载的空壳框架（或这一节的测验本来就没有内容），
+// 再等也不会出现题目。稳定 15 秒仍如此，就按“没法自动作答”处理，交回调用处点“下一节”。
+if (!stepProbe().quizPage && completedVideoTaskPointShown()) {
+if (!videoInsteadSince) videoInsteadSince = Date.now();
+else if (Date.now() - videoInsteadSince >= 15000) {
+const videoInsteadError = new Error('这一节显示的是已完成的视频任务点，测验框架里没有题目');
+videoInsteadError.emptyQuizSection = true;
+throw videoInsteadError;
+}
+} else {
+videoInsteadSince = 0;
 }
 // 有的章节测验先显示“开始答题/开始测验”入口，点了之后才加载题目
 if (!startClicked) {
@@ -3853,8 +3924,8 @@ return true;
 return false;
 },
 _currentStepTitle() {
-const cardsFrame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
-.find((frame) => frame.getClientRects().length > 0);
+// 同时存在多个任务点框架时，按“内容区真正显示的那个”判断，别被预加载的空壳框架带偏
+const cardsFrame = displayedCardsFrame();
 if (cardsFrame) {
 const num = new URL(cardsFrame.getAttribute('src'), location.href).searchParams.get('num');
 if (num === '0') return '视频';

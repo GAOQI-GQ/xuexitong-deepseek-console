@@ -1504,6 +1504,40 @@ return true;
 }
 app._sectionAlreadyCompleted = sectionAlreadyCompleted;
 
+// 当前显示的任务点编号（内容框架 src 里的 num）：这一节里的第几个任务点。
+// 用它给“任务点已完成”的跳过做冷却，同一节同一个任务点只跳一次。
+function currentTaskPointNum() {
+try {
+const frame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
+.find((item) => { try { return item.getClientRects().length > 0; } catch (_) { return false; } });
+if (!frame) return '';
+return new URL(frame.getAttribute('src'), location.href).searchParams.get('num') || '';
+} catch (_) { return ''; }
+}
+
+// 当前这段视频所在的任务点，平台是不是已经标记成“任务点已完成”。
+// 一个任务点就是一个内容框架：视频（含同框架里的多个分段）和它附带的图文都在这个框架里，
+// 框架里出现这句标记，说明整个任务点平台已经记为完成——再从头播一遍毫无意义。
+// 整节完成的判断在 sectionAlreadyCompleted；这里管的是“这个任务点已完成、但这一节还有别的任务点（比如章节测验）”。
+// 同一节同一个任务点 60 秒内只跳一次：万一“下一节”没点动或被平台拦回来，就回去正常播放，别原地打转。
+let doneTaskPointSkipped = { key: '', at: 0 };
+function videoTaskPointCompleted(el) {
+if (!el) return false;
+let doc = null;
+try { doc = el.ownerDocument; } catch (_) { return false; }
+if (!doc || !doc.body) return false;
+let text = '';
+try { text = clean(doc.body.innerText || doc.body.textContent || ''); } catch (_) { return false; }
+if (!text || text.length > 30000) return false;
+if (!/任务点已完成|视频任务点已完成|视频已完成/.test(text)) return false;
+const key = `${activeSectionKey()}|${currentTaskPointNum()}`;
+const now = Date.now();
+if (doneTaskPointSkipped.key === key && now - doneTaskPointSkipped.at < 60000) return false;
+doneTaskPointSkipped = { key, at: now };
+return true;
+}
+app._videoTaskPointCompleted = videoTaskPointCompleted;
+
 function noteDocumentRead(label, verified) {
 const key = clean(label);
 if (!key) return;
@@ -3734,6 +3768,20 @@ setTimeout(() => this.nextUnit(), 800);
 return;
 }
 this._allDoneChecks = 0;
+// 这一段视频的任务点平台上已经标成“任务点已完成”：
+// 视频本身没播完（从 0 开始重播），但平台已经认这段视频完成了——不要再重播一遍，
+// 直接点“下一节”去这一节的下一个任务点（通常是章节测验）。
+// 放在“本页视频均已完成”之后：同一任务点里真的还有没播的分段时，上面那段会先去播它们。
+if (typeof this._videoTaskPointCompleted === 'function' && this._videoTaskPointCompleted(el)) {
+this._videoEl = null;
+this._quizVideo = null;
+this._isPlaying = false;
+this._allDoneChecks = 0;
+this._clearCheckInterval();
+console.warn('%c当前视频任务点已完成（平台已标记），跳过这段视频，直接进入这一节的下一个任务点', 'color:#4CAF50');
+setTimeout(() => this.nextUnit(), 800);
+return;
+}
 this._isPlaying = true;
 this._videoEventHandle();
 try {

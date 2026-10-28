@@ -1546,18 +1546,12 @@ app._sectionAlreadyCompleted = sectionAlreadyCompleted;
 // 用它给“任务点已完成”的跳过做冷却，同一节同一个任务点只跳一次。
 function currentTaskPointNum() {
 try {
-const frame = Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
-.find((item) => { try { return item.getClientRects().length > 0; } catch (_) { return false; } });
+const frame = displayedCardsFrame();
 if (!frame) return '';
 return new URL(frame.getAttribute('src'), location.href).searchParams.get('num') || '';
 } catch (_) { return ''; }
 }
 
-// 当前这段视频所在的任务点，平台是不是已经标记成“任务点已完成”。
-// 一个任务点就是一个内容框架：视频（含同框架里的多个分段）和它附带的图文都在这个框架里，
-// 框架里出现这句标记，说明整个任务点平台已经记为完成——再从头播一遍毫无意义。
-// 整节完成的判断在 sectionAlreadyCompleted；这里管的是“这个任务点已完成、但这一节还有别的任务点（比如章节测验）”。
-// 同一节同一个任务点 60 秒内只跳一次：万一“下一节”没点动或被平台拦回来，就回去正常播放，别原地打转。
 // 这个框架里是不是已经有平台打上的“任务点已完成”标记
 function docShowsTaskPointDone(doc) {
 if (!doc || !doc.body) return false;
@@ -1579,13 +1573,18 @@ if (hasVideo && docShowsTaskPointDone(doc)) return true;
 return false;
 }
 
+// 当前这段视频所在的任务点，平台是不是已经标记成“任务点已完成”。
+// 一个任务点就是一个内容框架：视频（含同框架里的多个分段）和它附带的图文都在这个框架里，
+// 框架里出现这句标记，说明整个任务点平台已经记为完成——再从头播一遍毫无意义。
+// 只认视频自己所在的框架：别的框架里的完成标记属于别的任务点，不能拿来跳这一段。
+// 整节完成的判断在 sectionAlreadyCompleted；这里管的是“这个任务点已完成、但这一节还有别的任务点（比如章节测验）”。
+// 同一节同一个任务点 60 秒内只跳一次：万一“下一节”没点动或被平台拦回来，就回去正常播放，别原地打转。
 let doneTaskPointSkipped = { key: '', at: 0 };
 function videoTaskPointCompleted(el) {
 if (!el) return false;
 let doc = null;
 try { doc = el.ownerDocument; } catch (_) { doc = null; }
-// 标记可能就在视频自己的框架里，也可能在播放器外层的页面里，两处都认
-if (!docShowsTaskPointDone(doc) && !completedVideoTaskPointShown()) return false;
+if (!docShowsTaskPointDone(doc)) return false;
 const key = `${activeSectionKey()}|${currentTaskPointNum()}`;
 const now = Date.now();
 if (doneTaskPointSkipped.key === key && now - doneTaskPointSkipped.at < 60000) return false;

@@ -389,7 +389,20 @@ function validQuestions(questions) {
         q.options.every((o) => /^[A-H]$/.test(o.letter) && typeof o.text === 'string' && o.text.length > 0 && o.text.length <= 500));
 }
 
-let busy = false;
+// 弹题和章节测验可能同时向本地服务要答案。以前只允许一个请求在跑，后到的
+// 直接回 429“上一批题目仍在处理”，脚本收到就放弃作答，测验页停在原地不动。
+// 现在改成排队：先到先做，后面的按顺序等，最多排 8 个。
+const MAX_QUEUED = 8;
+let queueTail = Promise.resolve();
+let queued = 0;
+
+function enqueueAnswer(task) {
+    queued += 1;
+    const result = queueTail.then(task);
+    queueTail = result.then(() => {}, () => {});
+    return result.finally(() => { queued -= 1; });
+}
+
 const server = createServer(async (req, res) => {
     const origin = req.headers.origin;
 
@@ -512,29 +525,33 @@ const server = createServer(async (req, res) => {
         send(res, 409, { error: '尚未设置 DeepSeek API Key，请打开 http://127.0.0.1:37841/setup 设置' }, origin);
         return;
     }
-    if (busy) {
-        send(res, 429, { error: '上一批题目仍在处理' }, origin);
-        return;
-    }
     if (!String(req.headers['content-type'] || '').startsWith('application/json')) {
         send(res, 415, { error: '仅接受 JSON' }, origin);
         return;
     }
-    busy = true;
+    let questions;
     try {
         let raw = '';
         for await (const chunk of req) {
             raw += chunk.toString('utf8');
             if (raw.length > 100000) throw new Error('请求内容过大');
         }
-        const questions = JSON.parse(raw).questions;
+        questions = JSON.parse(raw).questions;
         if (!validQuestions(questions)) throw new Error('题目格式不正确');
-        const answers = await requestAnswers(questions, apiKey);
+    } catch (error) {
+        send(res, 502, { error: error.message }, origin);
+        return;
+    }
+    if (queued >= MAX_QUEUED) {
+        send(res, 503, { error: '排队的题目太多，请稍后再试' }, origin);
+        return;
+    }
+    if (queued > 0) console.log(`前面还有 ${queued} 批题目在排队，本次等它们做完再调用 DeepSeek`);
+    try {
+        const answers = await enqueueAnswer(() => requestAnswers(questions, apiKey));
         send(res, 200, { answers }, origin);
     } catch (error) {
         send(res, 502, { error: error.message }, origin);
-    } finally {
-        busy = false;
     }
 });
 
@@ -804,6 +821,7 @@ const videoQuizFailures = new Map();
 const videoQuizStates = new Map();
 let quizBusy = false;
 let quizLoadRetries = 0;
+let quizAnswerRetries = 0;
 // 连续跳过多少个“目录里是测验、内容区却是空的”小节（真答上一份测验就清零）
 let emptyQuizSkips = 0;
 // 上一次跳过的是哪一节、什么时候跳的：同一节刚跳过又被平台拉回来，说明这里确实有未完成任务点
@@ -2216,6 +2234,7 @@ options: q.options.map((o) => ({ letter: o.letter, text: o.text })),
 }));
 console.log('以下是本次发送给 DeepSeek 的题干和选项：', payload);
 if (DIRECT_MODE) return PAGE.__deepseekAsk(payload);
+for (let attempt = 0; ; attempt++) {
 let response;
 try {
 response = await fetch(`${LOCAL_URL}/answer`, {
@@ -2225,11 +2244,25 @@ body: JSON.stringify({ questions: payload }),
 signal: AbortSignal.timeout(900000),
 });
 } catch (error) {
+// 连接被拒多半是服务窗口关了；偶尔的网络抖动隔几秒再试一次就够了
+if (attempt < 2 && error.name !== 'TimeoutError') {
+await sleep(3000);
+continue;
+}
 throw new Error(`无法连接本地 DeepSeek 服务。请确认启动窗口仍在运行，且 Edge 允许本地网络访问。详情：${error.message}`);
 }
 const data = await response.json().catch(() => null);
-if (!response.ok) throw new Error(data?.error || `本地 DeepSeek 服务返回 HTTP ${response.status}`);
-return data.answers;
+if (response.ok) return data.answers;
+const message = data?.error || `本地 DeepSeek 服务返回 HTTP ${response.status}`;
+// 本地服务同时收到弹题和章节测验两批请求时会回 429/503 说“还在处理”。
+// 以前这里直接放弃，测验页就停在原地不动了；现在等一等，让排在前面的先做完。
+if ((response.status === 429 || response.status === 503) && attempt < 60) {
+console.warn(`%c本地 DeepSeek 服务正忙（${message}），5 秒后重试（第 ${attempt + 1} 次）`, 'color:#FF9800');
+await sleep(5000);
+continue;
+}
+throw new Error(message);
+}
 }
 
 function validateAnswers(questions, answers) {
@@ -2559,6 +2592,7 @@ console.error('跳过没法作答的小节时出错:', error);
 app._advanceChapterTest = function () {
 if (stopped || quizBusy) return;
 quizBusy = true;
+let quizAnswered = false;
 (async () => {
 // 目录里这一节已经打勾：不管它是纯测验、还是视频+测验混排，整节任务点都已完成，
 // 不要再等题目、也不要再提交，直接进下一节（play() 里同一判断会更早拦住，这里兜底直接调用的路径）
@@ -2643,13 +2677,27 @@ console.log(`识别到 ${questions.length} 道题，正在调用 DeepSeek`);
 const answers = validateAnswers(questions, await askDeepSeek(questions));
 console.table(questions.map((q, i) => ({ 题号: i + 1, 题型: q.kind, 选择: answers.get(i + 1).join('') })));
 await selectAnswers(questions, answers);
+quizAnswered = true;
 attemptedQuizzes.add(signature);
 await submitQuiz(questions[0].doc);
 console.log('章节测验提交已确认，点击“下一节”进入新视频');
+quizAnswerRetries = 0;
 quizBusy = false;
 await goToNextStep();
 })().catch((error) => {
 app._nextUnitPending = false;
+// 调用 AI 失败（服务正忙、接口报错、网络抖动）不代表这一节做不了：
+// 隔一会儿重来，别把测验页丢下不管——那样页面就停在原地不动了。
+// 已经填过答案的情况不重试，避免同一份测验被重复提交；
+// “已停止自动提交/已尝试过”这类是判定结果，重试也不会有变化，直接停。
+const permanentStop = /已停止自动提交|已停止重复提交/.test(error.message);
+if (!stopped && !app._destroyed && !quizAnswered && !permanentStop && quizAnswerRetries < 3) {
+quizAnswerRetries += 1;
+console.warn(`%c章节测验作答失败（${error.message}），30 秒后重试（第 ${quizAnswerRetries}/3 次）`, 'color:#FF9800');
+setTimeout(() => { if (!stopped && !app._destroyed) app._advanceChapterTest(); }, 30000);
+return;
+}
+quizAnswerRetries = 0;
 console.error('章节测验自动作答停止:', error);
 })
 .finally(() => { quizBusy = false; });

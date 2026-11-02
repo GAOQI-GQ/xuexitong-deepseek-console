@@ -2376,6 +2376,8 @@ while (!stopped) {
 await sleep(500);
 elapsedHalfSeconds++;
 if (quizCompleted()) return;
+// 平台弹出“未达到及格线，请重做”：交卷已经生效，结果交给 waitForQuizResult 判断，别再干等成绩页
+if (quizFailureDialog()) return;
 // 提交后页面往往会直接切换，按钮消失说明已经交上去了，不用无限等成绩
 if (elapsedHalfSeconds >= 20 && !findQuizSubmit(submitDoc)) {
 console.log('%c提交按钮已消失，按“已提交”继续', 'color:#4CAF50');
@@ -2647,6 +2649,62 @@ return el;
 return null;
 }
 
+// 平台说“未达到及格线，请重做”时弹的是只有“取消/确定”的提示框，页面上并没有“重做”按钮。
+// 不点掉这个框，脚本就只能干等着——成绩页和“重做”按钮都在它后面
+function quizFailureDialog() {
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('.layui-layer,.layui-layer-dialog,.layui-layer-page,.el-message-box,.el-dialog,[role="dialog"],[role="alertdialog"]')); } catch (_) { continue; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+if (el.querySelector('.layui-layer,.el-message-box,[role="dialog"]')) continue;
+let text = '';
+try { text = clean(el.innerText); } catch (_) { continue; }
+if (!text || !/未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/.test(text)) continue;
+return el;
+}
+}
+return null;
+}
+
+// 点“确定”关掉提示框；没有按钮就点右上角的关闭叉
+async function dismissQuizFailureDialog() {
+const dialog = quizFailureDialog();
+if (!dialog) return false;
+const button = findButtonIn(dialog, '确定') || findButtonIn(dialog, '确认') || findButtonIn(dialog, '知道了') || findButtonIn(dialog, '重做');
+let target = button;
+if (!target) {
+try { target = dialog.querySelector('.layui-layer-close,.el-message-box__close,.close'); } catch (_) { target = null; }
+}
+if (!target) {
+console.warn('%c“未达到及格线”提示框上没找到可点的按钮，请手动关掉它', 'color:#F44336');
+return false;
+}
+console.log('%c关闭“未达到及格线，请重做”提示框', 'color:#FF9800');
+fireClick(target);
+// 提示框的文字还在页面上，缓存会一直判成“未达标”，这里直接清掉重新读
+quizFailureCache = { at: 0, value: false };
+await sleep(1200);
+return true;
+}
+
+// 点掉提示框后，平台要么跳到成绩页（带对错标记和“重做”按钮），要么直接回到可作答的试卷
+function editableQuizPaper() {
+const hasSubmit = courseDocuments().some((doc) => findQuizSubmit(doc));
+if (!hasSubmit) return null;
+const questions = extractQuestions();
+return questions.length ? questions : null;
+}
+
+async function waitForQuizRedoReady() {
+for (let i = 0; i < 30; i++) {
+if (stopped) return false;
+if (findQuizRedoButton() || quizFailureDialog() || editableQuizPaper()) return true;
+await sleep(500);
+}
+return false;
+}
+
 function readMyAnswer(card) {
 let text = '';
 try { text = clean(card.innerText); } catch (_) { return null; }
@@ -2730,6 +2788,12 @@ answers.set(i + 1, letters);
 continue;
 }
 }
+// 上一轮选过、但既没判对也没判错的答案：先原样保留，只改动这一轮要试探的那道题
+if (Array.isArray(mem.lastAnswer) && mem.lastAnswer.length &&
+mem.lastAnswer.every((letter) => question.options.some((option) => option.letter === letter))) {
+answers.set(i + 1, [...mem.lastAnswer]);
+continue;
+}
 pending.push({ index: i, question });
 }
 if (pending.length) {
@@ -2755,6 +2819,7 @@ if (!Array.isArray(letters) || !letters.length) return;
 const key = quizQuestionKey(question);
 const mem = quizAnswerMemory.get(key) || { tried: [], wrong: [], correct: null };
 mem.tried = pushUniqueAnswer(mem.tried, letters);
+mem.lastAnswer = [...letters];
 quizAnswerMemory.set(key, mem);
 });
 }
@@ -2789,6 +2854,8 @@ return false;
 async function waitForQuizResult() {
 for (let attempt = 0; attempt < 60; attempt++) {
 if (stopped) return { failed: false };
+// 提示框一弹出来就说明没通过，不用再等成绩页
+if (quizFailureDialog()) return { failed: true };
 const retry = findQuizRedoButton();
 const failedText = quizFailureShown();
 if (failedText && retry) return { failed: true };
@@ -2803,19 +2870,48 @@ await sleep(500);
 return { failed: quizFailureShown() };
 }
 
-// 重做循环：读结果 → 点重做 → 换答案 → 重新交卷，直到通过或次数用完
+// 重做循环：关提示框/点重做 → 换答案 → 重新交卷，直到通过或次数用完
 async function runQuizRedo(reason) {
 if (quizRedoActive) return 'busy';
 quizRedoActive = true;
 try {
+// 重新作答一轮：选答案、交卷、等结果；返回 true 表示已通过
+const answerAndSubmit = async (questions, attempt) => {
+const answers = await chooseChapterAnswers(questions);
+// 成绩页上读不到每题对错（平台只给了总分）时，每轮只改一道题：
+// AI 的答案一般大部分是对的，逐题换答案比整份重猜收敛得快
+const hasFeedback = questions.some((question) => {
+const mem = quizAnswerMemory.get(quizQuestionKey(question));
+return Boolean(mem && (mem.correct || (mem.wrong && mem.wrong.length)));
+});
+if (!hasFeedback) {
+const targetIndex = (attempt - 1) % questions.length;
+const target = questions[targetIndex];
+const mem = quizAnswerMemory.get(quizQuestionKey(target)) || { tried: [], wrong: [], correct: null };
+const letters = fallbackLetters(target, { tried: mem.tried, wrong: mem.wrong || [] });
+if (letters) {
+answers.set(targetIndex + 1, letters);
+console.log(`%c这轮读不到每题对错，换第 ${targetIndex + 1} 题的答案：${letters.join('')}`, 'color:#2196F3');
+}
+}
+console.table(questions.map((question, index) => ({ 题号: index + 1, 题型: question.kind, 选择: (answers.get(index + 1) || []).join('') })));
+await clearQuizSelections(questions);
+await selectAnswers(questions, answers);
+rememberQuizTried(questions, answers);
+await submitQuiz(questions[0].doc);
+const result = await waitForQuizResult();
+return !result.failed;
+};
 for (let attempt = 1; attempt <= 12; attempt++) {
 if (stopped) return 'stopped';
+// 只有“取消/确定”的提示框先关掉，成绩页/重做按钮才会露出来
+if (quizFailureDialog()) {
+await dismissQuizFailureDialog();
+await waitForQuizRedoReady();
+}
 recordQuizOutcome();
 const retry = findQuizRedoButton();
-if (!retry) {
-console.error('%c成绩未达标，但页面上没有找到“重做”按钮，请手动处理这一节', 'color:#F44336');
-return 'no-retry';
-}
+if (retry) {
 console.warn(`%c${reason}，点击“重做”重新作答（第 ${attempt} 次）`, 'color:#FF9800');
 try { retry.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
 retry.click();
@@ -2830,18 +2926,17 @@ await sleep(5000);
 continue;
 }
 if (!questions) {
+// 页面还挂着“重做”或“未达标”，不能当成通过
+if (findQuizRedoButton() || quizFailureShown() || quizFailureDialog()) {
+console.warn('%c重做后页面仍提示未达标，继续重做', 'color:#FF9800');
+await sleep(2000);
+continue;
+}
 console.log('%c重做后页面显示测验已完成', 'color:#4CAF50');
 return 'passed';
 }
 try {
-const answers = await chooseChapterAnswers(questions);
-console.table(questions.map((question, index) => ({ 题号: index + 1, 题型: question.kind, 选择: (answers.get(index + 1) || []).join('') })));
-await clearQuizSelections(questions);
-await selectAnswers(questions, answers);
-rememberQuizTried(questions, answers);
-await submitQuiz(questions[0].doc);
-const result = await waitForQuizResult();
-if (!result.failed) {
+if (await answerAndSubmit(questions, attempt)) {
 console.log('%c重做后已经通过', 'color:#4CAF50');
 return 'passed';
 }
@@ -2852,6 +2947,27 @@ console.warn(`%c重做这一轮没做完（${error.message}），5 秒后继续`
 await sleep(5000);
 }
 await sleep(2000);
+continue;
+}
+// 没有“重做”按钮：平台点“确定”后可能直接回到可作答的试卷
+const paper = editableQuizPaper();
+if (paper) {
+console.log(`%c平台已回到可重新作答的试卷，直接换答案重交（第 ${attempt} 次）`, 'color:#FF9800');
+try {
+if (await answerAndSubmit(paper, attempt)) {
+console.log('%c重做后已经通过', 'color:#4CAF50');
+return 'passed';
+}
+console.log('%c重做后仍未通过，继续换答案', 'color:#FF9800');
+} catch (error) {
+console.warn(`%c重做这一轮没做完（${error.message}），5 秒后继续`, 'color:#FF9800');
+await sleep(5000);
+}
+await sleep(2000);
+continue;
+}
+console.error('%c成绩未达标，但页面上既没有“重做”按钮也没有可重新作答的试卷，请手动处理这一节', 'color:#F44336');
+return 'no-retry';
 }
 console.error('%c章节测验重做 12 次仍未通过：答对的题一直照抄，答错的题已经换遍选项，请手动处理这一节', 'color:#F44336');
 return 'gave-up';
@@ -2872,8 +2988,8 @@ console.log('%c这一节在目录里已经打勾（全部任务点已完成）�
 await goToNextStep();
 return;
 }
-// 成绩未达标、页面停在“请重做”上：接着重做，不能点“下一节”去撞“任务点未完成”弹窗
-if (quizFailureShown() && findQuizRedoButton()) {
+// 成绩未达标、页面停在“请重做”或提示框上：接着重做，不能点“下一节”去撞“任务点未完成”弹窗
+if (quizFailureShown() && (findQuizRedoButton() || quizFailureDialog())) {
 console.log('%c这一节的测验成绩未达标，准备重做', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'passed') {

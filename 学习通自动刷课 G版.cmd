@@ -2688,12 +2688,31 @@ await sleep(1200);
 return true;
 }
 
-// 点掉提示框后，平台要么跳到成绩页（带对错标记和“重做”按钮），要么直接回到可作答的试卷
+// 点掉提示框后，平台要么跳到成绩页（带对错标记和“重做”按钮），要么直接回到可作答的试卷。
+// 试卷是异步渲染的：题目数量要稳定两次、并且和“题量：N”对得上，才算真的能作答，
+// 否则会只填到半份卷子就交，被平台以“未作答”拒掉
+let quizPaperStable = { signature: '', count: 0 };
 function editableQuizPaper() {
 const hasSubmit = courseDocuments().some((doc) => findQuizSubmit(doc));
-if (!hasSubmit) return null;
+if (!hasSubmit) {
+quizPaperStable = { signature: '', count: 0 };
+return null;
+}
 const questions = extractQuestions();
-return questions.length ? questions : null;
+if (!questions.length) {
+quizPaperStable = { signature: '', count: 0 };
+return null;
+}
+const countText = clean(questions[0].doc?.body?.innerText).match(/题量\s*[:：]\s*(\d+)/);
+if (countText && Number(countText[1]) !== questions.length) {
+quizPaperStable = { signature: '', count: 0 };
+return null;
+}
+const signature = questions.map((question) => `${question.kind}:${question.title}:${question.options.length}`).join('|');
+if (signature === quizPaperStable.signature) quizPaperStable.count += 1;
+else quizPaperStable = { signature, count: 1 };
+if (quizPaperStable.count < 2) return null;
+return questions;
 }
 
 async function waitForQuizRedoReady() {

@@ -2699,6 +2699,7 @@ return;
 }
 quizAnswerRetries = 0;
 console.error('章节测验自动作答停止:', error);
+if (permanentStop) console.warn('%c这一节的测验已经提交过，但平台仍提示“还有任务点未完成”：请手动打开测验看看成绩有没有生成；脚本不会重复提交同一份答案，不会再动这一节', 'color:#FF9800');
 })
 .finally(() => { quizBusy = false; });
 };
@@ -2911,7 +2912,8 @@ function videoQuizState(signature) {
 if (!videoQuizStates.has(signature)) {
 videoQuizStates.set(signature, {
 signature,
-question: null,
+// 这里不再存题目对象：卡片是页面里的 DOM，存下来等于把整道题的节点一直挂在内存里，
+// 一节课几十道弹题、连着刷好几天，页面越攒越重（浏览器会先撑不住）
 attempts: 0,
 tried: [],
 // 页面明确判错的答案（和“提交过”分开：提交过但反馈没认出来的答案，之后还可能再选）
@@ -3404,7 +3406,6 @@ const signatureTitle = question.title
 const signature = `${videoQuizScope(video)}|${question.kind}:${signatureTitle}:${question.options.map((option) => option.letter).join('')}`;
 const state = videoQuizState(signature);
 state.signature = signature;
-state.question = question;
 if (attemptedVideoQuizzes.has(signature)) {
 if (state.gaveUp && state.skipCount < 3) {
 state.skipCount++;
@@ -3502,13 +3503,11 @@ console.log('%c点击弹题的“重新回答”按钮', 'color:#607D8B');
 retry.click();
 await sleep(600);
 question = findVideoQuizCard() || question;
-state.question = question;
 activeVideoQuiz = question;
 }
 }
 await clearVideoQuizSelections(question);
 question = findVideoQuizCard() || question;
-state.question = question;
 activeVideoQuiz = question;
 if (state.attempts === 0 && currentCorrect >= 0) state.correctBefore = currentCorrect;
 let letters;

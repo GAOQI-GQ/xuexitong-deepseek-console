@@ -2336,26 +2336,26 @@ if (before === after && !checked) throw new Error(`第 ${i + 1} 题 ${letter} �
 }
 
 async function confirmSubmitDialog() {
-for (let i = 0; i < 20; i++) {
+let clicked = 0;
+for (let i = 0; i < 40; i++) {
 if (stopped) throw new Error('脚本已停止');
-const dialogs = courseDocuments().flatMap((doc) =>
-Array.from(doc.querySelectorAll('#popok,[role="dialog"],[role="alertdialog"],.layui-layer-dialog,.el-message-box,.modal')));
-const platformButton = dialogs.find((el) => el.id === 'popok' && visible(el));
-if (platformButton) {
-const message = clean(platformButton.ownerDocument.querySelector('#popcontent')?.innerText);
-if (/未作答|请选择|请作答|答完/.test(message) && !/确定提交|确认提交/.test(message))
+const request = findSubmitConfirmRequest();
+if (request) {
+const message = clean(request.text);
+if (/未作答|请选择|请作答|答完/.test(message) && !/确认提交|确定提交|提交试卷|确认交卷/.test(message))
 throw new Error(`平台拒绝提交：${message}`);
-console.log(`确认平台提交窗口：${message || '提交'}`);
-platformButton.click();
-return;
+let label = message;
+try {
+const content = request.container.querySelector('#popcontent');
+if (content && visible(content)) label = clean(content.innerText) || label;
+} catch (_) { /* 忽略 */ }
+console.log(`确认平台提交窗口：${label || '提交'}`);
+fireClick(request.button);
+clicked++;
+await sleep(800);
+continue;
 }
-const dialog = dialogs.find((el) => el.id !== 'popok' && visible(el) && /提交|交卷/.test(clean(el.innerText)));
-if (dialog) {
-const confirm = findButton(dialog, '确定') || findButton(dialog, '确认') || findButton(dialog, '提交');
-if (!confirm) throw new Error('提交确认窗口未找到确认按钮');
-confirm.click();
-return;
-}
+if (clicked) return;
 await sleep(250);
 }
 }
@@ -2375,11 +2375,17 @@ let elapsedHalfSeconds = 0;
 while (!stopped) {
 await sleep(500);
 elapsedHalfSeconds++;
+// 确认框又弹出来了（点“提交”后平台再问一次）：接着点，别当成已经交卷
+if (findSubmitConfirmRequest()) {
+await confirmSubmitDialog();
+elapsedHalfSeconds = 0;
+continue;
+}
 if (quizCompleted()) return;
 // 平台弹出“未达到及格线，请重做”：交卷已经生效，结果交给 waitForQuizResult 判断，别再干等成绩页
 if (quizFailureDialog()) return;
 // 提交后页面往往会直接切换，按钮消失说明已经交上去了，不用无限等成绩
-if (elapsedHalfSeconds >= 20 && !findQuizSubmit(submitDoc)) {
+if (elapsedHalfSeconds >= 20 && !findQuizSubmit(submitDoc) && !findSubmitConfirmRequest()) {
 console.log('%c提交按钮已消失，按“已提交”继续', 'color:#4CAF50');
 return;
 }
@@ -2712,6 +2718,62 @@ await sleep(1200);
 return true;
 }
 
+// “确认提交？”弹窗：正按钮可能写着“提交”，也可能写着“确定”。
+// 必须读“按钮所在这个弹窗”的文字——页面别处可能残留着上一次“未达到及格线”的 #popcontent，
+// 读错了就会把提交确认当成失败提示，点完框还在原地
+function findSubmitConfirmRequest() {
+for (const doc of courseDocuments()) {
+let nodes = [];
+try {
+nodes = Array.from(doc.querySelectorAll('#popup,.popup,[id*="popup"],[id*="Popup"],[class*="popup"],[class*="Popup"],[class*="dialog"],[id*="dialog"],.layui-layer,.el-dialog,[role="dialog"],[role="alertdialog"],.modal'));
+} catch (_) { continue; }
+for (const container of nodes) {
+if (!visible(container)) continue;
+if (container.querySelector('#popup,.popup,.layui-layer,.el-dialog,[role="dialog"]')) continue;
+let text = '';
+try { text = clean(container.innerText); } catch (_) { continue; }
+if (!text || text.length > 300) continue;
+if (QUIZ_FAILURE_PATTERN.test(text)) continue; // 不及格提示交给重做流程
+if (!/确认提交|确定提交|提交试卷|确认交卷|是否提交|请确认提交/.test(text)) continue;
+let button = null;
+try { button = container.querySelector('#popok'); } catch (_) { button = null; }
+if (!button || !visible(button)) {
+button = ['提交', '确定', '确认'].map((label) => findButtonIn(container, label)).find(Boolean) || null;
+}
+if (!button) continue;
+return { container, button, text };
+}
+// 兜底：弹窗类名不认识时，从“提交/确定/确认”按钮往上找文字很短、且写着确认提交的祖先
+let buttons = [];
+try { buttons = Array.from(doc.querySelectorAll('button,a,input[type="button"],[role="button"]')); } catch (_) { continue; }
+for (const button of buttons) {
+if (!visible(button)) continue;
+const label = clean(button.value || button.innerText || '').replace(/\s+/g, '');
+if (!/^(提交|确定|确认|提交试卷|确认提交)$/.test(label)) continue;
+let scope = button.parentElement;
+for (let depth = 0; scope && depth < 6; depth++, scope = scope.parentElement) {
+if (!visible(scope)) { scope = null; break; }
+let text = '';
+try { text = clean(scope.innerText); } catch (_) { continue; }
+if (text.length > 200) break;
+if (QUIZ_FAILURE_PATTERN.test(text)) { scope = null; break; }
+if (!/确认提交|确定提交|提交试卷|确认交卷|是否提交|请确认提交/.test(text)) continue;
+return { container: scope, button, text };
+}
+}
+}
+return null;
+}
+
+// 页面上每题已经带着对错标记：这是上一次的成绩页，不是新测验
+function quizPageGraded(questions) {
+const list = Array.isArray(questions) ? questions : extractQuestions();
+return list.length > 0 && list.some((question) => {
+const outcome = quizCardOutcome(question.card);
+return outcome.wrong || outcome.right;
+});
+}
+
 // 点掉提示框后，平台要么跳到成绩页（带对错标记和“重做”按钮），要么直接回到可作答的试卷。
 // 试卷是异步渲染的：题目数量要稳定两次、并且和“题量：N”对得上，才算真的能作答，
 // 否则会只填到半份卷子就交，被平台以“未作答”拒掉
@@ -2897,6 +2959,11 @@ return false;
 async function waitForQuizResult() {
 for (let attempt = 0; attempt < 60; attempt++) {
 if (stopped) return { failed: false };
+// “确认提交？”还挂着说明这次根本没交上去：先点掉，再继续等结果
+if (findSubmitConfirmRequest()) {
+await confirmSubmitDialog();
+continue;
+}
 // 提示框一弹出来就说明没通过，不用再等成绩页
 if (quizFailureDialog()) return { failed: true };
 const retry = findQuizRedoButton();
@@ -3031,8 +3098,9 @@ console.log('%c这一节在目录里已经打勾（全部任务点已完成）�
 await goToNextStep();
 return;
 }
-// 成绩未达标、页面停在“请重做”或提示框上：接着重做，不能点“下一节”去撞“任务点未完成”弹窗
-if (quizFailureShown() && (findQuizRedoButton() || quizFailureDialog())) {
+// 成绩未达标、页面停在“请重做”/提示框/上次的成绩页上：接着重做，
+// 不能点“下一节”去撞“任务点未完成”弹窗，也不能把成绩页当成新测验再答一遍
+if (quizFailureShown() && (findQuizRedoButton() || quizFailureDialog() || quizPageGraded())) {
 console.log('%c这一节的测验成绩未达标，准备重做', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'passed') {
@@ -3103,6 +3171,17 @@ lastSkippedQuiz = { label: '', at: 0 };
 if (questions === null) {
 console.log('检测到当前章节测验已完成，点击“下一节”进入新视频');
 await goToNextStep();
+return;
+}
+// 等题目的过程中平台弹出了“未达到及格线，请重做”：这份卷子其实是上一次的成绩页，
+// 每题还带着对错标记，不能再当成新测验作答——交给重做流程换答案
+if (quizFailureShown() && quizPageGraded(questions)) {
+console.log('%c这一节显示的是上一次的成绩页，转入重做流程', 'color:#FF9800');
+const redoStatus = await runQuizRedo('成绩未达到及格线');
+if (redoStatus === 'passed') {
+quizBusy = false;
+await goToNextStep();
+}
 return;
 }
 if (questions.length > 30) throw new Error('题目数量超过 30，已停止自动提交');

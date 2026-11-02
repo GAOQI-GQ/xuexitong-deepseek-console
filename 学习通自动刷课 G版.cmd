@@ -2602,6 +2602,7 @@ const quizAnswerMemory = new Map();
 let quizRedoActive = false;
 
 const QUIZ_REDO_PATTERN = /^(重做|重做此题|重做本题|再做一次|再做一遍|重新作答|重新答题|重新测验|再答一次|重新考试)$/;
+const QUIZ_FAILURE_PATTERN = /未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/;
 
 // 题目身份用“题型+题干”。结果页会把“我的答案/正确答案/回答正确”混进题干里，
 // 这些内容要先去掉，否则交卷前和结果页上的同一道题会被当成两道，记忆就对不上了
@@ -2625,7 +2626,7 @@ try {
 value = courseDocuments().some((doc) => {
 let text = '';
 try { text = String(doc.body?.innerText || ''); } catch (_) { return false; }
-return /未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/.test(text);
+return QUIZ_FAILURE_PATTERN.test(text);
 });
 } catch (_) {
 value = false;
@@ -2650,18 +2651,40 @@ return null;
 }
 
 // 平台说“未达到及格线，请重做”时弹的是只有“取消/确定”的提示框，页面上并没有“重做”按钮。
-// 不点掉这个框，脚本就只能干等着——成绩页和“重做”按钮都在它后面
+// 不点掉这个框，脚本就只能干等着——成绩页和“重做”按钮都在它后面。
+// 这个框可能是平台自己的 #popcontent/#popok 弹窗（提交确认用的也是它），也可能是 layui/el-dialog
 function quizFailureDialog() {
 for (const doc of courseDocuments()) {
+// 1) 平台自定义弹窗：#popcontent 显示文字，#popok 是“确定”
+let content = null;
+try { content = doc.getElementById('popcontent'); } catch (_) { content = null; }
+if (content && visible(content)) {
+let text = '';
+try { text = clean(content.innerText); } catch (_) { text = ''; }
+if (text && QUIZ_FAILURE_PATTERN.test(text)) {
+let confirm = null;
+try {
+const popok = doc.getElementById('popok');
+if (popok && visible(popok)) confirm = popok;
+} catch (_) { confirm = null; }
+let element = content;
+try {
+element = content.closest('#popup,.popup,.popup_con,.layui-layer,.el-dialog,[role="dialog"],[role="alertdialog"]') ||
+content.parentElement || content;
+} catch (_) { element = content; }
+return { element, confirm, text };
+}
+}
+// 2) 框架式弹窗
 let nodes = [];
-try { nodes = Array.from(doc.querySelectorAll('.layui-layer,.layui-layer-dialog,.layui-layer-page,.el-message-box,.el-dialog,[role="dialog"],[role="alertdialog"]')); } catch (_) { continue; }
+try { nodes = Array.from(doc.querySelectorAll('.layui-layer,.layui-layer-dialog,.layui-layer-page,.el-message-box,.el-dialog,[role="dialog"],[role="alertdialog"],.modal')); } catch (_) { continue; }
 for (const el of nodes) {
 if (!visible(el)) continue;
 if (el.querySelector('.layui-layer,.el-message-box,[role="dialog"]')) continue;
 let text = '';
 try { text = clean(el.innerText); } catch (_) { continue; }
-if (!text || !/未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/.test(text)) continue;
-return el;
+if (!text || !QUIZ_FAILURE_PATTERN.test(text)) continue;
+return { element: el, confirm: null, text };
 }
 }
 return null;
@@ -2671,10 +2694,11 @@ return null;
 async function dismissQuizFailureDialog() {
 const dialog = quizFailureDialog();
 if (!dialog) return false;
-const button = findButtonIn(dialog, '确定') || findButtonIn(dialog, '确认') || findButtonIn(dialog, '知道了') || findButtonIn(dialog, '重做');
-let target = button;
+const element = dialog.element || dialog;
+let target = dialog.confirm ||
+findButtonIn(element, '确定') || findButtonIn(element, '确认') || findButtonIn(element, '知道了') || findButtonIn(element, '重做');
 if (!target) {
-try { target = dialog.querySelector('.layui-layer-close,.el-message-box__close,.close'); } catch (_) { target = null; }
+try { target = element.querySelector('.layui-layer-close,.el-message-box__close,.close'); } catch (_) { target = null; }
 }
 if (!target) {
 console.warn('%c“未达到及格线”提示框上没找到可点的按钮，请手动关掉它', 'color:#F44336');

@@ -1138,6 +1138,8 @@ return title;
 };
 
 function quizCompleted() {
+// 页面明确写着“未达到及格线，请重做”：这一份还要重做，不管显示什么成绩都不算完成
+if (quizFailureShown()) return false;
 const scoreShown = courseDocuments().some((doc) => {
 const text = clean(doc.body?.innerText);
 const hasGrade = /本次成绩\s*\d+(?:\.\d+)?\s*分/.test(text);
@@ -2589,6 +2591,275 @@ console.error('跳过没法作答的小节时出错:', error);
 }
 }
 
+// —— 章节测验“必须满分”的补答流程 ——
+// 有些测验要求 100 分，交卷后显示“未达到及格线，请重做”。
+// 这时不能点“下一节”（会被“还有任务点未完成”弹窗拉回来），也不该原样重交：
+// 先读结果页每题的对错，答对的照抄、答错的换一个（页面给了正确答案就直接用），点“重做”再交，
+// 直到通过或次数用完。AI 会答错，所以每答错一次就排除一个答案，靠排除法也能全对。
+const quizAnswerMemory = new Map();
+let quizRedoActive = false;
+
+const QUIZ_REDO_PATTERN = /^(重做|重做此题|重做本题|再做一次|再做一遍|重新作答|重新答题|重新测验|再答一次|重新考试)$/;
+
+// 题目身份用“题型+题干”。结果页会把“我的答案/正确答案/回答正确”混进题干里，
+// 这些内容要先去掉，否则交卷前和结果页上的同一道题会被当成两道，记忆就对不上了
+function quizQuestionKey(question) {
+const title = clean(question.title)
+.replace(/我的答案\s*[：:][\s\S]*$/, '')
+.replace(/正确答案\s*[：:][\s\S]*$/, '')
+.replace(/回答(?:正确|错误)[\s\S]*$/, '')
+.trim()
+.slice(0, 120);
+return `${question.kind}:${title}`;
+}
+
+// quizCompleted 每半秒就会被问一次，读整页文字很贵：一秒内复用同一个结果
+let quizFailureCache = { at: 0, value: false };
+function quizFailureShown() {
+const now = Date.now();
+if (quizFailureCache.at && now - quizFailureCache.at < 1000) return quizFailureCache.value;
+let value = false;
+try {
+value = courseDocuments().some((doc) => {
+let text = '';
+try { text = String(doc.body?.innerText || ''); } catch (_) { return false; }
+return /未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/.test(text);
+});
+} catch (_) {
+value = false;
+}
+quizFailureCache = { at: now, value };
+return value;
+}
+
+function findQuizRedoButton() {
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('button,a,input[type="button"],[role="button"],div,span')); } catch (_) { continue; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+const text = clean(el.value || el.innerText || '').replace(/\s+/g, '');
+if (!text || text.length > 8 || !QUIZ_REDO_PATTERN.test(text)) continue;
+if (el.querySelector('button,a')) continue;
+return el;
+}
+}
+return null;
+}
+
+function readMyAnswer(card) {
+let text = '';
+try { text = clean(card.innerText); } catch (_) { return null; }
+const match = text.match(/(?:我的答案|你的答案)\s*[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)/);
+if (!match) return null;
+return Array.from(new Set(match[1].match(/[A-H]/g) || []));
+}
+
+// 结果页上这一题判对还是判错、有没有给出正确答案
+function quizCardOutcome(card) {
+const outcome = { wrong: false, right: false, correct: null };
+if (!card) return outcome;
+let text = '';
+try { text = clean(card.innerText); } catch (_) { text = ''; }
+try {
+for (const el of card.querySelectorAll('i,span,em,b,img,div')) {
+const cls = String(el.className || '').toLowerCase();
+const src = `${el.getAttribute('src') || ''} ${el.getAttribute('alt') || ''}`.toLowerCase();
+if (/(^|[\s_-])(cuo|wrong|error)([\s_-]|$)|icon-?cuo|answer-?wrong|wrong-?icon/.test(cls) || /cuo|wrong/.test(src)) outcome.wrong = true;
+if (/(^|[\s_-])(dui|right|correct)([\s_-]|$)|icon-?dui|answer-?right|right-?icon/.test(cls) || /dui/.test(src)) outcome.right = true;
+const glyph = clean(el.textContent || '');
+if (glyph && glyph.length <= 3 && /^[✓✔√✗✘×✕]+$/.test(glyph)) {
+if (/[✗✘×✕]/.test(glyph)) outcome.wrong = true;
+else outcome.right = true;
+}
+}
+} catch (_) { /* 忽略 */ }
+if (/回答错误|答案错误|答错了|答错啦/.test(text)) outcome.wrong = true;
+if (outcome.wrong) outcome.right = false;
+else if (/回答正确|答案正确|答对了|答对啦/.test(text)) outcome.right = true;
+const match = text.match(/正确答案\s*[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)/);
+if (match) outcome.correct = Array.from(new Set(match[1].match(/[A-H]/g) || []));
+return outcome;
+}
+
+function pushUniqueAnswer(list, letters) {
+const items = Array.isArray(list) ? list : [];
+if (!Array.isArray(letters) || !letters.length) return items;
+if (!items.some((entry) => Array.isArray(entry) && sameLetters(entry, letters))) items.push([...letters]);
+return items;
+}
+
+// 把结果页上每题的判定记进记忆：答对的照抄、答错的排除、页面给了正确答案就直接用
+function recordQuizOutcome() {
+let recorded = 0;
+for (const question of extractQuestions()) {
+const key = quizQuestionKey(question);
+const outcome = quizCardOutcome(question.card);
+const mine = readMyAnswer(question.card);
+const mem = quizAnswerMemory.get(key) || { tried: [], wrong: [], correct: null };
+if (outcome.correct && outcome.correct.length) {
+mem.correct = [...outcome.correct];
+} else if (outcome.wrong) {
+mem.correct = null;
+if (mine) mem.wrong = pushUniqueAnswer(mem.wrong, mine);
+} else if (outcome.right && mine) {
+mem.correct = [...mine];
+}
+quizAnswerMemory.set(key, mem);
+recorded++;
+}
+return recorded;
+}
+
+// 重新作答时怎么选：页面给了正确答案用正确答案，答错过的用排除法换一个，
+// 其余的交回 AI；AI 又给出已经判错的答案时同样改成排除法的结果
+async function chooseChapterAnswers(questions) {
+const answers = new Map();
+const pending = [];
+for (let i = 0; i < questions.length; i++) {
+const question = questions[i];
+const mem = quizAnswerMemory.get(quizQuestionKey(question)) || { tried: [], wrong: [], correct: null };
+if (mem.correct && mem.correct.length && mem.correct.every((letter) => question.options.some((option) => option.letter === letter))) {
+answers.set(i + 1, [...mem.correct]);
+continue;
+}
+if (mem.wrong.length) {
+const letters = fallbackLetters(question, { tried: mem.tried, wrong: mem.wrong });
+if (letters) {
+answers.set(i + 1, letters);
+continue;
+}
+}
+pending.push({ index: i, question });
+}
+if (pending.length) {
+const got = validateAnswers(pending.map((item) => item.question), await askDeepSeek(pending.map((item) => item.question)));
+pending.forEach((item, position) => {
+const question = item.question;
+const mem = quizAnswerMemory.get(quizQuestionKey(question)) || { tried: [], wrong: [], correct: null };
+let letters = got.get(position + 1) || null;
+if (letters && mem.wrong.some((entry) => sameLetters(entry, letters))) {
+letters = fallbackLetters(question, { tried: mem.tried, wrong: mem.wrong });
+}
+if (!letters) letters = fallbackLetters(question, { tried: mem.tried, wrong: mem.wrong });
+answers.set(item.index + 1, letters);
+});
+}
+return answers;
+}
+
+function rememberQuizTried(questions, answers) {
+questions.forEach((question, index) => {
+const letters = answers.get(index + 1);
+if (!Array.isArray(letters) || !letters.length) return;
+const key = quizQuestionKey(question);
+const mem = quizAnswerMemory.get(key) || { tried: [], wrong: [], correct: null };
+mem.tried = pushUniqueAnswer(mem.tried, letters);
+quizAnswerMemory.set(key, mem);
+});
+}
+
+async function clearQuizSelections(questions) {
+for (const question of questions) {
+try { await clearVideoQuizSelections(question); } catch (_) { /* 忽略 */ }
+}
+}
+
+async function confirmQuizRedoDialog() {
+for (let i = 0; i < 8; i++) {
+let button = null;
+for (const doc of courseDocuments()) {
+let dialogs = [];
+try { dialogs = Array.from(doc.querySelectorAll('.layui-layer-dialog,.el-message-box,[role="dialog"],[role="alertdialog"]')).filter((el) => visible(el)); } catch (_) { dialogs = []; }
+button = dialogs.map((el) => findButtonIn(el, '确定') || findButtonIn(el, '确认')).find(Boolean) || null;
+if (button) break;
+}
+if (button) {
+console.log('%c确认“重做”提示', 'color:#607D8B');
+button.click();
+await sleep(600);
+return true;
+}
+await sleep(250);
+}
+return false;
+}
+
+// 交卷后等结果页：明确判错、写着不及格，或者每题都判完了，才算有结论
+async function waitForQuizResult() {
+for (let attempt = 0; attempt < 60; attempt++) {
+if (stopped) return { failed: false };
+const retry = findQuizRedoButton();
+const failedText = quizFailureShown();
+if (failedText && retry) return { failed: true };
+if (!failedText && quizCompleted()) return { failed: false };
+if (attempt % 3 === 0) {
+const outcome = extractQuestions().map((question) => quizCardOutcome(question.card));
+const judged = outcome.filter((item) => item.wrong || item.right);
+if (judged.length && judged.length === outcome.length) return { failed: outcome.some((item) => item.wrong) };
+}
+await sleep(500);
+}
+return { failed: quizFailureShown() };
+}
+
+// 重做循环：读结果 → 点重做 → 换答案 → 重新交卷，直到通过或次数用完
+async function runQuizRedo(reason) {
+if (quizRedoActive) return 'busy';
+quizRedoActive = true;
+try {
+for (let attempt = 1; attempt <= 12; attempt++) {
+if (stopped) return 'stopped';
+recordQuizOutcome();
+const retry = findQuizRedoButton();
+if (!retry) {
+console.error('%c成绩未达标，但页面上没有找到“重做”按钮，请手动处理这一节', 'color:#F44336');
+return 'no-retry';
+}
+console.warn(`%c${reason}，点击“重做”重新作答（第 ${attempt} 次）`, 'color:#FF9800');
+try { retry.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+retry.click();
+await sleep(1200);
+await confirmQuizRedoDialog();
+let questions = null;
+try {
+questions = await waitForQuizQuestions();
+} catch (error) {
+console.warn(`%c重做后没等到题目（${error.message}），5 秒后再试`, 'color:#FF9800');
+await sleep(5000);
+continue;
+}
+if (!questions) {
+console.log('%c重做后页面显示测验已完成', 'color:#4CAF50');
+return 'passed';
+}
+try {
+const answers = await chooseChapterAnswers(questions);
+console.table(questions.map((question, index) => ({ 题号: index + 1, 题型: question.kind, 选择: (answers.get(index + 1) || []).join('') })));
+await clearQuizSelections(questions);
+await selectAnswers(questions, answers);
+rememberQuizTried(questions, answers);
+await submitQuiz(questions[0].doc);
+const result = await waitForQuizResult();
+if (!result.failed) {
+console.log('%c重做后已经通过', 'color:#4CAF50');
+return 'passed';
+}
+console.log('%c重做后仍未通过，继续换答案', 'color:#FF9800');
+} catch (error) {
+// 这一轮没做完（AI 服务报错、页面重建）不代表题做不了：换答案的逻辑还在，稍后接着来
+console.warn(`%c重做这一轮没做完（${error.message}），5 秒后继续`, 'color:#FF9800');
+await sleep(5000);
+}
+await sleep(2000);
+}
+console.error('%c章节测验重做 12 次仍未通过：答对的题一直照抄，答错的题已经换遍选项，请手动处理这一节', 'color:#F44336');
+return 'gave-up';
+} finally {
+quizRedoActive = false;
+}
+}
+
 app._advanceChapterTest = function () {
 if (stopped || quizBusy) return;
 quizBusy = true;
@@ -2599,6 +2870,16 @@ let quizAnswered = false;
 if (sectionAlreadyCompleted()) {
 console.log('%c这一节在目录里已经打勾（全部任务点已完成），跳过测验直接进入下一节', 'color:#4CAF50');
 await goToNextStep();
+return;
+}
+// 成绩未达标、页面停在“请重做”上：接着重做，不能点“下一节”去撞“任务点未完成”弹窗
+if (quizFailureShown() && findQuizRedoButton()) {
+console.log('%c这一节的测验成绩未达标，准备重做', 'color:#FF9800');
+const redoStatus = await runQuizRedo('成绩未达到及格线');
+if (redoStatus === 'passed') {
+quizBusy = false;
+await goToNextStep();
+}
 return;
 }
 if (quizCompleted()) {
@@ -2672,7 +2953,8 @@ const countText = clean(questions[0].doc.body.innerText).match(/题量\s*[:：]\
 if (countText && Number(countText[1]) !== questions.length)
 throw new Error(`页面显示 ${countText[1]} 道题，脚本只识别 ${questions.length} 道，已停止提交`);
 const signature = questions.map((q) => `${q.kind}:${q.title}`).join('|');
-if (attemptedQuizzes.has(signature)) throw new Error('本次测验已尝试过，已停止重复提交');
+// 重做流程自己会换答案再交，不算“重复提交同一份答案”
+if (attemptedQuizzes.has(signature) && !quizRedoActive) throw new Error('本次测验已尝试过，已停止重复提交');
 console.log(`识别到 ${questions.length} 道题，正在调用 DeepSeek`);
 const answers = validateAnswers(questions, await askDeepSeek(questions));
 console.table(questions.map((q, i) => ({ 题号: i + 1, 题型: q.kind, 选择: answers.get(i + 1).join('') })));
@@ -2680,6 +2962,18 @@ await selectAnswers(questions, answers);
 quizAnswered = true;
 attemptedQuizzes.add(signature);
 await submitQuiz(questions[0].doc);
+// 交卷后先看结果：平台要求满分时，不合格就重做，别急着点“下一节”
+const quizResult = await waitForQuizResult();
+if (quizResult.failed) {
+console.log('%c成绩未达到及格线，准备重做（答对的保持，答错的换答案）', 'color:#FF9800');
+quizAnswerRetries = 0;
+const redoStatus = await runQuizRedo('成绩未达到及格线');
+if (redoStatus === 'passed') {
+quizBusy = false;
+await goToNextStep();
+}
+return;
+}
 console.log('章节测验提交已确认，点击“下一节”进入新视频');
 quizAnswerRetries = 0;
 quizBusy = false;

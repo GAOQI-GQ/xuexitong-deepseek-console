@@ -2237,7 +2237,13 @@ options: q.options.map((o) => ({ letter: o.letter, text: o.text })),
 // 只打印字符串，不把对象交给控制台：长时间开着的页面会被 DevTools 留着不放，越积越多
 console.log(`本次发送给 DeepSeek 的题干和选项：${JSON.stringify(payload)}`);
 if (DIRECT_MODE) return PAGE.__deepseekAsk(payload);
-for (let attempt = 0; ; attempt++) {
+// DeepSeek 上游忙的时候会回 “HTTP 503 Service is too busy”，本地服务再把它包成 502 转发给页面。
+// 以前只重试 429/503，一遇到 502 就当作致命错误，整节测验停在原地。现在所有 5xx、429 和网络抖动
+// 都按指数退避一直重试（最多约两小时），只要服务恢复就接着作答；配置错误（Key 无效、没设置 Key）
+// 这类重试也没用的错误仍然立刻停下，避免白等。
+let wait = 5000;
+for (let attempt = 1; ; attempt++) {
+if (typeof stopped !== 'undefined' && stopped) throw new Error('脚本已停止');
 let response;
 try {
 response = await fetch(`${LOCAL_URL}/answer`, {
@@ -2247,21 +2253,23 @@ body: JSON.stringify({ questions: payload }),
 signal: AbortSignal.timeout(900000),
 });
 } catch (error) {
-// 连接被拒多半是服务窗口关了；偶尔的网络抖动隔几秒再试一次就够了
-if (attempt < 2 && error.name !== 'TimeoutError') {
-await sleep(3000);
+if (attempt >= 240) throw new Error(`连续 ${attempt} 次无法连接本地 DeepSeek 服务。请确认启动窗口仍在运行。详情：${error.message}`);
+console.warn(`%c连接本地 DeepSeek 服务失败（${error.message}），${Math.round(wait / 1000)} 秒后重试（第 ${attempt} 次）`, 'color:#FF9800');
+await sleep(wait);
+wait = Math.min(Math.round(wait * 1.5), 30000);
 continue;
-}
-throw new Error(`无法连接本地 DeepSeek 服务。请确认启动窗口仍在运行，且 Edge 允许本地网络访问。详情：${error.message}`);
 }
 const data = await response.json().catch(() => null);
 if (response.ok) return data.answers;
 const message = data?.error || `本地 DeepSeek 服务返回 HTTP ${response.status}`;
-// 本地服务同时收到弹题和章节测验两批请求时会回 429/503 说“还在处理”。
-// 以前这里直接放弃，测验页就停在原地不动了；现在等一等，让排在前面的先做完。
-if ((response.status === 429 || response.status === 503) && attempt < 60) {
-console.warn(`%c本地 DeepSeek 服务正忙（${message}），5 秒后重试（第 ${attempt + 1} 次）`, 'color:#FF9800');
-await sleep(5000);
+// 上游 4xx 被本地服务包成 502 后，真正原因在 message 里：这类错误重试不会变好
+const permanent = /\bHTTP (400|401|402|403|404|409|413|415|422)\b/.test(message) ||
+/尚未设置|API Key|invalid api key|authentication|余额不足|insufficient/i.test(message);
+const retryable = !permanent && (response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500);
+if (retryable && attempt < 240) {
+console.warn(`%cDeepSeek 服务暂时不可用（${message}），${Math.round(wait / 1000)} 秒后重试（第 ${attempt} 次）`, 'color:#FF9800');
+await sleep(wait);
+wait = Math.min(Math.round(wait * 1.5), 30000);
 continue;
 }
 throw new Error(message);

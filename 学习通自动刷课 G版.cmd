@@ -2234,7 +2234,8 @@ type: q.kind,
 question: q.title,
 options: q.options.map((o) => ({ letter: o.letter, text: o.text })),
 }));
-console.log('以下是本次发送给 DeepSeek 的题干和选项：', payload);
+// 只打印字符串，不把对象交给控制台：长时间开着的页面会被 DevTools 留着不放，越积越多
+console.log(`本次发送给 DeepSeek 的题干和选项：${JSON.stringify(payload)}`);
 if (DIRECT_MODE) return PAGE.__deepseekAsk(payload);
 for (let attempt = 0; ; attempt++) {
 let response;
@@ -2606,6 +2607,40 @@ console.error('跳过没法作答的小节时出错:', error);
 // 直到通过或次数用完。AI 会答错，所以每答错一次就排除一个答案，靠排除法也能全对。
 const quizAnswerMemory = new Map();
 let quizRedoActive = false;
+
+// 重做循环会在同一张试卷上反复提交。平台的每次交卷都会重建一大块页面，
+// 十几轮下来渲染进程内存能涨到几个 G，最后标签页直接 “Out of Memory”。
+// 这里在每次交卷前先量一下：JS 堆或 DOM 节点数已经异常就先停下，
+// 宁可停在这一轮，也不能让整个标签页崩掉。
+function quizMemoryHot() {
+let heap = 0;
+let limit = 0;
+let nodes = 0;
+try {
+const mem = performance.memory;
+if (mem) {
+heap = Number(mem.usedJSHeapSize) || 0;
+limit = Number(mem.jsHeapSizeLimit) || 0;
+}
+} catch (_) {
+heap = 0;
+limit = 0;
+}
+// 题目在 iframe 里，节点数要把所有框架一起算，才能看出平台每轮重建后有没有越堆越多
+try {
+for (const doc of courseDocuments()) {
+try { nodes += doc.getElementsByTagName('*').length; } catch (_) { /* 忽略 */ }
+}
+} catch (_) {
+try { nodes = document.getElementsByTagName('*').length; } catch (_) { nodes = 0; }
+}
+// JS 堆到 1 GB（或接近 V8 上限）已经远高于正常课程页，再交卷就离崩溃只差几步
+const hot = heap > 1024 * 1024 * 1024 || (limit > 0 && heap > limit * 0.7) || nodes > 120000;
+if (hot) {
+console.warn(`%c页面占用已经很高（JS 堆 ${Math.round(heap / 1048576)} MB，节点 ${nodes} 个），先停止重做，避免标签页崩溃`, 'color:#F44336');
+}
+return hot;
+}
 
 const QUIZ_REDO_PATTERN = /^(重做|重做此题|重做本题|再做一次|再做一遍|重新作答|重新答题|重新测验|再答一次|重新考试)$/;
 const QUIZ_FAILURE_PATTERN = /未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/;
@@ -2985,32 +3020,60 @@ async function runQuizRedo(reason) {
 if (quizRedoActive) return 'busy';
 quizRedoActive = true;
 try {
-// 重新作答一轮：选答案、交卷、等结果；返回 true 表示已通过
+// 上一轮交上去的答案（每题用“|”拼起来）。只要这轮的答案和上一轮一模一样，
+// 平台就只会原样再判一次不及格，还会白白重建一遍页面——必须拦住。
+let lastAnswerSignature = '';
+let paperRounds = 0;
+// 重新作答一轮：选答案、交卷、等结果；返回 'passed' / 'failed' / 'memory' / 'exhausted'
 const answerAndSubmit = async (questions, attempt) => {
+// 交卷前先确认页面还没到崩溃边缘；到了就这一轮都不交
+if (quizMemoryHot()) return 'memory';
 const answers = await chooseChapterAnswers(questions);
-// 成绩页上读不到每题对错（平台只给了总分）时，每轮只改一道题：
-// AI 的答案一般大部分是对的，逐题换答案比整份重猜收敛得快
-const hasFeedback = questions.some((question) => {
+// 没有“已判对”的题按轮次逐题换答案。不能因为别的题有对错标记就整份原样重交：
+// 只要有一道题被标成“对”，以前就会永远停在同一份答案上，12 轮都在重复交同一份卷子
+const switchable = [];
+questions.forEach((question, index) => {
 const mem = quizAnswerMemory.get(quizQuestionKey(question));
-return Boolean(mem && (mem.correct || (mem.wrong && mem.wrong.length)));
+const knownRight = mem && Array.isArray(mem.correct) && mem.correct.length > 0;
+if (!knownRight) switchable.push(index);
 });
-if (!hasFeedback) {
-const targetIndex = (attempt - 1) % questions.length;
+if (switchable.length) {
+const targetIndex = switchable[(attempt - 1) % switchable.length];
 const target = questions[targetIndex];
 const mem = quizAnswerMemory.get(quizQuestionKey(target)) || { tried: [], wrong: [], correct: null };
 const letters = fallbackLetters(target, { tried: mem.tried, wrong: mem.wrong || [] });
 if (letters) {
 answers.set(targetIndex + 1, letters);
-console.log(`%c这轮读不到每题对错，换第 ${targetIndex + 1} 题的答案：${letters.join('')}`, 'color:#2196F3');
+console.log(`%c这轮换第 ${targetIndex + 1} 题的答案：${letters.join('')}`, 'color:#2196F3');
 }
 }
+const signatureOf = () => questions.map((question, index) => (answers.get(index + 1) || []).join('')).join('|');
+// 换完答案还是和上一轮完全一样（选项全试遍/读数把答案锁死了）：再交一遍不会有任何变化
+if (signatureOf() === lastAnswerSignature) {
+let changed = false;
+for (let offset = 0; offset < questions.length && !changed; offset++) {
+const index = (attempt + offset) % questions.length;
+const target = questions[index];
+const mem = quizAnswerMemory.get(quizQuestionKey(target)) || { tried: [], wrong: [], correct: null };
+const letters = fallbackLetters(target, { tried: mem.tried, wrong: mem.wrong || [] });
+if (!letters || sameLetters(letters, answers.get(index + 1) || [])) continue;
+answers.set(index + 1, letters);
+changed = true;
+console.log(`%c这轮答案和上一轮完全一样，改第 ${index + 1} 题：${letters.join('')}`, 'color:#2196F3');
+}
+if (!changed) {
+console.error('%c所有题目的答案组合都已经交过了，再重交也不会有变化，先停下', 'color:#F44336');
+return 'exhausted';
+}
+}
+lastAnswerSignature = signatureOf();
 console.table(questions.map((question, index) => ({ 题号: index + 1, 题型: question.kind, 选择: (answers.get(index + 1) || []).join('') })));
 await clearQuizSelections(questions);
 await selectAnswers(questions, answers);
 rememberQuizTried(questions, answers);
 await submitQuiz(questions[0].doc);
 const result = await waitForQuizResult();
-return !result.failed;
+return result.failed ? 'failed' : 'passed';
 };
 for (let attempt = 1; attempt <= 12; attempt++) {
 if (stopped) return 'stopped';
@@ -3046,10 +3109,12 @@ console.log('%c重做后页面显示测验已完成', 'color:#4CAF50');
 return 'passed';
 }
 try {
-if (await answerAndSubmit(questions, attempt)) {
+const status = await answerAndSubmit(questions, attempt);
+if (status === 'passed') {
 console.log('%c重做后已经通过', 'color:#4CAF50');
 return 'passed';
 }
+if (status === 'memory' || status === 'exhausted') return status;
 console.log('%c重做后仍未通过，继续换答案', 'color:#FF9800');
 } catch (error) {
 // 这一轮没做完（AI 服务报错、页面重建）不代表题做不了：换答案的逻辑还在，稍后接着来
@@ -3062,12 +3127,21 @@ continue;
 // 没有“重做”按钮：平台点“确定”后可能直接回到可作答的试卷
 const paper = editableQuizPaper();
 if (paper) {
-console.log(`%c平台已回到可重新作答的试卷，直接换答案重交（第 ${attempt} 次）`, 'color:#FF9800');
+// 原地重交不会刷新页面，平台的每次重建都留在同一个渲染进程里；
+// 这条路最多交 6 次，再多就停下，避免把标签页撑爆
+paperRounds++;
+if (paperRounds > 6) {
+console.error('%c同一张试卷原地重交了 6 次仍未通过，先停下（再交下去只会在同一份答案上打转，还容易把标签页撑崩）', 'color:#F44336');
+return 'gave-up';
+}
+console.log(`%c平台已回到可重新作答的试卷，直接换答案重交（第 ${attempt} 次，这条路第 ${paperRounds}/6 次）`, 'color:#FF9800');
 try {
-if (await answerAndSubmit(paper, attempt)) {
+const status = await answerAndSubmit(paper, attempt);
+if (status === 'passed') {
 console.log('%c重做后已经通过', 'color:#4CAF50');
 return 'passed';
 }
+if (status === 'memory' || status === 'exhausted') return status;
 console.log('%c重做后仍未通过，继续换答案', 'color:#FF9800');
 } catch (error) {
 console.warn(`%c重做这一轮没做完（${error.message}），5 秒后继续`, 'color:#FF9800');
@@ -3103,6 +3177,10 @@ return;
 if (quizFailureShown() && (findQuizRedoButton() || quizFailureDialog() || quizPageGraded())) {
 console.log('%c这一节的测验成绩未达标，准备重做', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
+if (redoStatus === 'memory') {
+console.warn('%c页面占用过高，已停止重做以免标签页崩溃：请按 F5 刷新这个页面，再点一次书签，脚本会接着做完这一节', 'color:#F44336');
+return;
+}
 if (redoStatus === 'passed') {
 quizBusy = false;
 await goToNextStep();
@@ -3178,6 +3256,10 @@ return;
 if (quizFailureShown() && quizPageGraded(questions)) {
 console.log('%c这一节显示的是上一次的成绩页，转入重做流程', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
+if (redoStatus === 'memory') {
+console.warn('%c页面占用过高，已停止重做以免标签页崩溃：请按 F5 刷新这个页面，再点一次书签，脚本会接着做完这一节', 'color:#F44336');
+return;
+}
 if (redoStatus === 'passed') {
 quizBusy = false;
 await goToNextStep();

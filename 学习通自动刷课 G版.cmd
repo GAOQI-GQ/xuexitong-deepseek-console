@@ -3293,8 +3293,9 @@ if (entry) continue;
 // 同时渲染进程的内存被清零。辅助窗口会在刷新后自动重启脚本。同一节只刷一次。
 let reloadLabel = '';
 try { reloadLabel = activeSectionKey() || ''; } catch (_) { reloadLabel = ''; }
-if (quizReloadBudget(reloadLabel, Date.now()) &&
+if (window.__xuexitongKeeperReady === true &&
 typeof app === 'object' && app && typeof app._autoRefresh === 'function' &&
+quizReloadBudget(reloadLabel, Date.now()) &&
 app._autoRefresh('成绩未达标，但页面上找不到重做入口')) {
 return 'reloading';
 }
@@ -3315,8 +3316,9 @@ quizRedoActive = false;
 async function retrySectionAfterRefresh(reason) {
 let label = '';
 try { label = activeSectionKey() || ''; } catch (_) { label = ''; }
-if (quizReloadBudget(label, Date.now()) &&
+if (window.__xuexitongKeeperReady === true &&
 typeof app === 'object' && app && typeof app._autoRefresh === 'function' &&
+quizReloadBudget(label, Date.now()) &&
 app._autoRefresh(reason)) {
 return true;
 }

@@ -2742,6 +2742,17 @@ let hint = '';
 try { hint = `${el.id || ''} ${el.className || ''} ${el.getAttribute('onclick') || ''}`.toLowerCase(); } catch (_) { hint = ''; }
 hit = /redo|chongzuo|again|retest|retry/.test(hint) && /重做|重测|重考|重新|再[做测答考]/.test(label);
 }
+// “请点此重做”“重做本题”这类更长的文案：只对真正可点的控件放宽匹配。
+// “未达到及格线，请重做”是平台的状态文字（不是按钮），绝不能当成重做入口去点。
+if (!hit) {
+let interactive = false;
+try {
+interactive = /^(BUTTON|A|INPUT)$/.test(el.tagName) ||
+el.getAttribute('role') === 'button' ||
+el.hasAttribute('onclick');
+} catch (_) { interactive = false; }
+if (interactive && label.length <= 20 && /重做|重测|重考|重新作答|重新答题/.test(label)) hit = true;
+}
 if (!hit) continue;
 if (el.querySelector('button,a')) continue;
 return el;
@@ -2769,6 +2780,80 @@ if (rows.length >= 30) return rows;
 return rows;
 }
 
+// 左栏“任务点”里的“章节测验”一行：平台用事件委托处理点击，没有 onclick 属性、
+// 也不是 button/a，普通的按钮扫描根本看不到它。但点它才是重新打开测验任务的入口——
+// 成绩页上那条“未达到及格线，请重做”只是状态文字，本身不能点。
+function findQuizTaskPoint() {
+// 先找“任务点”标题，只在它所在的那一块里找“章节测验”行：
+// 测验卡片标题也是“章节测验”，按位置分不干净（目录还可能放在右边），按所属区块分最稳。
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('div,span,h3,h4,p,dt,li')); } catch (_) { continue; }
+const headings = [];
+for (const el of nodes) {
+if (!visible(el)) continue;
+let text = '';
+try { text = clean(el.innerText || ''); } catch (_) { continue; }
+if (text.replace(/[\s\d（）()]+/g, '') !== '任务点') continue;
+headings.push(el);
+}
+for (const heading of headings) {
+let root = heading.parentElement;
+for (let depth = 0; depth < 2 && root; depth++) {
+const hit = findQuizTaskRowIn(root);
+if (hit) return hit;
+root = root.parentElement;
+}
+}
+}
+return findQuizTaskPointFallback();
+}
+
+// 在“任务点”标题所在区块里取最里层的“章节测验”行（去掉未完成数量徽标再比）
+function findQuizTaskRowIn(root) {
+let nodes = [];
+try { nodes = Array.from(root.querySelectorAll('li,dd,dt,div,span,p,a')); } catch (_) { return null; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+let text = '';
+try { text = clean(el.innerText || ''); } catch (_) { continue; }
+const normalized = text.replace(/[\s\d（）()]+/g, '');
+if (normalized !== '章节测验' && normalized !== '测验任务') continue;
+let hasInner = false;
+try {
+hasInner = Array.from(el.children || []).some((child) => clean(child.innerText || '').replace(/[\s\d（）()]+/g, '') === normalized);
+} catch (_) { hasInner = false; }
+if (hasInner) continue;
+return el;
+}
+return null;
+}
+
+// 没有“任务点”标题的版式：只认任务点类名/行列标签，绝不把右侧卡片标题当成任务点
+function findQuizTaskPointFallback() {
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('li,dd,dt,div,span,p,a')); } catch (_) { continue; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+let text = '';
+try { text = clean(el.innerText || ''); } catch (_) { continue; }
+const normalized = text.replace(/[\s\d（）()]+/g, '');
+if (normalized !== '章节测验' && normalized !== '测验任务') continue;
+let hint = '';
+try { hint = `${el.className || ''} ${el.id || ''}`.toLowerCase(); } catch (_) { hint = ''; }
+if (!(/task|point|job|mission|rw/.test(hint) || /^(LI|DD|DT)$/.test(el.tagName))) continue;
+let hasInner = false;
+try {
+hasInner = Array.from(el.children || []).some((child) => clean(child.innerText || '').replace(/[\s\d（）()]+/g, '') === normalized);
+} catch (_) { hasInner = false; }
+if (hasInner) continue;
+return el;
+}
+}
+return null;
+}
+
 // 成绩页的按钮/试卷经常比题目晚几秒渲染：等一会儿再下结论，顺手滚到底部把懒加载的按钮带出来
 async function waitForQuizRedoEntry(ms) {
 // 按轮数等，不用墙钟时间：测试里 sleep 是立即返回的，也不会卡住 15 秒
@@ -2776,6 +2861,7 @@ const rounds = Math.max(1, Math.round(ms / 500));
 let scrolled = false;
 let startClicked = false;
 let tabClicked = false;
+let pointClicked = false;
 for (let i = 0; i < rounds && !stopped; i++) {
 if (quizFailureDialog()) {
 await dismissQuizFailureDialog();
@@ -2783,6 +2869,18 @@ continue;
 }
 if (findQuizRedoButton()) return 'retry';
 if (editableQuizPaper()) return 'paper';
+// 先点左栏“任务点”里的“章节测验”重新打开测验任务：成绩页本身没有可点的重做入口，
+// 平台要在任务点上重新进入才会给出“开始答题/重做”
+if (!pointClicked) {
+const point = findQuizTaskPoint();
+if (point) {
+pointClicked = true;
+console.log('%c点击左侧“任务点”里的“章节测验”，重新打开测验任务', 'color:#2196F3');
+fireClick(point);
+await sleep(800);
+continue;
+}
+}
 if (!startClicked && typeof findTextControl === 'function' && typeof QUIZ_START_LABELS !== 'undefined') {
 const start = courseDocuments().map((doc) => findTextControl(doc.documentElement, QUIZ_START_LABELS)).find(Boolean);
 if (start) {
@@ -3526,6 +3624,30 @@ console.error('章节测验自动作答停止:', error);
 if (permanentStop) console.warn('%c这一节的测验已经提交过，但平台仍提示“还有任务点未完成”：请手动打开测验看看成绩有没有生成；脚本不会重复提交同一份答案，不会再动这一节', 'color:#FF9800');
 })
 .finally(() => { quizBusy = false; });
+};
+
+// 手动诊断：在控制台执行 app.inspectQuizRedo()，会列出页面上所有和“重做/测验/任务点”有关的元素。
+// 平台以后要是再把入口换到别处，把这张表发出来就能一眼定位新的按钮。
+app.inspectQuizRedo = function () {
+const rows = [];
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('a,button,input,li,dd,dt,div,span,p')); } catch (_) { continue; }
+for (const el of nodes) {
+let text = '';
+try { text = clean(el.innerText || ''); } catch (_) { continue; }
+if (!text || text.length > 24 || !/重做|重测|重考|及格|任务点|测验/.test(text)) continue;
+let cls = '';
+try { cls = String(el.className || '').split(/\s+/).filter(Boolean).slice(0, 2).join('.'); } catch (_) { cls = ''; }
+const name = `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}${cls ? `.${cls}` : ''}`;
+if (!rows.includes(`${name} → ${text}`)) rows.push(`${name} → ${text}`);
+if (rows.length >= 40) break;
+}
+if (rows.length >= 40) break;
+}
+console.log('%c页面上的重做/测验元素：', 'color:#2196F3');
+console.table(rows.map((row) => ({ 元素: row })));
+return rows;
 };
 
 function videoQuizDocuments() {

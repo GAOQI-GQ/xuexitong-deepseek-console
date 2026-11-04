@@ -4434,7 +4434,7 @@ const state = videoQuizState(signature);
 state.signature = signature;
 // 平台已经判完（显示“真遗憾/正确答案”，提交按钮没了）：不要再循环找提交按钮
 const resultScreen = videoQuizResultScreen(question);
-if (resultScreen) {
+if (resultScreen && !attemptedVideoQuizzes.has(signature)) {
 if (resultScreen.retry && state.attempts < videoQuizMaxAttempts(question)) {
 videoQuizFailures.delete(signature);
 state.gaveUp = false;

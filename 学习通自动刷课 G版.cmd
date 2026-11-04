@@ -658,6 +658,32 @@ let docTaskBusy = false;
 let docTaskBusySince = 0;
 let docTaskWakeAt = 0;
 
+// —— 渲染进程内存保护 ——
+// 课程页往往一开就是几十个小时：平台每次交卷/换框架都重建一大块 DOM，DevTools 控制台也一直累积，
+// 渲染进程迟早撑到 “Out of Memory”，整个标签页直接崩掉，脚本再聪明也救不回来。
+// 辅助窗口能在整页刷新后自动重新注入脚本，所以这里在内存偏高或连续运行太久时主动刷新一次，
+// 把渲染进程的内存清零后接着学。判据写成纯函数（不碰 DOM），方便测试覆盖忙时推迟/冷却/阈值。
+const MEMORY_RELOAD_COOLDOWN = 5 * 60 * 1000;
+const MEMORY_RELOAD_HEAP = 1200 * 1024 * 1024;
+const MEMORY_RELOAD_URGENT_HEAP = 1600 * 1024 * 1024;
+const MEMORY_RELOAD_UPTIME = 3 * 60 * 60 * 1000;
+const MEMORY_RELOAD_BUSY_WAIT = 3 * 60 * 1000;
+// 达到条件返回 true。busy=true（答题/等 AI/图文滚动）时先等空闲；
+// 但内存已经很危险或已经等满 3 分钟，就算忙也要刷——宁可重做一轮，也不能让标签页崩。
+function memoryRefreshDecision(input) {
+const { now = 0, heap = 0, limit = 0, busy = false, busySince = 0, uptime = 0, lastReloadAt = 0 } = input || {};
+if (lastReloadAt && now - lastReloadAt < MEMORY_RELOAD_COOLDOWN) return false;
+const hot = heap > MEMORY_RELOAD_HEAP || (limit > 0 && heap > limit * 0.6);
+const stale = uptime > MEMORY_RELOAD_UPTIME;
+if (!hot && !stale) return false;
+if (busy) {
+const waited = busySince ? now - busySince : 0;
+const urgent = heap > MEMORY_RELOAD_URGENT_HEAP || uptime > MEMORY_RELOAD_UPTIME * 1.5;
+if (!urgent && waited < MEMORY_RELOAD_BUSY_WAIT) return false;
+}
+return true;
+}
+
 // 清理旧实例失败也不能影响本次注入
 const destroyQuietly = (instance) => {
 try {
@@ -674,6 +700,8 @@ clearInterval(PAGE[BOOT_TIMER_KEY]);
 PAGE[BOOT_TIMER_KEY] = null;
 }
 if (!startedByKeeper) installNavigationKeeper();
+// 整页刷新会自动丢掉脚本，只有辅助窗口确实在（本次由它注入，或刚刚成功打开），才允许脚本自己刷新页面
+PAGE.__xuexitongKeeperReady = startedByKeeper || PAGE.__xuexitongKeeperReady === true;
 if (DIRECT_MODE) {
 console.log('%cDeepSeek 直连模式已就绪', 'color:#4CAF50;font-weight:bold');
 startPlayer();
@@ -750,6 +778,7 @@ keeper.eval(`window.__xuexitongKeeperTimer = setInterval(function () {
 }
 keeper.blur();
 PAGE.focus();
+PAGE.__xuexitongKeeperReady = true;
 console.log('整页跳转辅助窗口已启动；请保持它打开');
 } catch (error) {
 console.warn('整页跳转后无法自动重新启动脚本；请允许此站点打开弹出窗口，或在新页面重新粘贴脚本。', error);
@@ -2650,6 +2679,17 @@ console.warn(`%c页面占用已经很高（JS 堆 ${Math.round(heap / 1048576)} 
 return hot;
 }
 
+// 同一节最多整页刷新一次去重新找“重做”入口；刷新后还是没有就跳过，
+// 防止“刷新→没有→再刷新”来回死循环。时间记在 sessionStorage 里，整页刷新后仍然有效。
+function quizReloadBudget(label, now) {
+const key = `xxtQuizReloadAt:${String(label || '')}`;
+let at = 0;
+try { at = Number(window.sessionStorage.getItem(key)) || 0; } catch (_) { at = 0; }
+if (at && now - at < 15 * 60 * 1000) return false;
+try { window.sessionStorage.setItem(key, String(now)); } catch (_) { /* 忽略 */ }
+return true;
+}
+
 const QUIZ_REDO_PATTERN = /^(点击)?(重做(此题|本题|试卷|试题)?|再做一次|再做一遍|重测|重考|再测一次|再考一次|重新测试|重新测验|重新考试|重新作答|重新答题|重新做题|再答一次|再次答题|再次作答)$/;
 const QUIZ_FAILURE_PATTERN = /未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/;
 
@@ -2778,50 +2818,6 @@ if (last && last.card) last.card.scrollIntoView({ block: 'end' });
 await sleep(500);
 }
 return null;
-}
-
-// 重新点一下左侧目录里当前这一节，让平台把整个小节重新渲染一遍
-// （成绩页上的“重做”入口有时是渲染漏了，重新进入才会出现）
-function reenterActiveSection() {
-try {
-const item = catalogItems().find((entry) => entry.active);
-if (!item || !item.el) return false;
-console.log(`%c重新打开这一节（${item.label}），让平台重新渲染测验入口`, 'color:#FF9800');
-// 真正的点击处理常常挂在标题链接上，优先点它，最后才点整行
-const target = item.el.querySelector('.posCatalog_name,a') || item.el;
-fireClick(target);
-return true;
-} catch (_) { return false; }
-}
-
-// 最后手段：刷新测验所在的框架，释放上一轮留下的页面，再看有没有重做/开始入口
-function reloadQuizFrame() {
-for (const doc of courseDocuments()) {
-let frameEl = null;
-try { frameEl = doc.defaultView && doc.defaultView.frameElement; } catch (_) { frameEl = null; }
-if (!frameEl || !frameEl.isConnected) continue;
-let isQuiz = false;
-try {
-isQuiz = Boolean(doc.querySelector('.TiMu,.questionLi,#popcontent,[class*="question"],[class*="TiMu"]')) ||
-QUIZ_FAILURE_PATTERN.test(String(doc.body?.innerText || '').slice(0, 4000));
-} catch (_) { isQuiz = false; }
-if (!isQuiz) continue;
-try {
-const win = frameEl.contentWindow;
-if (win && win.location && typeof win.location.reload === 'function') {
-win.location.reload();
-return true;
-}
-} catch (_) { /* 跨域时退回改 src */ }
-try {
-const src = frameEl.getAttribute('src');
-if (src) {
-frameEl.setAttribute('src', src);
-return true;
-}
-} catch (_) { /* 忽略 */ }
-}
-return false;
 }
 
 // 平台说“未达到及格线，请重做”时弹的是只有“取消/确定”的提示框，页面上并没有“重做”按钮。
@@ -3157,12 +3153,15 @@ try {
 // 平台就只会原样再判一次不及格，还会白白重建一遍页面——必须拦住。
 let lastAnswerSignature = '';
 let paperRounds = 0;
-let sectionReloads = 0;
-let frameReloads = 0;
 // 重新作答一轮：选答案、交卷、等结果；返回 'passed' / 'failed' / 'memory' / 'exhausted'
 const answerAndSubmit = async (questions, attempt) => {
-// 交卷前先确认页面还没到崩溃边缘；到了就这一轮都不交
-if (quizMemoryHot()) return 'memory';
+// 交卷前先确认页面还没到崩溃边缘；到了就这一轮都不交，改让整页刷新把内存清掉
+if (quizMemoryHot()) {
+if (typeof app === 'object' && app && typeof app._autoRefresh === 'function') {
+app._autoRefresh('章节测验重做时页面内存占用过高');
+}
+return 'memory';
+}
 const answers = await chooseChapterAnswers(questions);
 // 没有“已判对”的题按轮次逐题换答案。不能因为别的题有对错标记就整份原样重交：
 // 只要有一道题被标成“对”，以前就会永远停在同一份答案上，12 轮都在重复交同一份卷子
@@ -3289,20 +3288,15 @@ continue;
 console.warn('%c成绩未达标，先等页面把“重做”入口渲染出来', 'color:#FF9800');
 let entry = await waitForQuizRedoEntry(15000);
 if (entry) continue;
-// 还找不到就把这一节重新打开一次：平台可能只是没渲染出重做按钮
-if (sectionReloads < 1 && reenterActiveSection()) {
-sectionReloads++;
-await sleep(3000);
-entry = await waitForQuizRedoEntry(15000);
-if (entry) continue;
-}
-// 最后一招：原地刷新测验框架，释放上一轮页面再看一眼
-if (frameReloads < 1 && reloadQuizFrame()) {
-frameReloads++;
-console.warn('%c仍然没有重做入口，刷新测验框架再找一次', 'color:#FF9800');
-await sleep(4000);
-entry = await waitForQuizRedoEntry(15000);
-if (entry) continue;
+// 还找不到就别再原地重建页面了：反复重新进节/刷框架正是把渲染进程撑到崩溃的动作。
+// 改成整页刷新一次——平台的任务点状态会重新拉取，“重做”入口常常就出来了；
+// 同时渲染进程的内存被清零。辅助窗口会在刷新后自动重启脚本。同一节只刷一次。
+let reloadLabel = '';
+try { reloadLabel = activeSectionKey() || ''; } catch (_) { reloadLabel = ''; }
+if (quizReloadBudget(reloadLabel, Date.now()) &&
+typeof app === 'object' && app && typeof app._autoRefresh === 'function' &&
+app._autoRefresh('成绩未达标，但页面上找不到重做入口')) {
+return 'reloading';
 }
 const candidates = quizEntryCandidates();
 if (candidates.length) console.warn(`%c页面上能点的按钮：${candidates.join('；')}`, 'color:#F44336');
@@ -3314,6 +3308,19 @@ return 'gave-up';
 } finally {
 quizRedoActive = false;
 }
+}
+
+// 重做到头了（同一张试卷原地重交被上限拦住 / 12 轮都没过）：整页刷新一次，
+// 用干净的页面和内存重新拿一次任务点状态再试；这一节刚刷新过就不要再刷，免得来回死循环。
+async function retrySectionAfterRefresh(reason) {
+let label = '';
+try { label = activeSectionKey() || ''; } catch (_) { label = ''; }
+if (quizReloadBudget(label, Date.now()) &&
+typeof app === 'object' && app && typeof app._autoRefresh === 'function' &&
+app._autoRefresh(reason)) {
+return true;
+}
+return false;
 }
 
 app._advanceChapterTest = function () {
@@ -3334,11 +3341,23 @@ if (quizFailureShown() && (findQuizRedoButton() || quizFailureDialog() || quizPa
 console.log('%c这一节的测验成绩未达标，准备重做', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'memory') {
-console.warn('%c页面占用过高，已停止重做以免标签页崩溃：请按 F5 刷新这个页面，再点一次书签，脚本会接着做完这一节', 'color:#F44336');
+console.warn(app._refreshing
+? '%c页面占用过高，已停止重做；脚本正在自动刷新页面释放内存，刷新后会自动接着做这一节'
+: '%c页面占用过高，已停止重做以免标签页崩溃：请按 F5 刷新这个页面，再点一次书签，脚本会接着做完这一节', 'color:#F44336');
+return;
+}
+if (redoStatus === 'reloading') {
+console.warn('%c已安排整页刷新来重新获取“重做”入口，辅助窗口会在刷新后自动重启脚本', 'color:#FF9800');
+return;
+}
+if (redoStatus === 'gave-up') {
+if (await retrySectionAfterRefresh('这一节重做多次仍未通过，整页刷新后换一份干净状态再试')) return;
+console.warn('%c这一节重做多次仍未通过，先跳过；稍后如果平台把它带回来，再手动点一次书签继续', 'color:#F44336');
+await skipQuizSection('重做多次仍未通过');
 return;
 }
 if (redoStatus === 'no-retry') {
-// 平台死活不给重做入口（等了 15 秒、重新进节、刷新框架都没有）：这份卷子已经交上去了，
+// 平台死活不给重做入口（等过、也整页刷新过一次）：这份卷子已经交上去了，
 // 再停在这里也不会有进展，按“已提交”处理继续下一节；如果平台认为任务点没完成，
 // goToNextStep 会被“还有任务点未完成”拉回来，skipQuizSection 会识别并停下
 console.warn('%c平台没有提供重做入口，这一节按已提交处理，自动继续下一节', 'color:#FF9800');
@@ -3421,7 +3440,19 @@ if (quizFailureShown() && quizPageGraded(questions)) {
 console.log('%c这一节显示的是上一次的成绩页，转入重做流程', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'memory') {
-console.warn('%c页面占用过高，已停止重做以免标签页崩溃：请按 F5 刷新这个页面，再点一次书签，脚本会接着做完这一节', 'color:#F44336');
+console.warn(app._refreshing
+? '%c页面占用过高，已停止重做；脚本正在自动刷新页面释放内存，刷新后会自动接着做这一节'
+: '%c页面占用过高，已停止重做以免标签页崩溃：请按 F5 刷新这个页面，再点一次书签，脚本会接着做完这一节', 'color:#F44336');
+return;
+}
+if (redoStatus === 'reloading') {
+console.warn('%c已安排整页刷新来重新获取“重做”入口，辅助窗口会在刷新后自动重启脚本', 'color:#FF9800');
+return;
+}
+if (redoStatus === 'gave-up') {
+if (await retrySectionAfterRefresh('这一节重做多次仍未通过，整页刷新后换一份干净状态再试')) return;
+console.warn('%c这一节重做多次仍未通过，先跳过；稍后如果平台把它带回来，再手动点一次书签继续', 'color:#F44336');
+await skipQuizSection('重做多次仍未通过');
 return;
 }
 if (redoStatus === 'no-retry') {
@@ -3460,6 +3491,14 @@ const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'passed') {
 quizBusy = false;
 await goToNextStep();
+}
+if (redoStatus === 'memory' || redoStatus === 'reloading') {
+console.warn('%c这一节还没做通，但页面占用已经偏高：脚本先刷新页面释放内存，刷新后会自动接着做', 'color:#F44336');
+}
+if (redoStatus === 'gave-up') {
+if (await retrySectionAfterRefresh('这一节重做多次仍未通过，整页刷新后换一份干净状态再试')) return;
+console.warn('%c这一节重做多次仍未通过，先跳到下一节；稍后如果平台把它带回来，再手动点一次书签继续', 'color:#F44336');
+await skipQuizSection('重做多次仍未通过');
 }
 return;
 }
@@ -4419,6 +4458,7 @@ currentVideoTitle: "",
 run() {
 console.log("%c=== 学习通视频与章节测验助手 V800 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
 this._installWatchdog();
+this._installMemoryGuard();
 this._noteProgress();
 this._safeStopped = false;
 this._nextUnitPending = false;
@@ -4922,6 +4962,64 @@ this._lastProgressAt = Date.now();
 this._pendingSince = 0;
 this._watchdogRestartAt = 0;
 this._watchdogTimer = setInterval(() => this._watchdogTick(), 3000);
+},
+// —— 内存保护 ——
+// 每 1 分钟看一眼：内存偏高、或这一页已经连开太久，就整页刷新一次再让辅助窗口重启脚本。
+// 这是唯一能真正把渲染进程占用清零的办法（JS 里没有别的释放途径）。
+_installMemoryGuard() {
+if (this._memoryGuardTimer) clearInterval(this._memoryGuardTimer);
+this._bootedAt = this._bootedAt || Date.now();
+this._memoryGuardTimer = setInterval(() => this._memoryGuardTick(), 60000);
+},
+_memoryGuardTick() {
+if (this._destroyed || this._refreshing) return;
+const now = Date.now();
+let heap = 0;
+let limit = 0;
+try {
+const mem = performance.memory;
+if (mem) {
+heap = Number(mem.usedJSHeapSize) || 0;
+limit = Number(mem.jsHeapSizeLimit) || 0;
+}
+} catch (_) { /* 读不到就不按堆判断，只按运行时长刷新 */ }
+let busy = false;
+try { busy = typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy(); } catch (_) { busy = false; }
+busy = Boolean(busy || this._videoQuizActive || this._videoQuizPending || docTaskBusy);
+if (busy && !this._busySince) this._busySince = now;
+if (!busy) this._busySince = 0;
+let lastReloadAt = 0;
+try { lastReloadAt = Number(PAGE.sessionStorage.getItem('xxtAutoReloadAt')) || 0; } catch (_) { lastReloadAt = 0; }
+const decision = memoryRefreshDecision({
+now,
+heap,
+limit,
+busy,
+busySince: this._busySince,
+uptime: now - (this._bootedAt || now),
+lastReloadAt,
+});
+if (!decision) return;
+this._autoRefresh(heap > MEMORY_RELOAD_HEAP ? `页面内存占用偏高（JS 堆 ${Math.round(heap / 1048576)} MB）` : '页面已连续运行很久');
+},
+_autoRefresh(reason) {
+if (this._destroyed || this._refreshing) return false;
+if (PAGE.__xuexitongKeeperReady !== true) {
+console.warn(`%c${reason}，但负责整页刷新后自动重启脚本的辅助窗口不可用，不能自动刷新；请手动按 F5，再点一次“学习通自动答题”书签`, 'color:#F44336');
+return false;
+}
+this._refreshing = true;
+try { PAGE.sessionStorage.setItem('xxtAutoReloadAt', String(Date.now())); } catch (_) { /* 忽略 */ }
+console.log(`%c${reason}，马上自动刷新页面释放内存；辅助窗口会重新启动脚本，接着当前课程继续`, 'color:#FF9800');
+setTimeout(() => {
+try {
+PAGE.location.reload();
+} catch (error) {
+this._refreshing = false;
+console.warn('自动刷新页面失败，请手动按 F5:', error);
+}
+}, 800);
+return true;
 },
 _watchdogTick() {
 try {
@@ -5473,6 +5571,10 @@ this._detachVideoEvents();
 if (this._watchdogTimer) {
 clearInterval(this._watchdogTimer);
 this._watchdogTimer = null;
+}
+if (this._memoryGuardTimer) {
+clearInterval(this._memoryGuardTimer);
+this._memoryGuardTimer = null;
 }
 this._clearDelayedNextUnit();
 $(document).off('.xuexitongPlayerV800');

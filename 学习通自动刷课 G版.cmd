@@ -4074,6 +4074,86 @@ return true;
 return false;
 }
 
+// —— 弹题提交按钮定位 ——
+// 之前只在题目卡片里找文案刚好等于“提交”的元素，平台把按钮叫成“提交作答”、
+// 在按钮里塞了图标、或者选完选项后把整块面板重建，都会直接找不到，然后反复报
+// “视频弹题中未找到提交按钮”。这里按 由内到外 的顺序找，并且允许重新定位卡片。
+const VIDEO_QUIZ_SUBMIT_LABELS = ['提交答案', '提交作答', '确认提交', '确定提交', '提交'];
+
+function submitControlIn(root) {
+if (!root || typeof root.querySelectorAll !== 'function') return null;
+for (const label of VIDEO_QUIZ_SUBMIT_LABELS) {
+const found = findButton(root, label, true);
+if (found) return found;
+}
+const textNode = findTextControl(root, VIDEO_QUIZ_SUBMIT_LABELS);
+if (!textNode) return null;
+// 文字可能落在按钮里的 span/i 上，往上找到真正的按钮再点
+if (/^(BUTTON|A|INPUT)$/.test(textNode.tagName) || textNode.getAttribute('role') === 'button') return textNode;
+let control = textNode.parentElement;
+for (let depth = 0; control && depth < 3; depth++, control = control.parentElement) {
+if (!root.contains(control)) break;
+if (/^(BUTTON|A|INPUT)$/.test(control.tagName) || control.getAttribute('role') === 'button') return control;
+}
+return textNode;
+}
+
+function findVideoQuizSubmit(question) {
+if (!question || !question.card) return null;
+let button = submitControlIn(question.card);
+if (button) return button;
+// 弹题的提交按钮有时和选项不在同一层（外层浮层/遮罩里），逐级向外找
+let scope = question.card;
+for (let depth = 0; depth < 6; depth++) {
+scope = scope.parentElement;
+if (!scope || scope === scope.ownerDocument.body) break;
+button = submitControlIn(scope);
+if (button) return button;
+}
+// 最后回到文档里找：只认和这道题共用同一块浮层的提交按钮
+const docs = question.doc ? [question.doc] : videoQuizDocuments();
+for (const doc of docs) {
+for (const candidate of textSubmitCandidates(doc)) {
+if (!visible(candidate)) continue;
+let node = candidate.parentElement;
+for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+if (node === doc.body) break;
+if (node.contains(question.card)) return candidate;
+}
+}
+}
+return null;
+}
+
+// 选完选项后卡片可能被平台重建（旧节点虽然 isConnected 为 false，visible() 会直接判死），
+// 所以找不到按钮时重新扫一遍弹题，用新的卡片再找一次。
+function locateVideoQuizSubmit(question) {
+let button = findVideoQuizSubmit(question);
+if (button) return { button, question };
+const fresh = findVideoQuizCard();
+if (fresh && fresh.card !== question.card) {
+button = findVideoQuizSubmit(fresh);
+if (button) return { button, question: fresh };
+}
+return { button: null, question };
+}
+
+// 平台判完之后的“结果页”：题目面板还在，但“提交”按钮已经换成“继续学习/重新作答”。
+// 之前把这种页面当成还在答题，一直循环找提交按钮，三次失败后就暂停跳节。
+function videoQuizResultScreen(question) {
+if (!question || !question.card) return null;
+const text = clean(question.card.innerText || question.card.textContent);
+const wrong = isVideoQuizWrong(text);
+const success = isVideoQuizSuccess(text);
+const correctShown = /正确答案\s*[：:]/.test(text);
+if (!wrong && !success && !correctShown) return null;
+if (findVideoQuizSubmit(question)) return null;
+const retry = findRetryButton(question.card);
+const leave = findTextControl(question.card, DISMISS_LABELS) || findVideoQuizContinueButton();
+if (!retry && !leave) return null;
+return { wrong, success, correctShown, retry, leave, text };
+}
+
 function sameLetters(a, b) {
 return [...a].sort().join('') === [...b].sort().join('');
 }
@@ -4352,6 +4432,40 @@ const signatureTitle = question.title
 const signature = `${videoQuizScope(video)}|${question.kind}:${signatureTitle}:${question.options.map((option) => option.letter).join('')}`;
 const state = videoQuizState(signature);
 state.signature = signature;
+// 平台已经判完（显示“真遗憾/正确答案”，提交按钮没了）：不要再循环找提交按钮
+const resultScreen = videoQuizResultScreen(question);
+if (resultScreen) {
+if (resultScreen.retry && state.attempts < videoQuizMaxAttempts(question)) {
+videoQuizFailures.delete(signature);
+state.gaveUp = false;
+state.gaveUpAt = 0;
+state.sameRetried = false;
+state.loggedUnknown = false;
+if (resultScreen.wrong) markVideoQuizWrongAnswer(state, state.tried[state.tried.length - 1]);
+console.log('%c弹题页面已判错，点击“重新作答”再试一次', 'color:#FF9800');
+fireClick(resultScreen.retry);
+videoQuizRetryAt = Date.now() + 1500;
+return;
+}
+attemptedVideoQuizzes.add(signature);
+app._videoQuizPending = false;
+activeVideoQuiz = null;
+const shown = shownCorrectLetters(resultScreen.text);
+if (shown) console.log(`%c视频弹题页面给出的正确答案：${shown.join('')}`, 'color:#2196F3');
+if (resultScreen.leave) {
+console.log('%c视频弹题页面已给出判定，点击继续按钮，不再重复作答', 'color:#4CAF50');
+fireClick(resultScreen.leave);
+videoQuizContinueAt = Date.now();
+} else {
+console.warn('%c视频弹题结果页没有“继续学习”按钮，先恢复播放，等平台自己收起面板', 'color:#FF9800');
+}
+if (app._videoEndedDuringQuiz) scheduleVideoEndedNext(1500);
+setTimeout(() => {
+if (typeof app._resumeAfterVideoQuiz === 'function') app._resumeAfterVideoQuiz();
+else if (typeof app._tryResumePlayback === 'function') app._tryResumePlayback('video-quiz-done');
+}, 600);
+return;
+}
 if (attemptedVideoQuizzes.has(signature)) {
 if (state.gaveUp && state.skipCount < 3) {
 state.skipCount++;
@@ -4475,10 +4589,16 @@ if (question.kind !== '多选题') {
 const stillStale = await clearStaleVideoQuizSelections(question, letters);
 if (stillStale.length) throw new Error(`旧选项未能取消（${stillStale.map((option) => option.letter).join('、')}），暂不提交`);
 }
-const submit = findButtonIn(question.card, '提交');
+const located = locateVideoQuizSubmit(question);
+if (located.question !== question) {
+question = located.question;
+activeVideoQuiz = question;
+}
+const submit = located.button;
 if (!submit) throw new Error('视频弹题中未找到提交按钮');
-submit.scrollIntoView({ block: 'center' });
-submit.click();
+try { submit.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+fireClick(submit);
+videoQuizFailures.delete(signature);
 state.attempts++;
 state.tried.push(letters);
 state.lastSubmittedAt = Date.now();

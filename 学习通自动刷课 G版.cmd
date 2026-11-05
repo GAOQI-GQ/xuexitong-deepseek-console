@@ -2170,9 +2170,11 @@ if (text && !found.has(letter)) found.set(letter, { letter, text, element: row }
 return Array.from(found.values()).sort((a, b) => a.letter.localeCompare(b.letter));
 }
 
-function extractQuestions() {
+// onlyDocs：只在这些框架里找题（识别“能不能重新作答”时用，避免把隐藏框架里
+// 上一份成绩页的题目混进来，题量永远对不上）
+function extractQuestions(onlyDocs) {
 const questions = [];
-for (const doc of courseDocuments()) {
+for (const doc of (Array.isArray(onlyDocs) ? onlyDocs : courseDocuments())) {
 if (!doc.body) continue;
 const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
 const seenCards = new Set();
@@ -2322,9 +2324,9 @@ for (const blank of blanks) usedInputs.add(blank);
 return found;
 }
 
-function extractTextQuestions() {
+function extractTextQuestions(onlyDocs) {
 const questions = [];
-for (const doc of courseDocuments()) {
+for (const doc of (Array.isArray(onlyDocs) ? onlyDocs : courseDocuments())) {
 if (!doc.body || !isQuizTextDocument(doc)) continue;
 const usedInputs = new Set();
 try { questions.push(...taggedTextQuestions(doc, usedInputs)); } catch (_) { /* 忽略 */ }
@@ -2376,11 +2378,12 @@ return found;
 }
 
 // 选择题数组上挂一份 textQuestions，交卷/计数/重做都按“选择题 + 填空简答”合计
-function attachTextQuestions(questions) {
+function attachTextQuestions(questions, onlyDocs) {
 const list = Array.isArray(questions) ? questions : [];
 let textQuestions = [];
-try { textQuestions = extractTextQuestions(); } catch (_) { textQuestions = []; }
-if (list.length) textQuestions = textQuestions.filter((question) => question.doc === list[0].doc);
+try { textQuestions = extractTextQuestions(onlyDocs); } catch (_) { textQuestions = []; }
+// 指定了框架范围时，抽出来的填空/简答本来就在这个范围里，不用再按第一题所在框架过滤
+if (list.length && !Array.isArray(onlyDocs)) textQuestions = textQuestions.filter((question) => question.doc === list[0].doc);
 if (textQuestions.length) list.textQuestions = textQuestions;
 else delete list.textQuestions;
 return list;
@@ -2416,10 +2419,20 @@ candidates.find((el) => !Array.from(el.children).some((child) => compact(child.i
 const QUIZ_SUBMIT_LABELS = ['提交', '交卷', '提交答案', '提交试卷', '交卷并查看结果'];
 function findQuizSubmit(doc) {
 for (const label of QUIZ_SUBMIT_LABELS) {
-const button = findButton(doc, label);
+// 平台的按钮文字常被拆成“提 交”或塞了图标节点：精确匹配之后再用去空白匹配兜一次
+const button = findButton(doc, label) || findButton(doc, label, true);
 if (button) return button;
 }
-return null;
+// 文字里带空格/图标读不出来时，按按钮类名兜底（卷面底部基本都是 btnSubmit/submitBtn）
+let candidates = [];
+try { candidates = Array.from(doc.querySelectorAll('a,button,input[type="button"],input[type="submit"],[role="button"],div,span')); } catch (_) { return null; }
+const matched = candidates.filter((el) => {
+if (!visible(el) || el.disabled) return false;
+const hint = `${el.className || ''} ${el.id || ''}`.toLowerCase();
+const text = clean(el.value || el.innerText).replace(/\s+/g, '');
+return /submit|tijiao/.test(hint) || /^(提交|交卷|提交答案|提交试卷|交卷并查看结果)$/.test(text);
+});
+return matched.find((el) => /^(A|BUTTON|INPUT)$/.test(el.tagName)) || matched[0] || null;
 }
 
 function findNextButton() {
@@ -2657,7 +2670,7 @@ let videoInsteadSince = 0;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
-submitDoc = courseDocuments().find((doc) => findQuizSubmit(doc));
+submitDoc = quizSubmitDoc();
 if (submitDoc) break;
 // 图文/阅读任务点被误判成测验时，不要干等 120 秒：8 秒后确认到正文就交回阅读流程
 if (attempt >= 16 && attempt % 16 === 0) {
@@ -2714,7 +2727,11 @@ let stableCount = 0;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
-const questions = attachTextQuestions(extractQuestions());
+// 只按“提交按钮所在框架”找题：平台切页时会把上一份成绩页留在别的隐藏框架里，
+// 混着数题会一直和卷面题量对不上；按钮在外层、题目在别的框架时退回全页面识别
+const paperDocs = docsWithin(submitDoc);
+let questions = attachTextQuestions(extractQuestions(paperDocs), paperDocs);
+if (!paperQuestionTotal(questions)) questions = attachTextQuestions(extractQuestions());
 const textQuestions = questions.textQuestions || [];
 const total = questions.length + textQuestions.length;
 const countText = clean(submitDoc.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
@@ -3902,7 +3919,7 @@ await dismissQuizFailureDialog();
 continue;
 }
 if (findQuizRedoButton()) return 'retry';
-if (editableQuizPaper()) return 'paper';
+if (editableQuizPaper() || quizPaperAnswerable()) return 'paper';
 // 先点左栏“任务点”里的“章节测验”重新打开测验任务：成绩页本身没有可点的重做入口，
 // 平台要在任务点上重新进入才会给出“开始答题/重做”
 if (!pointClicked) {
@@ -4092,27 +4109,126 @@ return outcome.wrong || outcome.right;
 });
 }
 
+// 判断框架本身是不是用户正看着的那一屏：平台切页时会把上一份成绩页留在隐藏框架里，
+// 不区分的话“旧成绩页的提交按钮 + 新试卷的题目”会混在一起，题量永远对不上
+function frameVisible(doc) {
+if (!doc || doc === document) return true;
+try {
+const frame = doc.defaultView && doc.defaultView.frameElement;
+if (!frame) return true;
+return visible(frame);
+} catch (_) { return false; }
+}
+
+// 提交按钮所在框架：优先取可见的那个（隐藏框架里往往是上一份已经交掉的成绩页）
+function quizSubmitDoc() {
+let docs = [];
+try { docs = courseDocuments(); } catch (_) { return null; }
+const withSubmit = docs.filter((doc) => findQuizSubmit(doc));
+if (!withSubmit.length) return null;
+return withSubmit.find(frameVisible) || withSubmit[0];
+}
+
+// 某个框架及其里层框架
+function docsWithin(doc) {
+const docs = [];
+const visit = (item, depth) => {
+if (!item || depth > 3 || docs.includes(item)) return;
+docs.push(item);
+let frames = [];
+try { frames = Array.from(item.querySelectorAll('iframe')); } catch (_) { return; }
+for (const frame of frames) {
+try { visit(frame.contentDocument, depth + 1); } catch (_) { /* 跨域 */ }
+}
+};
+visit(doc, 0);
+return docs;
+}
+
+// 同一道题在页面上出现两份（旧成绩页副本还在同一个框架里）时按题型+题干+选项去重，
+// 否则交卷时会把同一道题算两遍、题量和卷面对不上
+function dedupePaperQuestions(questions) {
+const seen = new Set();
+const unique = [];
+for (const question of (Array.isArray(questions) ? questions : [])) {
+const options = (question.options || []).map((option) => clean(option.text)).join('/');
+const key = `${question.kind}:${clean(question.title).slice(0, 120)}:${options}`;
+if (seen.has(key)) continue;
+seen.add(key);
+unique.push(question);
+}
+const texts = (questions && Array.isArray(questions.textQuestions)) ? questions.textQuestions : [];
+if (texts.length) {
+const seenText = new Set();
+const uniqueText = texts.filter((question) => {
+const key = `${question.kind}:${clean(question.title).slice(0, 120)}:${question.blanks.length}`;
+if (seenText.has(key)) return false;
+seenText.add(key);
+return true;
+});
+if (uniqueText.length) unique.textQuestions = uniqueText;
+}
+return unique;
+}
+
+// 只按“提交按钮所在框架”来识别试卷；提交按钮在外层、题目在别的框架时退回全页面识别
+function quizPaperCandidates(submitDoc) {
+if (!submitDoc) return null;
+const scoped = docsWithin(submitDoc);
+let questions = attachTextQuestions(extractQuestions(scoped), scoped);
+if (!paperQuestionTotal(questions)) questions = attachTextQuestions(extractQuestions());
+return dedupePaperQuestions(questions || []);
+}
+
+function quizPaperExpected(questions) {
+const paperBody = paperDoc(questions)?.body || null;
+if (!paperBody) return { paperBody: null, expectedTotal: null };
+let text = '';
+try { text = clean(paperBody.innerText); } catch (_) { text = ''; }
+const countText = text.match(/题量\s*[:：]\s*(\d+)/);
+return { paperBody, expectedTotal: countText ? Number(countText[1]) : quizHeadingTotal(paperBody) };
+}
+
+// 找到了提交按钮、题量却对不上时，把“识别到几题 / 卷面几题 / 分节和输入框情况”打出来，
+// 这样下次卡住时控制台就能直接看出是缺了哪一类题，而不是干等一个不会出现的“重做”入口
+let quizPaperGapKey = '';
+function reportQuizPaperGap(questions, expectedTotal) {
+const total = paperQuestionTotal(questions);
+const key = `${total}:${expectedTotal || 0}`;
+if (key === quizPaperGapKey) return;
+quizPaperGapKey = key;
+if (!total) {
+console.warn('%c卷面识别：找到了“提交”按钮，但页面上暂时没识别到题目，先不交卷', 'color:#FF9800');
+return;
+}
+let detail = '';
+try {
+const info = typeof quizPaperSnapshot === 'function' ? quizPaperSnapshot(paperDoc(questions)?.body) : null;
+if (info && typeof describeQuizPaper === 'function') detail = describeQuizPaper(info);
+} catch (_) { detail = ''; }
+console.warn(`%c卷面识别：找到“提交”按钮，识别到 ${total} 题，卷面标注 ${expectedTotal ? `${expectedTotal} 题` : '题量未知'}${detail ? `（${detail}）` : ''}，先不交卷，等页面渲染完再核对`, 'color:#FF9800');
+}
+
 // 点掉提示框后，平台要么跳到成绩页（带对错标记和“重做”按钮），要么直接回到可作答的试卷。
 // 试卷是异步渲染的：题目数量要稳定两次、并且和“题量：N”对得上，才算真的能作答，
 // 否则会只填到半份卷子就交，被平台以“未作答”拒掉
 let quizPaperStable = { signature: '', count: 0 };
 function editableQuizPaper() {
-const hasSubmit = courseDocuments().some((doc) => findQuizSubmit(doc));
-if (!hasSubmit) {
+const submitDoc = quizSubmitDoc();
+if (!submitDoc) {
 quizPaperStable = { signature: '', count: 0 };
 return null;
 }
-const questions = attachTextQuestions(extractQuestions());
+const questions = quizPaperCandidates(submitDoc);
 const total = paperQuestionTotal(questions);
 if (!total) {
 quizPaperStable = { signature: '', count: 0 };
 return null;
 }
-const paperBody = paperDoc(questions)?.body;
-const countText = clean(paperBody?.innerText).match(/题量\s*[:：]\s*(\d+)/);
-const expectedTotal = countText ? Number(countText[1]) : quizHeadingTotal(paperBody);
+const { expectedTotal } = quizPaperExpected(questions);
 if (expectedTotal && expectedTotal !== total) {
 quizPaperStable = { signature: '', count: 0 };
+reportQuizPaperGap(questions, expectedTotal);
 return null;
 }
 const textSignature = (questions.textQuestions || [])
@@ -4129,16 +4245,17 @@ return questions;
 // runQuizRedo 开头的“有没有重做入口”判断必须用它：成绩页刚变成可作答试卷时，
 // 稳定计数还是 0，用 editableQuizPaper() 会误判成“没有重做入口”，然后开始跳节死循环。
 function quizPaperAnswerable() {
-const submitDoc = courseDocuments().find((doc) => findQuizSubmit(doc));
+const submitDoc = quizSubmitDoc();
 if (!submitDoc) return null;
-const questions = attachTextQuestions(extractQuestions());
+const questions = quizPaperCandidates(submitDoc);
 const total = paperQuestionTotal(questions);
 if (!total) return null;
-const paperBody = paperDoc(questions)?.body;
+const { paperBody, expectedTotal } = quizPaperExpected(questions);
 if (!paperBody) return null;
-const countText = clean(paperBody.innerText).match(/题量\s*[:：]\s*(\d+)/);
-const expectedTotal = countText ? Number(countText[1]) : quizHeadingTotal(paperBody);
-if (expectedTotal && expectedTotal !== total) return null;
+if (expectedTotal && expectedTotal !== total) {
+reportQuizPaperGap(questions, expectedTotal);
+return null;
+}
 return questions;
 }
 
@@ -4158,7 +4275,7 @@ if (stable >= 1) return paper;
 stable = 0;
 previous = '';
 }
-const doc = courseDocuments().find((item) => findQuizSubmit(item));
+const doc = quizSubmitDoc();
 if (doc) await nudgeQuizScroll(doc);
 await sleep(500);
 }
@@ -4781,8 +4898,12 @@ await goToNextStep();
 return;
 }
 // 成绩未达标、页面停在“请重做”/提示框/上次的成绩页上：接着重做，
-// 不能点“下一节”去撞“任务点未完成”弹窗，也不能把成绩页当成新测验再答一遍
-if (quizFailureShown() && (findQuizRedoButton() || quizFailureDialog() || quizPageGraded())) {
+// 不能点“下一节”去撞“任务点未完成”弹窗，也不能把成绩页当成新测验再答一遍。
+// 但如果平台已经把页面原地变回一份带“提交”按钮、题目齐全、填空能填的试卷（上次的答案
+// 还标着对错），那就是“改答案重交”，直接走正常作答，别去等一个永远不会出现的“重做”入口
+const earlyPaper = quizPaperAnswerable();
+if (earlyPaper) console.log('%c成绩页已经变成可重新作答的试卷，直接改答案重交', 'color:#FF9800');
+if (!earlyPaper && quizFailureShown() && (findQuizRedoButton() || quizFailureDialog() || quizPageGraded())) {
 console.log('%c这一节的测验成绩未达标，准备重做', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'memory') {
@@ -4880,8 +5001,9 @@ await goToNextStep();
 return;
 }
 // 等题目的过程中平台弹出了“未达到及格线，请重做”：这份卷子其实是上一次的成绩页，
-// 每题还带着对错标记，不能再当成新测验作答——交给重做流程换答案
-if (quizFailureShown() && quizPageGraded(questions)) {
+// 每题还带着对错标记，不能再当成新测验作答——交给重做流程换答案。
+// 除非页面本身就是一份能重新作答的完整试卷（有提交按钮、题目齐全），那种直接改答案重交
+if (quizFailureShown() && quizPageGraded(questions) && !quizPaperAnswerable()) {
 console.log('%c这一节显示的是上一次的成绩页，转入重做流程', 'color:#FF9800');
 const redoStatus = await runQuizRedo('成绩未达到及格线');
 if (redoStatus === 'memory') {
@@ -4924,8 +5046,9 @@ if (expectedTotal && expectedTotal !== paperTotal)
 throw new Error(`页面显示 ${expectedTotal} 道题，脚本只识别 ${paperTotal} 道，已停止提交，避免只答一部分`);
 const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}`).join('|');
 const signature = questions.map((q) => `${q.kind}:${q.title}`).join('|') + (textSignature ? `|${textSignature}` : '');
-// 重做流程自己会换答案再交，不算“重复提交同一份答案”
-if (attemptedQuizzes.has(signature) && !quizRedoActive) throw new Error('本次测验已尝试过，已停止重复提交');
+// 重做流程自己会换答案再交，不算“重复提交同一份答案”；
+// 成绩未达标后平台原地还给一份可作答试卷时，改答案重交也属于正常重做
+if (attemptedQuizzes.has(signature) && !quizRedoActive && !quizFailureShown()) throw new Error('本次测验已尝试过，已停止重复提交');
 console.log(`识别到 ${paperTotal} 道题${textQuestions.length ? `（选择 ${questions.length} 道，填空/简答 ${textQuestions.length} 道）` : ''}，正在调用 DeepSeek`);
 const answers = questions.length ? validateAnswers(questions, await askDeepSeek(questions)) : new Map();
 const textAnswers = textQuestions.length ? validateTextAnswers(textQuestions, await askDeepSeekText(textQuestions)) : new Map();
@@ -4933,6 +5056,8 @@ console.table([
 ...questions.map((q, i) => ({ 题号: i + 1, 题型: q.kind, 选择: (answers.get(i + 1) || []).join(''), 填空: '' })),
 ...textQuestions.map((q, i) => ({ 题号: questions.length + i + 1, 题型: q.kind, 选择: '', 填空: (textAnswers.get(i + 1) || []).join(' / ') })),
 ]);
+// 平台把上一次的作答留在卷面上时，先清掉已勾选项：多选改答案只点新选项会把旧选项也带上
+if (quizFailureShown()) await clearQuizSelections(questions);
 await selectAnswers(questions, answers);
 await fillTextAnswers(textQuestions, textAnswers);
 quizAnswered = true;

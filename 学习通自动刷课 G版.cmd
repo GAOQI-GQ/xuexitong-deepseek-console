@@ -73,7 +73,7 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
             response_format: { type: 'json_object' },
             ...settings,
             messages: [
-                { role: 'system', content: '按题意回答全部题目。注意：题干或选项可能经过网页防复制处理，出现个别汉字被替换、插入无关字，或词语看起来不通顺。先结合上下文和选项在内部还原最可能的原句，再按还原后的题意作答；不要把明显异常的替换字当作专业术语，也不要因无法逐字还原而放弃。每题都必须给非空答案，只用该题提供的选项字母且不可重复；单选和判断选一个，多选列出所有正确项。不确定时选最可能的答案。id须对应题号。只输出JSON：{"answers":[{"id":1,"letters":["A"]}]}。' },
+                { role: 'system', content: '按题意回答全部题目。注意：题干或选项可能经过网页防复制处理，出现个别汉字被替换、插入无关字，或词语看起来不通顺。先结合上下文和选项在内部还原最可能的原句，再按还原后的题意作答；不要把明显异常的替换字当作专业术语，也不要因无法逐字还原而放弃。每题都必须作答：带 options 的选择题只用该题提供的选项字母且不可重复，单选和判断选一个，多选列出所有正确项，放在 letters 里；带 blanks 的填空题/简答题不用字母，按空的数量依次给出文字答案，放在 texts 里，texts 的数量必须等于 blanks，简答/论述/名词解释题给一段完整、简洁的作答。不确定时选最可能的答案。id须对应题号。只输出JSON：{"answers":[{"id":1,"letters":["A"]},{"id":2,"texts":["答案一","答案二"]}]}。' },
                 { role: 'user', content: JSON.stringify(questions) },
             ],
         };
@@ -2064,6 +2064,157 @@ questions.push({ kind, title, options, card, doc });
 return questions;
 }
 
+// —— 填空题/简答题 ——
+// 这两类题没有选项，靠“输入框”识别。卷面上不一定每题都带【填空题】标签，
+// 所以先按标签找，再按“输入框 + 题干”兜底找，两边用同一批输入框去重。
+const TEXT_KINDS_SOURCE = '填空题|简答题|论述题|名词解释';
+const textKindPattern = new RegExp(`[\\[【](${TEXT_KINDS_SOURCE})[\\]】]`);
+const TEXT_INPUT_SELECTOR = 'input[type="text"],input[type="search"],input:not([type]),textarea,[contenteditable="true"]';
+
+function fillableElements(root) {
+if (!root || typeof root.querySelectorAll !== 'function') return [];
+let list = [];
+try { list = Array.from(root.querySelectorAll(TEXT_INPUT_SELECTOR)); } catch (_) { return []; }
+return list.filter((el) => {
+if (!visible(el) || el.disabled || el.readOnly === true) return false;
+if (el.tagName === 'INPUT') {
+const type = String(el.type || '').toLowerCase();
+if (type && type !== 'text' && type !== 'search') return false;
+}
+return true;
+});
+}
+
+function textQuestionTitle(card, kind) {
+let text = '';
+try { text = clean(card.innerText || card.textContent); } catch (_) { return ''; }
+return text
+.replace(textKindPattern, '')
+.replace(/^\s*\d+\s*[.、．:：]?\s*/, '')
+.trim()
+.slice(0, 1000);
+}
+
+function isQuizTextDocument(doc) {
+let bodyText = '';
+try { bodyText = clean(doc.body.innerText || doc.body.textContent); } catch (_) { return false; }
+if (/题量\s*[:：]\s*\d+/.test(bodyText)) return true;
+if (/我的答案\s*[：:]|正确答案\s*[：:]/.test(bodyText)) return true;
+try { return Boolean(findQuizSubmit(doc)); } catch (_) { return false; }
+}
+
+// 输入框所在的题号容器：从输入框往上找，跳过只有“第1空：”这种标签的小盒子
+function textQuestionCardFor(input) {
+let card = input.parentElement;
+for (let depth = 0; card && depth < 8; card = card.parentElement) {
+const doc = input.ownerDocument;
+if (!doc || card === doc.body) break;
+let inputs = [];
+try { inputs = fillableElements(card); } catch (_) { inputs = []; }
+if (inputs.length > 12) return null;
+if (inputs.length && optionElements(card).length < 2) {
+let text = '';
+try { text = clean(card.innerText); } catch (_) { text = ''; }
+const questionMarks = (text.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length;
+if (questionMarks <= 1 && text.length >= 6) return card;
+}
+}
+return null;
+}
+
+function taggedTextQuestions(doc, usedInputs) {
+const found = [];
+const seenCards = new Set();
+const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+let node;
+while ((node = walker.nextNode())) {
+const match = clean(node.textContent).match(textKindPattern);
+if (!match || !visible(node.parentElement)) continue;
+const kind = match[1];
+let card = node.parentElement;
+let chosen = null;
+let blanks = [];
+for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
+let cardText = '';
+try { cardText = clean(card.innerText); } catch (_) { cardText = ''; }
+const kinds = cardText.match(new RegExp(textKindPattern.source, 'g')) || [];
+if (kinds.length > 1) break;
+if (optionElements(card).length >= 2) break;
+const inputs = fillableElements(card);
+if (!inputs.length) continue;
+if (inputs.length > 12) break;
+chosen = card;
+blanks = inputs;
+break;
+}
+if (!chosen || seenCards.has(chosen)) continue;
+seenCards.add(chosen);
+const title = textQuestionTitle(chosen, kind);
+if (!title) continue;
+found.push({ kind, title, blanks, card: chosen, doc });
+for (const input of blanks) usedInputs.add(input);
+}
+return found;
+}
+
+function untaggedTextQuestions(doc, usedInputs) {
+const found = [];
+const seenCards = new Set();
+for (const input of fillableElements(doc.body)) {
+if (usedInputs.has(input)) continue;
+const card = textQuestionCardFor(input);
+if (!card || seenCards.has(card)) continue;
+seenCards.add(card);
+const blanks = fillableElements(card);
+const longForm = blanks.some((el) => el.tagName === 'TEXTAREA' ||
+el.getAttribute('contenteditable') === 'true' || el.isContentEditable);
+const kind = longForm ? '简答题' : '填空题';
+const title = textQuestionTitle(card, kind);
+if (!title) continue;
+found.push({ kind, title, blanks, card, doc });
+for (const blank of blanks) usedInputs.add(blank);
+}
+return found;
+}
+
+function extractTextQuestions() {
+const questions = [];
+for (const doc of courseDocuments()) {
+if (!doc.body || !isQuizTextDocument(doc)) continue;
+const usedInputs = new Set();
+try { questions.push(...taggedTextQuestions(doc, usedInputs)); } catch (_) { /* 忽略 */ }
+try { questions.push(...untaggedTextQuestions(doc, usedInputs)); } catch (_) { /* 忽略 */ }
+}
+return questions;
+}
+
+// 选择题数组上挂一份 textQuestions，交卷/计数/重做都按“选择题 + 填空简答”合计
+function attachTextQuestions(questions) {
+const list = Array.isArray(questions) ? questions : [];
+let textQuestions = [];
+try { textQuestions = extractTextQuestions(); } catch (_) { textQuestions = []; }
+if (list.length) textQuestions = textQuestions.filter((question) => question.doc === list[0].doc);
+if (textQuestions.length) list.textQuestions = textQuestions;
+else delete list.textQuestions;
+return list;
+}
+
+function paperQuestions(questions) {
+const list = Array.isArray(questions) ? questions.slice() : [];
+if (questions && Array.isArray(questions.textQuestions)) list.push(...questions.textQuestions);
+return list;
+}
+
+function paperQuestionTotal(questions) {
+return (Array.isArray(questions) ? questions.length : 0) +
+(questions && Array.isArray(questions.textQuestions) ? questions.textQuestions.length : 0);
+}
+
+function paperDoc(questions) {
+const list = paperQuestions(questions);
+return list.length ? list[0].doc : null;
+}
+
 // loose：平台按钮文字可能带空格、换行或多个图标子节点，去掉空白再比更稳
 function findButton(doc, label, loose) {
 const compact = (value) => (loose ? clean(value).replace(/\s+/g, '') : clean(value));
@@ -2265,7 +2416,7 @@ const parts = [];
 if (info.headings.length) {
 parts.push(`分节：${info.headings.map((item) => `${item.label}${item.count ? `×${item.count}` : ''}`).join('、')}`);
 }
-if (info.textInputs) parts.push(`填空/简答输入框 ${info.textInputs} 个（脚本不自动作答）`);
+if (info.textInputs) parts.push(`填空/简答输入框 ${info.textInputs} 个`);
 if (info.pager) parts.push('卷面有分页按钮');
 return parts.join('；');
 }
@@ -2338,11 +2489,15 @@ let stableCount = 0;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
-const questions = extractQuestions();
+const questions = attachTextQuestions(extractQuestions());
+const textQuestions = questions.textQuestions || [];
+const total = questions.length + textQuestions.length;
 const countText = clean(submitDoc.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
 const expected = countText ? Number(countText[1]) : null;
-if (questions.length && (!expected || questions.length === expected)) {
-const signature = questions.map((q) => `${q.kind}:${q.title}:${q.options.length}`).join('|');
+if (total && (!expected || total === expected)) {
+const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}:${q.blanks.length}`).join('|');
+const signature = questions.map((q) => `${q.kind}:${q.title}:${q.options.length}`).join('|') +
+(textSignature ? `|${textSignature}` : '');
 stableCount = signature === previousSignature ? stableCount + 1 : 0;
 previousSignature = signature;
 if (stableCount >= 3) return questions;
@@ -2356,7 +2511,8 @@ if (attempt > 0 && attempt % 30 === 0) {
 const info = quizPaperSnapshot(submitDoc);
 const extra = describeQuizPaper(info);
 const expectedText = expected ? `，卷面写着题量 ${expected} 道` : '';
-console.log(`测验题目仍在加载，已等待 ${attempt / 2} 秒；当前识别 ${questions.length} 道${expectedText}${extra ? `；${extra}` : ''}`);
+const split = textQuestions.length ? `（选择 ${questions.length} 道，填空/简答 ${textQuestions.length} 道）` : '';
+console.log(`测验题目仍在加载，已等待 ${attempt / 2} 秒；当前识别 ${total} 道${split}${expectedText}${extra ? `；${extra}` : ''}`);
 }
 await sleep(500);
 }
@@ -2373,6 +2529,22 @@ options: q.options.map((o) => ({ letter: o.letter, text: o.text })),
 }));
 // 只打印字符串，不把对象交给控制台：长时间开着的页面会被 DevTools 留着不放，越积越多
 console.log(`本次发送给 DeepSeek 的题干和选项：${JSON.stringify(payload)}`);
+return requestDeepSeekAnswers(payload);
+}
+
+// 填空题/简答题：没有选项，把“有几个空”告诉 AI，让它按空返回文字答案
+async function askDeepSeekText(textQuestions) {
+const payload = textQuestions.map((q, i) => ({
+id: i + 1,
+type: q.kind,
+question: q.title,
+blanks: Math.max(1, q.blanks.length),
+}));
+console.log(`本次发送给 DeepSeek 的填空题/简答题：${JSON.stringify(payload)}`);
+return requestDeepSeekAnswers(payload);
+}
+
+async function requestDeepSeekAnswers(payload) {
 if (DIRECT_MODE) return PAGE.__deepseekAsk(payload);
 // DeepSeek 上游忙的时候会回 “HTTP 503 Service is too busy”，本地服务再把它包成 502 转发给页面。
 // 以前只重试 429/503，一遇到 502 就当作致命错误，整节测验停在原地。现在所有 5xx、429 和网络抖动
@@ -2434,6 +2606,24 @@ result.set(item.id, letters);
 return result;
 }
 
+function validateTextAnswers(textQuestions, answers) {
+if (!Array.isArray(answers) || answers.length !== textQuestions.length) throw new Error('AI 返回的填空/简答题数量不匹配');
+const result = new Map();
+for (const item of answers) {
+if (!Number.isInteger(item.id) || result.has(item.id) || !Array.isArray(item.texts))
+throw new Error('AI 返回的填空/简答答案格式错误');
+const q = textQuestions[item.id - 1];
+if (!q) throw new Error('AI 返回未知题号');
+const texts = item.texts.map((value) => clean(value));
+if (texts.length !== q.blanks.length)
+throw new Error(`第 ${item.id} 道${q.kind}有 ${q.blanks.length} 个空，AI 返回了 ${texts.length} 个答案，已停止提交`);
+if (texts.some((value) => !value)) throw new Error(`第 ${item.id} 道${q.kind} AI 未给出完整答案，已停止提交`);
+if (texts.some((value) => value.length > 300)) throw new Error(`第 ${item.id} 道${q.kind} AI 答案过长，已停止提交`);
+result.set(item.id, texts);
+}
+return result;
+}
+
 async function selectAnswers(questions, answers) {
 for (let i = 0; i < questions.length; i++) {
 const q = questions[i];
@@ -2479,6 +2669,87 @@ break;
 if (before === after && !checked) throw new Error(`第 ${i + 1} 题 ${letter} 选项未确认选中，已停止提交`);
 }
 }
+}
+
+// 直接改 value 在很多前端框架里不会触发绑定：用原生 setter + input/change 事件模拟真实输入
+function setNativeInputValue(el, value) {
+const doc = el.ownerDocument;
+const win = doc && doc.defaultView;
+const proto = el.tagName === 'TEXTAREA'
+? (win && win.HTMLTextAreaElement && win.HTMLTextAreaElement.prototype)
+: (win && win.HTMLInputElement && win.HTMLInputElement.prototype);
+const descriptor = proto && Object.getOwnPropertyDescriptor(proto, 'value');
+if (descriptor && typeof descriptor.set === 'function') descriptor.set.call(el, value);
+else el.value = value;
+}
+
+function dispatchTextEvent(el, type) {
+try {
+const doc = el.ownerDocument;
+const win = doc && doc.defaultView;
+const event = new (win && win.Event ? win.Event : Event)(type, { bubbles: true });
+el.dispatchEvent(event);
+} catch (_) { /* 忽略 */ }
+}
+
+function blankValueOf(el) {
+if (el.getAttribute && el.getAttribute('contenteditable') === 'true' || el.isContentEditable) {
+try { return clean(el.textContent); } catch (_) { return ''; }
+}
+return clean(el.value);
+}
+
+async function writeTextBlank(el, value) {
+if (stopped) throw new Error('脚本已停止');
+try { el.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+try { el.focus(); } catch (_) { /* 忽略 */ }
+if (el.getAttribute && (el.getAttribute('contenteditable') === 'true' || el.isContentEditable)) {
+el.textContent = value;
+} else {
+setNativeInputValue(el, value);
+}
+dispatchTextEvent(el, 'input');
+dispatchTextEvent(el, 'change');
+dispatchTextEvent(el, 'keyup');
+try { el.blur(); } catch (_) { /* 忽略 */ }
+await sleep(120);
+}
+
+// 按空顺序把答案填进卷面；填完复查一遍，框架重建导致没填上的再补一次
+async function fillTextAnswers(textQuestions, answers) {
+if (!Array.isArray(textQuestions) || !textQuestions.length) return;
+const wanted = [];
+textQuestions.forEach((question, index) => {
+const values = answers.get(index + 1) || [];
+const blanks = fillableElements(question.card);
+if (blanks.length !== question.blanks.length) {
+throw new Error(`第 ${index + 1} 道${question.kind}的输入框数量变了（${question.blanks.length} → ${blanks.length}），已停止提交`);
+}
+question.blanks = blanks;
+wanted.push({ question, values });
+});
+for (const item of wanted) {
+for (let i = 0; i < item.question.blanks.length; i++) {
+await writeTextBlank(item.question.blanks[i], item.values[i] || '');
+}
+}
+await sleep(250);
+// 复查：某个空被平台清掉时重填一次；仍然清掉说明页面不接受输入，停止提交
+const missing = [];
+for (const item of wanted) {
+for (let i = 0; i < item.question.blanks.length; i++) {
+const value = item.values[i] || '';
+if (blankValueOf(item.question.blanks[i]) !== value) missing.push({ el: item.question.blanks[i], value });
+}
+}
+if (!missing.length) return;
+console.warn(`%c有 ${missing.length} 个填空没写进去，正在重填`, 'color:#FF9800');
+for (const item of missing) {
+await writeTextBlank(item.el, item.value);
+}
+await sleep(250);
+const stillMissing = missing.filter((item) => blankValueOf(item.el) !== item.value);
+if (stillMissing.length) throw new Error(`有 ${stillMissing.length} 个填空没写进去（页面可能不接受自动输入），已停止提交`);
 }
 
 async function confirmSubmitDialog() {
@@ -2671,10 +2942,16 @@ console.error('切换下一学习步骤失败:', error);
 };
 
 app.inspectQuiz = function () {
-return extractQuestions().map((q, i) => ({
+const questions = attachTextQuestions(extractQuestions());
+return [
+...questions.map((q, i) => ({
 id: i + 1, type: q.kind, question: q.title,
 options: q.options.map((o) => `${o.letter}. ${o.text}`),
-}));
+})),
+...(questions.textQuestions || []).map((q, i) => ({
+id: questions.length + i + 1, type: q.kind, question: q.title, blanks: q.blanks.length,
+})),
+];
 };
 
 // 诊断用：列出页面里所有视频（包括隐藏的）和所在框架，便于排查多视频页面
@@ -2751,6 +3028,9 @@ console.error('跳过没法作答的小节时出错:', error);
 // 先读结果页每题的对错，答对的照抄、答错的换一个（页面给了正确答案就直接用），点“重做”再交，
 // 直到通过或次数用完。AI 会答错，所以每答错一次就排除一个答案，靠排除法也能全对。
 const quizAnswerMemory = new Map();
+// 填空题/简答题的答案：AI 给过的原样保存（重做时不用再问一遍），
+// 结果页给出“正确答案”时直接换成正确答案
+const quizTextMemory = new Map();
 let quizRedoActive = false;
 
 // 重做循环会在同一张试卷上反复提交。平台的每次交卷都会重建一大块页面，
@@ -3154,17 +3434,22 @@ if (!hasSubmit) {
 quizPaperStable = { signature: '', count: 0 };
 return null;
 }
-const questions = extractQuestions();
-if (!questions.length) {
+const questions = attachTextQuestions(extractQuestions());
+const total = paperQuestionTotal(questions);
+if (!total) {
 quizPaperStable = { signature: '', count: 0 };
 return null;
 }
-const countText = clean(questions[0].doc?.body?.innerText).match(/题量\s*[:：]\s*(\d+)/);
-if (countText && Number(countText[1]) !== questions.length) {
+const paperBody = paperDoc(questions)?.body;
+const countText = clean(paperBody?.innerText).match(/题量\s*[:：]\s*(\d+)/);
+if (countText && Number(countText[1]) !== total) {
 quizPaperStable = { signature: '', count: 0 };
 return null;
 }
-const signature = questions.map((question) => `${question.kind}:${question.title}:${question.options.length}`).join('|');
+const textSignature = (questions.textQuestions || [])
+.map((question) => `${question.kind}:${question.title}:${question.blanks.length}`).join('|');
+const signature = questions.map((question) => `${question.kind}:${question.title}:${question.options.length}`).join('|') +
+(textSignature ? `|${textSignature}` : '');
 if (signature === quizPaperStable.signature) quizPaperStable.count += 1;
 else quizPaperStable = { signature, count: 1 };
 if (quizPaperStable.count < 2) return null;
@@ -3299,6 +3584,76 @@ quizAnswerMemory.set(key, mem);
 });
 }
 
+// 把“正确答案：甲；乙”这类文字拆成每空的答案；拆不开就当作没读到，不乱改
+function splitTextAnswer(text, count) {
+const value = clean(text);
+if (!value) return [];
+if (count <= 1) return [value];
+const parts = value.split(/\s*[；;|｜]\s*/).map((part) => clean(part)).filter(Boolean);
+return parts.length === count ? parts : [];
+}
+
+// 填空题/简答题怎么答：结果页给过正确答案就直接用，否则沿用 AI 上一次给的，再没有才问 AI
+async function chooseTextAnswers(textQuestions) {
+const answers = new Map();
+const pending = [];
+textQuestions.forEach((question, index) => {
+const mem = quizTextMemory.get(quizQuestionKey(question)) || {};
+if (Array.isArray(mem.correct) && mem.correct.length === question.blanks.length) {
+answers.set(index + 1, [...mem.correct]);
+return;
+}
+if (Array.isArray(mem.last) && mem.last.length === question.blanks.length) {
+answers.set(index + 1, [...mem.last]);
+return;
+}
+pending.push({ index, question });
+});
+if (pending.length) {
+const got = validateTextAnswers(pending.map((item) => item.question), await askDeepSeekText(pending.map((item) => item.question)));
+pending.forEach((item, position) => {
+const values = got.get(position + 1);
+answers.set(item.index + 1, values);
+const key = quizQuestionKey(item.question);
+const mem = quizTextMemory.get(key) || {};
+mem.last = [...values];
+quizTextMemory.set(key, mem);
+});
+}
+return answers;
+}
+
+// 结果页上填空题/简答题的“我的答案 / 正确答案”
+function recordQuizTextOutcome() {
+let recorded = 0;
+for (const question of extractTextQuestions()) {
+let cardText = '';
+try { cardText = clean(question.card.innerText); } catch (_) { continue; }
+const correct = cardText.match(/正确答案\s*[：:]\s*([\s\S]*?)(?=\s*(?:我的答案|答案解析|得分|回答正确|回答错误)\s*[：:]?|$)/);
+const mine = cardText.match(/我的答案\s*[：:]\s*([\s\S]*?)(?=\s*正确答案\s*[：:]|$)/);
+const key = quizQuestionKey(question);
+const mem = quizTextMemory.get(key) || {};
+let changed = false;
+if (correct) {
+const values = splitTextAnswer(correct[1], question.blanks.length);
+if (values.length) {
+mem.correct = values;
+changed = true;
+recorded++;
+}
+}
+if (mine) {
+const values = splitTextAnswer(mine[1], question.blanks.length);
+if (values.length) {
+mem.last = values;
+changed = true;
+}
+}
+if (changed) quizTextMemory.set(key, mem);
+}
+return recorded;
+}
+
 async function clearQuizSelections(questions) {
 for (const question of questions) {
 try { await clearVideoQuizSelections(question); } catch (_) { /* 忽略 */ }
@@ -3343,7 +3698,13 @@ if (!failedText && quizCompleted()) return { failed: false };
 if (attempt % 3 === 0) {
 const outcome = extractQuestions().map((question) => quizCardOutcome(question.card));
 const judged = outcome.filter((item) => item.wrong || item.right);
-if (judged.length && judged.length === outcome.length) return { failed: outcome.some((item) => item.wrong) };
+// 有填空题/简答题时，等它们也判完再下结论，别只看选择题就判“全部判完”
+const textJudged = extractTextQuestions().every((question) => {
+let cardText = '';
+try { cardText = clean(question.card.innerText); } catch (_) { return false; }
+return /我的答案\s*[：:]|回答正确|回答错误|正确答案\s*[：:]/.test(cardText);
+});
+if (judged.length && judged.length === outcome.length && textJudged) return { failed: outcome.some((item) => item.wrong) };
 }
 await sleep(500);
 }
@@ -3369,6 +3730,8 @@ app._autoRefresh('章节测验重做时页面内存占用过高');
 return 'memory';
 }
 const answers = await chooseChapterAnswers(questions);
+const textQuestions = questions.textQuestions || [];
+const textAnswers = textQuestions.length ? await chooseTextAnswers(textQuestions) : new Map();
 // 没有“已判对”的题按轮次逐题换答案。不能因为别的题有对错标记就整份原样重交：
 // 只要有一道题被标成“对”，以前就会永远停在同一份答案上，12 轮都在重复交同一份卷子
 const switchable = [];
@@ -3387,7 +3750,8 @@ answers.set(targetIndex + 1, letters);
 console.log(`%c这轮换第 ${targetIndex + 1} 题的答案：${letters.join('')}`, 'color:#2196F3');
 }
 }
-const signatureOf = () => questions.map((question, index) => (answers.get(index + 1) || []).join('')).join('|');
+const signatureOf = () => questions.map((question, index) => (answers.get(index + 1) || []).join('')).join('|') +
+'#' + textQuestions.map((question, index) => (textAnswers.get(index + 1) || []).join('~')).join('|');
 // 换完答案还是和上一轮完全一样（选项全试遍/读数把答案锁死了）：再交一遍不会有任何变化
 if (signatureOf() === lastAnswerSignature) {
 let changed = false;
@@ -3407,11 +3771,15 @@ return 'exhausted';
 }
 }
 lastAnswerSignature = signatureOf();
-console.table(questions.map((question, index) => ({ 题号: index + 1, 题型: question.kind, 选择: (answers.get(index + 1) || []).join('') })));
+console.table([
+...questions.map((question, index) => ({ 题号: index + 1, 题型: question.kind, 选择: (answers.get(index + 1) || []).join(''), 填空: '' })),
+...textQuestions.map((question, index) => ({ 题号: questions.length + index + 1, 题型: question.kind, 选择: '', 填空: (textAnswers.get(index + 1) || []).join(' / ') })),
+]);
 await clearQuizSelections(questions);
 await selectAnswers(questions, answers);
+await fillTextAnswers(textQuestions, textAnswers);
 rememberQuizTried(questions, answers);
-await submitQuiz(questions[0].doc);
+await submitQuiz(paperDoc(questions));
 const result = await waitForQuizResult();
 return result.failed ? 'failed' : 'passed';
 };
@@ -3423,6 +3791,7 @@ await dismissQuizFailureDialog();
 await waitForQuizRedoReady();
 }
 recordQuizOutcome();
+recordQuizTextOutcome();
 const retry = findQuizRedoButton();
 if (retry) {
 console.warn(`%c${reason}，点击“重做”重新作答（第 ${attempt} 次）`, 'color:#FF9800');
@@ -3674,22 +4043,32 @@ await goToNextStep();
 }
 return;
 }
-if (questions.length > 30) throw new Error('题目数量超过 30，已停止自动提交');
-const docs = new Set(questions.map((q) => q.doc));
+const textQuestions = questions.textQuestions || [];
+const paperTotal = questions.length + textQuestions.length;
+if (paperTotal > 30) throw new Error('题目数量超过 30，已停止自动提交');
+const paperList = paperQuestions(questions);
+const docs = new Set(paperList.map((q) => q.doc));
 if (docs.size !== 1) throw new Error('题目跨多个框架，已停止自动提交');
-const countText = clean(questions[0].doc.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
-if (countText && Number(countText[1]) !== questions.length)
-throw new Error(`页面显示 ${countText[1]} 道题，脚本只识别 ${questions.length} 道，已停止提交`);
-const signature = questions.map((q) => `${q.kind}:${q.title}`).join('|');
+const paperDocument = paperDoc(questions);
+const countText = clean(paperDocument.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
+if (countText && Number(countText[1]) !== paperTotal)
+throw new Error(`页面显示 ${countText[1]} 道题，脚本只识别 ${paperTotal} 道，已停止提交`);
+const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}`).join('|');
+const signature = questions.map((q) => `${q.kind}:${q.title}`).join('|') + (textSignature ? `|${textSignature}` : '');
 // 重做流程自己会换答案再交，不算“重复提交同一份答案”
 if (attemptedQuizzes.has(signature) && !quizRedoActive) throw new Error('本次测验已尝试过，已停止重复提交');
-console.log(`识别到 ${questions.length} 道题，正在调用 DeepSeek`);
-const answers = validateAnswers(questions, await askDeepSeek(questions));
-console.table(questions.map((q, i) => ({ 题号: i + 1, 题型: q.kind, 选择: answers.get(i + 1).join('') })));
+console.log(`识别到 ${paperTotal} 道题${textQuestions.length ? `（选择 ${questions.length} 道，填空/简答 ${textQuestions.length} 道）` : ''}，正在调用 DeepSeek`);
+const answers = questions.length ? validateAnswers(questions, await askDeepSeek(questions)) : new Map();
+const textAnswers = textQuestions.length ? validateTextAnswers(textQuestions, await askDeepSeekText(textQuestions)) : new Map();
+console.table([
+...questions.map((q, i) => ({ 题号: i + 1, 题型: q.kind, 选择: (answers.get(i + 1) || []).join(''), 填空: '' })),
+...textQuestions.map((q, i) => ({ 题号: questions.length + i + 1, 题型: q.kind, 选择: '', 填空: (textAnswers.get(i + 1) || []).join(' / ') })),
+]);
 await selectAnswers(questions, answers);
+await fillTextAnswers(textQuestions, textAnswers);
 quizAnswered = true;
 attemptedQuizzes.add(signature);
-await submitQuiz(questions[0].doc);
+await submitQuiz(paperDocument);
 // 交卷后先看结果：平台要求满分时，不合格就重做，别急着点“下一节”
 const quizResult = await waitForQuizResult();
 if (quizResult.failed) {
@@ -4483,8 +4862,25 @@ stale = staleVideoQuizSelections(question, letters);
 return stale;
 }
 
+// 章节测验页面上也有“提交”按钮，findVideoQuizCard 会把整张试卷当成弹题卡片。
+// 卷面上明确写着“题量：N”，或出现两道以上题型标签时，一律不按弹题处理，
+// 否则弹题流程会只选一题的答案就点提交，把整份测验提前交掉。
+function looksLikeChapterQuizPaper(question) {
+try {
+if (!question) return false;
+if (typeof app._isChapterTest === 'function' && app._isChapterTest()) return true;
+const doc = question.doc || (question.card && question.card.ownerDocument);
+if (!doc || !doc.body) return false;
+let text = '';
+try { text = clean(doc.body.innerText); } catch (_) { return false; }
+if (/题量\s*[:：]\s*\d+/.test(text)) return true;
+const kinds = text.match(/[\[【](单选题|多选题|判断题|填空题|简答题|论述题|名词解释)[\]】]/g) || [];
+return kinds.length >= 2;
+} catch (_) { return false; }
+}
+
 async function handleVideoQuiz() {
-if (stopped || videoQuizBusy || app._isChapterTest()) return;
+if (stopped || videoQuizBusy || quizBusy || app._isChapterTest()) return;
 if (videoQuizSuccessVisible()) {
 app._videoQuizPending = true;
 if (!clickVideoQuizContinue() && !findVideoQuizContinueButton() && Date.now() - videoQuizDiagAt > 10000) {
@@ -4524,6 +4920,13 @@ activeVideoQuiz = null;
 videoQuizStuckSince = 0;
 app._videoQuizPending = false;
 }
+return;
+}
+// 找到的“弹题卡片”其实是章节测验试卷：立刻退出，把作答交给章节测验流程
+if (looksLikeChapterQuizPaper(question)) {
+activeVideoQuiz = null;
+videoQuizStuckSince = 0;
+app._videoQuizPending = false;
 return;
 }
 activeVideoQuiz = question;

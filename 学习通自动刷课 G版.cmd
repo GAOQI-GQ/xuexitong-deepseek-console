@@ -126,7 +126,7 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
 
 // 页面长时间没有进展时，把页面文字和可点元素发给模型，让它选一个能继续学习的动作。
 // 注意：DeepSeek 的对话接口只收文字，不收截图，所以这里传的是“页面内容识别结果”，不是图片像素。
-const ACTION_SYSTEM_PROMPT = '你是“学习通”网课自动学习脚本的页面恢复助手。脚本在一张页面上长时间没有任何进展，需要你根据页面文字和可点元素，选出一个最可能让学习继续下去的操作。只能从以下动作里选一个：{"action":"click","id":编号,"reason":"简短理由"} 点击编号对应的元素；{"action":"scroll","reason":"简短理由"} 页面下方可能还有没加载出来的内容；{"action":"next","reason":"简短理由"} 当前小节确实无法继续，跳到下一节；{"action":"wait","reason":"简短理由"} 还需要等页面加载；{"action":"skip","reason":"简短理由"} 当前小节无法自动完成，跳过。优先选“重做、重新作答、继续学习、开始答题、下一题、确定、关闭、去学习”这类能让流程继续的元素；页面内容明显没显示完时选 scroll；确实无法继续才选 next 或 skip。禁止选择“交卷、提交、删除、清空、退出”类元素。id 必须是 controls 里存在的编号。不确定时选 wait。只输出 JSON，不要输出其它文字。';
+const ACTION_SYSTEM_PROMPT = '你是“学习通”网课自动学习脚本的页面恢复助手。脚本在一张页面上长时间没有任何进展，需要你根据页面文字和可点元素，选出一个最可能让学习继续下去的操作。只能从以下动作里选一个：{"action":"click","id":编号,"reason":"简短理由"} 点击编号对应的元素；{"action":"scroll","reason":"简短理由"} 页面下方可能还有没加载出来的内容；{"action":"next","reason":"简短理由"} 当前小节确实无法继续，跳到下一节；{"action":"wait","reason":"简短理由"} 还需要等页面加载；{"action":"skip","reason":"简短理由"} 当前小节无法自动完成，跳过。优先选“重做、重新作答、继续学习、开始答题、下一题、确定、关闭、去学习”这类能让流程继续的元素；页面内容明显没显示完时选 scroll；确实无法继续才选 next 或 skip。禁止选择“交卷、提交、删除、清空、退出”类元素。页面上的“未达到及格线，请重做”只是成绩状态文字，不是按钮，不要选它。id 必须是 controls 里存在的编号。不确定时选 wait。只输出 JSON，不要输出其它文字。';
 
 function validAction(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -1011,6 +1011,8 @@ const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 const visible = (el) => Boolean(el && el.isConnected && el.getClientRects().length &&
 el.ownerDocument.defaultView.getComputedStyle(el).visibility !== 'hidden');
 const kindPattern = /[\[【](单选题|多选题|判断题)[\]】]/;
+// 成绩状态文字（“未达到及格线，请重做”）：它不是按钮，既不能点，也不能让 AI 当成入口
+const quizStatusText = /未达到|未达标|不及格|未通过|已提交|已完成/;
 
 function courseDocuments() {
 const result = [];
@@ -2071,6 +2073,39 @@ const match = String(text || '').match(/(?<![A-Za-z])[A-H]\s*[.、．:：]\s*/);
 return (match && match.index > 0 ? text.slice(0, match.index) : text).trim();
 }
 
+// 判断题常见的写法是“正确/错误”“对/错”“√/×”，选项没有 A/B 字母。
+// 按出现顺序映射成 A=正确、B=错误，后面的选答案和 AI 提示都按字母处理。
+function judgeOptionElements(card) {
+const pairs = [['正确', '错误'], ['对', '错'], ['√', '×'], ['是', '否']];
+for (const [yes, no] of pairs) {
+let yesEl = null;
+let noEl = null;
+let nodes = [];
+try { nodes = Array.from(card.querySelectorAll('span,div,label,li,p,b,i,strong,a,button')); } catch (_) { return []; }
+for (const el of nodes) {
+let text = '';
+try { text = clean(el.textContent); } catch (_) { text = ''; }
+if (text !== yes && text !== no) continue;
+if (!visible(el)) continue;
+// 只取最里层：外层容器也带着同一句话
+let innerSame = false;
+try {
+innerSame = Array.from(el.children || []).some((child) => clean(child.textContent) === text);
+} catch (_) { innerSame = false; }
+if (innerSame) continue;
+if (text === yes && !yesEl) yesEl = el;
+if (text === no && !noEl) noEl = el;
+}
+if (yesEl && noEl) {
+return [
+{ letter: 'A', text: yes, element: yesEl },
+{ letter: 'B', text: no, element: noEl },
+];
+}
+}
+return [];
+}
+
 function optionElements(card) {
 const labels = Array.from(card.querySelectorAll('span,div,label,li,p,b,i,strong,a'))
 .filter((el) => letterOf(el) && !Array.from(el.children).some((child) => letterOf(child)));
@@ -2106,6 +2141,9 @@ row = row.parentElement;
 if (text) found.set(letter, { letter, text, element: target });
 }
 if (found.size >= 2) return Array.from(found.values()).sort((a, b) => a.letter.localeCompare(b.letter));
+// 判断题：没有字母，“正确/错误”两个选项
+const judge = judgeOptionElements(card);
+if (judge.length >= 2) return judge;
 const inputs = Array.from(card.querySelectorAll('input[type="radio"],input[type="checkbox"]'));
 if (inputs.length >= 2 && inputs.length <= 8) {
 inputs.forEach((input, index) => {
@@ -2514,6 +2552,15 @@ if (info.pager) parts.push('卷面有分页按钮');
 return parts.join('；');
 }
 
+// 卷面分节标题（“一、单选题（共2题）”）给出的题量之和。没有“题量：N”时用它来对账，
+// 防止只识别出一部分题目就交卷（以前出现过整卷 5 题只答了 1 题就交上去的情况）
+function quizHeadingTotal(docOrBody) {
+const info = quizPaperSnapshot(docOrBody);
+if (!info.headings.length) return null;
+const total = info.headings.reduce((sum, item) => sum + (Number(item.count) || 0), 0);
+return total > 0 ? total : null;
+}
+
 const QUIZ_START_LABELS = ['开始答题', '开始测验', '开始考试', '进入答题', '继续答题', '继续作答'];
 
 async function waitForQuizQuestions() {
@@ -2586,7 +2633,7 @@ const questions = attachTextQuestions(extractQuestions());
 const textQuestions = questions.textQuestions || [];
 const total = questions.length + textQuestions.length;
 const countText = clean(submitDoc.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
-const expected = countText ? Number(countText[1]) : null;
+const expected = countText ? Number(countText[1]) : quizHeadingTotal(submitDoc);
 if (total && (!expected || total === expected)) {
 const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}:${q.blanks.length}`).join('|');
 const signature = questions.map((q) => `${q.kind}:${q.title}:${q.options.length}`).join('|') +
@@ -3141,6 +3188,8 @@ let label = '';
 try { label = clean(el.getAttribute('aria-label') || el.value || el.innerText || el.getAttribute('placeholder') || ''); } catch (_) { label = ''; }
 if (!label || label.length > group.max) continue;
 if (AI_RESCUE_BLOCKED.test(label)) continue;
+// 成绩状态文字（“未达到及格线，请重做”）不是可点入口，别让 AI 去点
+if (quizStatusText.test(label)) continue;
 // 只要最里层的元素：外层容器带同样的文字，点它会点偏
 let hasInner = false;
 try { hasInner = Boolean(el.querySelector('button,a,input,[role="button"],[onclick]')); } catch (_) { hasInner = false; }
@@ -3350,6 +3399,10 @@ const quizAnswerMemory = new Map();
 // 结果页给出“正确答案”时直接换成正确答案
 const quizTextMemory = new Map();
 let quizRedoActive = false;
+// 平台确实不给重做入口的小节：记下来，短时间内不再等入口、整页刷新、点成绩文字，
+// 避免在成绩页上来回打转（成绩页本身没有“重做”按钮时，再找一万次也不会出现）
+const quizNoRedoUntil = new Map();
+const QUIZ_NO_REDO_TTL = 20 * 60 * 1000;
 
 // 重做循环会在同一张试卷上反复提交。平台的每次交卷都会重建一大块页面，
 // 十几轮下来渲染进程内存能涨到几个 G，最后标签页直接 “Out of Memory”。
@@ -3383,6 +3436,22 @@ if (hot) {
 console.warn(`%c页面占用已经很高（JS 堆 ${Math.round(heap / 1048576)} MB，节点 ${nodes} 个），先停止重做，避免标签页崩溃`, 'color:#F44336');
 }
 return hot;
+}
+
+function quizNoRedoKey() {
+try { return activeSectionKey() || activeCatalogLabel() || ''; } catch (_) { return ''; }
+}
+
+function markQuizNoRedo() {
+const key = quizNoRedoKey();
+if (key) quizNoRedoUntil.set(key, Date.now());
+}
+
+function quizNoRedoKnown() {
+const key = quizNoRedoKey();
+if (!key) return false;
+const at = quizNoRedoUntil.get(key) || 0;
+return Boolean(at) && Date.now() - at < QUIZ_NO_REDO_TTL;
 }
 
 // 同一节最多整页刷新一次去重新找“重做”入口；刷新后还是没有就跳过，
@@ -3480,6 +3549,8 @@ let text = '';
 try { text = clean(el.innerText || el.value || '').replace(/\s+/g, ''); } catch (_) { text = ''; }
 if (!text || text.length > 24) continue;
 if (!/重做|重测|重考|重新作答|重新答题/.test(text)) continue;
+// “未达到及格线，请重做”是成绩状态文字，不是按钮：点它不会有任何反应
+if (quizStatusText.test(text)) continue;
 // 弹窗里的文字不是重做入口；真正的入口在弹窗后面
 let inDialog = false;
 try { inDialog = Boolean(el.closest('#popcontent,.layui-layer,.layui-layer-dialog,.el-dialog,.el-message-box,[role="dialog"],[role="alertdialog"]')); } catch (_) { inDialog = false; }
@@ -3806,7 +3877,8 @@ return null;
 }
 const paperBody = paperDoc(questions)?.body;
 const countText = clean(paperBody?.innerText).match(/题量\s*[:：]\s*(\d+)/);
-if (countText && Number(countText[1]) !== total) {
+const expectedTotal = countText ? Number(countText[1]) : quizHeadingTotal(paperBody);
+if (expectedTotal && expectedTotal !== total) {
 quizPaperStable = { signature: '', count: 0 };
 return null;
 }
@@ -4080,6 +4152,12 @@ async function runQuizRedo(reason) {
 if (quizRedoActive) return 'busy';
 quizRedoActive = true;
 try {
+// 这一节刚确认过平台不提供重做入口：别再等入口/刷新/问 AI，直接按“已提交”继续往下学。
+// 页面若又出现了新的可作答试卷或“重做”按钮，说明平台改主意了，照常处理
+if (quizNoRedoKnown() && !findQuizRedoButton() && !editableQuizPaper()) {
+console.warn('%c这一节之前确认过平台没有重做入口，不再重复查找，直接继续下一节', 'color:#FF9800');
+return 'no-retry';
+}
 // 上一轮交上去的答案（每题用“|”拼起来）。只要这轮的答案和上一轮一模一样，
 // 平台就只会原样再判一次不及格，还会白白重建一遍页面——必须拦住。
 let lastAnswerSignature = '';
@@ -4255,7 +4333,9 @@ return 'reloading';
 }
 const candidates = quizEntryCandidates();
 if (candidates.length) console.warn(`%c页面上能点的按钮：${candidates.join('；')}`, 'color:#F44336');
-console.error('%c成绩未达标，但页面上确实没有“重做”按钮也没有可重新作答的试卷', 'color:#F44336');
+console.error('%c成绩未达标，但页面上确实没有“重做”按钮也没有可重新作答的试卷（平台没有提供重做机会），这一节按已提交处理', 'color:#F44336');
+// 记下这一节确实没有重做入口：平台把它带回来时不再重复等 15 秒 + 刷新 + 问 AI
+markQuizNoRedo();
 return 'no-retry';
 }
 console.error('%c章节测验重做 12 次仍未通过：答对的题一直照抄，答错的题已经换遍选项，请手动处理这一节', 'color:#F44336');
@@ -4431,8 +4511,9 @@ const docs = new Set(paperList.map((q) => q.doc));
 if (docs.size !== 1) throw new Error('题目跨多个框架，已停止自动提交');
 const paperDocument = paperDoc(questions);
 const countText = clean(paperDocument.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
-if (countText && Number(countText[1]) !== paperTotal)
-throw new Error(`页面显示 ${countText[1]} 道题，脚本只识别 ${paperTotal} 道，已停止提交`);
+const expectedTotal = countText ? Number(countText[1]) : quizHeadingTotal(paperDocument.body);
+if (expectedTotal && expectedTotal !== paperTotal)
+throw new Error(`页面显示 ${expectedTotal} 道题，脚本只识别 ${paperTotal} 道，已停止提交，避免只答一部分`);
 const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}`).join('|');
 const signature = questions.map((q) => `${q.kind}:${q.title}`).join('|') + (textSignature ? `|${textSignature}` : '');
 // 重做流程自己会换答案再交，不算“重复提交同一份答案”

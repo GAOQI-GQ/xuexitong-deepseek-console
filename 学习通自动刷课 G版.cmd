@@ -2210,20 +2210,106 @@ return questions;
 // 所以先按标签找，再按“输入框 + 题干”兜底找，两边用同一批输入框去重。
 const TEXT_KINDS_SOURCE = '填空题|简答题|论述题|名词解释';
 const textKindPattern = new RegExp(`[\\[【](${TEXT_KINDS_SOURCE})[\\]】]`);
-const TEXT_INPUT_SELECTOR = 'input[type="text"],input[type="search"],input:not([type]),textarea,[contenteditable="true"]';
+const TEXT_INPUT_SELECTOR = 'input[type="text"],input[type="search"],input:not([type]),textarea,[contenteditable="true"],[contenteditable=""],[role="textbox"]';
+
+// 新版学习通的填空题常被做成富文本编辑器：可编辑正文在同源 iframe 里（UEditor），
+// 页面上只看得到一个空框，querySelector 扫不到 input。这里把这种 iframe 也当成一个“空”
+function editorFrameDetails(frame) {
+const doc = frame.contentDocument;
+const id = frame.id || (frame.closest ? (frame.closest('[id]') || {}).id : '') || '';
+let UE = null;
+try {
+const win = frame.ownerDocument.defaultView;
+UE = (win && win.UE) || (win && win.parent && win.parent.UE) || null;
+} catch (_) { UE = null; }
+let editor = null;
+if (UE && typeof UE.getEditor === 'function') {
+for (const key of [id, `ueditor_${id}`, id.replace(/^ueditor_/, '')]) {
+try { editor = editor || UE.getEditor(key); } catch (_) { /* 忽略 */ }
+}
+}
+return { doc, id, UE, editor };
+}
+
+function editorFramesWithin(root) {
+let frames = [];
+try { frames = Array.from(root.querySelectorAll('iframe')); } catch (_) { return []; }
+return frames.filter((frame) => {
+if (!visible(frame)) return false;
+let doc = null;
+try { doc = frame.contentDocument; } catch (_) { return false; }
+if (!doc || !doc.body) return false;
+try {
+if (doc.body.isContentEditable || doc.body.getAttribute('contenteditable') === 'true' || doc.body.getAttribute('contenteditable') === '') return true;
+return Boolean(doc.querySelector('[contenteditable="true"],[contenteditable=""],[role="textbox"]'));
+} catch (_) { return false; }
+});
+}
+
+function editorFrameValue(frame) {
+const { doc, editor } = editorFrameDetails(frame);
+try {
+if (editor && typeof editor.getContentTxt === 'function') return clean(editor.getContentTxt());
+} catch (_) { /* 忽略 */ }
+try { return clean(doc.body.innerText || doc.body.textContent); } catch (_) { return ''; }
+}
+
+function writeEditorFrame(frame, value) {
+const { doc, editor } = editorFrameDetails(frame);
+let done = false;
+try {
+if (editor && typeof editor.setContent === 'function') {
+editor.setContent(value);
+done = true;
+}
+if (editor && typeof editor.fireEvent === 'function') editor.fireEvent('contentChange');
+} catch (_) { done = false; }
+if (!done) {
+try {
+doc.body.innerHTML = '';
+doc.body.textContent = value;
+} catch (_) { /* 忽略 */ }
+}
+for (const target of [doc.body, frame]) {
+for (const type of ['input', 'change', 'keyup']) dispatchTextEvent(target, type);
+}
+}
 
 function fillableElements(root) {
 if (!root || typeof root.querySelectorAll !== 'function') return [];
 let list = [];
 try { list = Array.from(root.querySelectorAll(TEXT_INPUT_SELECTOR)); } catch (_) { return []; }
-return list.filter((el) => {
-if (!visible(el) || el.disabled || el.readOnly === true) return false;
+// 只有题目容器里写着“第N空”的，才把 disabled/readonly 的框也当可填（有些平台重做时
+// 输入框是灰的，去掉属性就能写）；整页扫描时不放宽，免得把搜索框之类的误当成填空
+let blankLabeled = false;
+try {
+const scope = root.body || root;
+const scopeText = String(scope.innerText || scope.textContent || '');
+blankLabeled = /第\s*[0-9一二三四五六七八九十]+\s*空/.test(scopeText);
+} catch (_) { blankLabeled = false; }
+const fields = list.filter((el) => {
+if (!visible(el)) return false;
+if ((el.disabled || el.readOnly === true) && !blankLabeled) return false;
 if (el.tagName === 'INPUT') {
 const type = String(el.type || '').toLowerCase();
 if (type && type !== 'text' && type !== 'search') return false;
 }
 return true;
 });
+for (const frame of editorFramesWithin(root)) fields.push(frame);
+// 同一题里既有普通输入框又有富文本编辑框时，按页面上的先后顺序对应第1空、第2空
+fields.sort((a, b) => {
+if (a === b) return 0;
+try {
+if (a.ownerDocument === b.ownerDocument) {
+const pos = a.compareDocumentPosition(b);
+if (pos & 4) return -1;
+if (pos & 2) return 1;
+}
+} catch (_) { /* 忽略 */ }
+return 0;
+});
+return fields;
 }
 
 function textQuestionTitle(card, kind) {
@@ -2269,6 +2355,7 @@ if (questionMarks <= 1 && text.length >= 6) return card;
 return null;
 }
 
+let quizBlankDiagAt = 0;
 function taggedTextQuestions(doc, usedInputs) {
 const found = [];
 const seenCards = new Set();
@@ -2281,7 +2368,9 @@ const kind = match[1];
 let card = node.parentElement;
 let chosen = null;
 let blanks = [];
+let suspect = node.parentElement;
 for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
+suspect = card;
 let cardText = '';
 try { cardText = clean(card.innerText); } catch (_) { cardText = ''; }
 const kinds = cardText.match(new RegExp(textKindPattern.source, 'g')) || [];
@@ -2294,7 +2383,19 @@ chosen = card;
 blanks = inputs;
 break;
 }
-if (!chosen || seenCards.has(chosen)) continue;
+if (!chosen) {
+// 看到【填空题】却找不到任何输入框：把题目容器的结构打出来，一眼能看出填空框是什么做的
+try {
+const now = Date.now();
+if (now - quizBlankDiagAt > 10000) {
+quizBlankDiagAt = now;
+const html = String((suspect || node.parentElement).outerHTML || '').replace(/\s+/g, ' ').slice(0, 500);
+console.warn(`%c填空/简答识别：找到【${kind}】题，但题目里没有可填写的输入框/编辑框。题目结构：${html}`, 'color:#FF9800');
+}
+} catch (_) { /* 忽略 */ }
+continue;
+}
+if (seenCards.has(chosen)) continue;
 seenCards.add(chosen);
 const title = textQuestionTitle(chosen, kind);
 if (!title) continue;
@@ -2874,6 +2975,13 @@ if (stopped) throw new Error('脚本已停止');
 const option = q.options.find((item) => item.letter === letter);
 if (!option?.element?.isConnected) throw new Error(`第 ${i + 1} 题选项已变化`);
 const existingInput = option.element.matches('input') ? option.element : option.element.querySelector('input');
+// 平台把重做页的选项置灰（disabled/readonly）时，点击不会有任何反应：先去掉限制再点
+try {
+for (const input of q.card.querySelectorAll('input[type="radio"],input[type="checkbox"]')) {
+if (input.disabled) input.disabled = false;
+if (input.readOnly === true) input.readOnly = false;
+}
+} catch (_) { /* 忽略 */ }
 const alreadyChecked = Boolean(existingInput?.checked) ||
 option.element.getAttribute('aria-checked') === 'true' ||
 Boolean(option.element.querySelector('[aria-checked="true"], .checked, .selected, .is-checked, .checkbox-checked'));
@@ -2935,6 +3043,7 @@ el.dispatchEvent(event);
 }
 
 function blankValueOf(el) {
+if (el && el.tagName === 'IFRAME') return editorFrameValue(el);
 if (el.getAttribute && el.getAttribute('contenteditable') === 'true' || el.isContentEditable) {
 try { return clean(el.textContent); } catch (_) { return ''; }
 }
@@ -2944,6 +3053,14 @@ return clean(el.value);
 async function writeTextBlank(el, value) {
 if (stopped) throw new Error('脚本已停止');
 try { el.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+if (el && el.tagName === 'IFRAME') {
+writeEditorFrame(el, value);
+await sleep(200);
+return;
+}
+// 有些平台重做时填空框是 disabled/readonly，去掉属性才能写进去
+try { if (el.disabled) el.disabled = false; } catch (_) { /* 忽略 */ }
+try { if (el.readOnly === true) el.readOnly = false; } catch (_) { /* 忽略 */ }
 try { el.focus(); } catch (_) { /* 忽略 */ }
 if (el.getAttribute && (el.getAttribute('contenteditable') === 'true' || el.isContentEditable)) {
 el.textContent = value;

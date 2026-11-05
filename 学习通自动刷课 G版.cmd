@@ -982,6 +982,14 @@ let quizAnswerRetries = 0;
 let emptyQuizSkips = 0;
 // 上一次跳过的是哪一节、什么时候跳的：同一节刚跳过又被平台拉回来，说明这里确实有未完成任务点
 let lastSkippedQuiz = { label: '', at: 0 };
+// 同一节反复被“还有任务点未完成”弹回来：平台不给重做入口时脚本怎么做都过不去，
+// 记下次数并在第 3 次停下，免得“跳节→被带回→再跳节”无限刷屏
+const quizBounceCounts = new Map();
+let quizStuckLabel = '';
+// initializePlayer 里的停滞自检/AI 恢复要能问一句“这一节是不是已经停手了”
+app._quizStuckHere = function () {
+return Boolean(quizStuckLabel) && quizStuckLabel === (activeCatalogLabel() || '');
+};
 let videoQuizBusy = false;
 let videoQuizTimer = null;
 let videoQuizRetryAt = 0;
@@ -2222,6 +2230,9 @@ try { text = clean(card.innerText || card.textContent); } catch (_) { return '';
 return text
 .replace(textKindPattern, '')
 .replace(/^\s*\d+\s*[.、．:：]?\s*/, '')
+// 成绩页会把“我的答案/正确答案/答案解析”拼在题干后面：题干只留到这些标记之前，
+// 否则同一道题在作答页和成绩页会被当成两道，纠错记忆对不上
+.replace(/\s*(?:我的答案|你的答案|正确答案|答案解析|得分|回答正确|回答错误|第\s*\d+\s*空)\s*[：:][\s\S]*$/, '')
 .trim()
 .slice(0, 1000);
 }
@@ -2245,8 +2256,11 @@ try { inputs = fillableElements(card); } catch (_) { inputs = []; }
 if (inputs.length > 12) return null;
 if (inputs.length && optionElements(card).length < 2) {
 let text = '';
+let raw = '';
 try { text = clean(card.innerText); } catch (_) { text = ''; }
-const questionMarks = (text.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length;
+try { raw = String(card.innerText || ''); } catch (_) { raw = ''; }
+// clean() 会把换行压成空格，题号判断必须用原始文字，否则永远数不到“另一道题”的题号
+const questionMarks = (raw.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length;
 if (questionMarks <= 1 && text.length >= 6) return card;
 }
 }
@@ -2317,6 +2331,48 @@ try { questions.push(...taggedTextQuestions(doc, usedInputs)); } catch (_) { /* 
 try { questions.push(...untaggedTextQuestions(doc, usedInputs)); } catch (_) { /* 忽略 */ }
 }
 return questions;
+}
+
+// 成绩页上的填空/简答题：输入框已经没了，只剩下“我的答案 / 正确答案”两行。
+// 只用来读答案、记纠错，不能拿来作答（没有输入框就填不进去）。
+function reviewTextQuestions() {
+const found = [];
+for (const doc of courseDocuments()) {
+if (!doc.body) continue;
+const seen = new Set();
+let walker;
+try { walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT); } catch (_) { continue; }
+let node;
+while ((node = walker.nextNode())) {
+const match = clean(node.textContent).match(textKindPattern);
+if (!match || !visible(node.parentElement)) continue;
+let card = node.parentElement;
+let chosen = null;
+for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
+let cardText = '';
+try { cardText = clean(card.innerText); } catch (_) { cardText = ''; }
+const kinds = cardText.match(new RegExp(textKindPattern.source, 'g')) || [];
+if (kinds.length > 1) break;
+if (optionElements(card).length >= 2) break;
+if (fillableElements(card).length) break;
+if (!/我的答案|你的答案|正确答案/.test(cardText)) continue;
+chosen = card;
+break;
+}
+if (!chosen || seen.has(chosen)) continue;
+seen.add(chosen);
+const title = textQuestionTitle(chosen, match[1]);
+if (!title) continue;
+let blanks = 1;
+try {
+// “我的答案”和“正确答案”里都会出现“第一空：”，按不同空号去重，别把空数算成两倍
+const labels = new Set(clean(chosen.innerText).match(/第\s*[0-9一二三四五六七八九十]+\s*空/g) || []);
+if (labels.size > blanks) blanks = Math.min(labels.size, 10);
+} catch (_) { /* 忽略 */ }
+found.push({ kind: match[1], title, blanks: new Array(blanks).fill(null), card: chosen, doc, review: true });
+}
+}
+return found;
 }
 
 // 选择题数组上挂一份 textQuestions，交卷/计数/重做都按“选择题 + 填空简答”合计
@@ -2417,6 +2473,25 @@ if (/下一节|跳过|取消|关闭/.test(text)) return null;
 return { button: primary, label: text || '主按钮' };
 }
 
+// 这一节的测验已经确认没有重做入口时，弹窗里的“下一节/继续观看”才是正确选择：
+// 再点“去学习”只会回到同一张成绩页，然后下一节又被弹回来，无限循环。
+function findLeaveChapterDialogProceed(dialog) {
+const labels = ['下一节', '继续观看', '继续学习下一节', '跳过此节'];
+for (const label of labels) {
+const button = findButtonIn(dialog, label);
+if (button) return { button, label, proceed: true };
+}
+let nodes = [];
+try { nodes = Array.from(dialog.querySelectorAll('button,a,input,[role="button"],.layui-layer-btn0,.layui-layer-btn1')); } catch (_) { return null; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+const text = clean(el.value || el.innerText || '').replace(/\s+/g, '');
+if (!text || text.length > 12) continue;
+if (/^(下一节|继续观看|跳过此节|跳过)$/.test(text)) return { button: el, label: text, proceed: true };
+}
+return null;
+}
+
 // 弹窗只有“下一节”时，用右上角关闭按钮取消本次跳节，既不跳过任务点也不会一直卡住
 function findLeaveChapterDialogClose(dialog) {
 for (const selector of ['.layui-layer-close', '.layui-layer-setwin a', '[aria-label*="关闭"]', '[title*="关闭"]', '[class*="close"]']) {
@@ -2436,7 +2511,11 @@ if (!dialog) {
 leaveDialogSeenAt = 0;
 return null;
 }
-const found = findLeaveChapterDialogButton(dialog);
+// 这一节已经确认过测验没有重做入口：优先点“下一节/继续观看”真的离开，
+// 否则“去学习→成绩页→下一节→又被弹回来”会无限循环
+const skipSection = typeof quizNoRedoKnown === 'function' && quizNoRedoKnown();
+let found = skipSection ? findLeaveChapterDialogProceed(dialog) : null;
+if (!found) found = findLeaveChapterDialogButton(dialog);
 if (!found) {
 if (!leaveDialogSeenAt) leaveDialogSeenAt = Date.now();
 if (Date.now() - leaveDialogSeenAt < 3000) return null;
@@ -2453,6 +2532,12 @@ return '关闭弹窗';
 }
 leaveDialogSeenAt = 0;
 leaveDialogClickedAt = Date.now();
+if (found.proceed) {
+console.warn(`%c这一节的测验已确认没有重做入口，点击弹窗里的“${found.label}”继续往下学`, 'color:#FF9800');
+found.button.scrollIntoView({ block: 'center' });
+found.button.click();
+return { label: found.label, proceed: true };
+}
 console.log(`%c检测到“当前章节还有任务点未完成”弹窗，自动点击“${found.label}”去完成剩余任务点`, 'color:#FF9800');
 found.button.scrollIntoView({ block: 'center' });
 found.button.click();
@@ -3001,9 +3086,17 @@ await sleep(500);
 if (!app._nextUnitPending) return;
 const dialogAction = confirmLeaveChapterDialog();
 if (dialogAction) {
+const dialogLabel = typeof dialogAction === 'object' ? dialogAction.label : dialogAction;
+if (typeof dialogAction === 'object' && dialogAction.proceed) {
+// 确认没有重做入口后点了“下一节/继续观看”：不取消切换，继续等新小节加载
+console.log(`%c已点击弹窗里的“${dialogLabel}”，继续切换下一节`);
+clickedAt = Date.now();
+nextLogAt = clickedAt + 15000;
+continue;
+}
 app._nextUnitPending = false;
 app._doneVideos = previousDoneVideos;
-console.log(`%c平台提示本章还有任务点未完成，已点击“${dialogAction}”，取消切换下一节，回到本页继续完成`);
+console.log(`%c平台提示本章还有任务点未完成，已点击“${dialogLabel}”，取消切换下一节，回到本页继续完成`);
 return;
 }
 currentStep = app._currentStepTitle();
@@ -3352,6 +3445,17 @@ app._aiPageRescue = aiPageRescue;
 async function skipQuizSection(reason) {
 const label = activeCatalogLabel() || app._currentStepTitle() || '';
 const recent = lastSkippedQuiz.label && lastSkippedQuiz.label === label && Date.now() - lastSkippedQuiz.at < 180000;
+// 同一节被平台带回来第 3 次：平台既不给重做入口、又不让离开，再跳也只会在这一节打转
+if (label) {
+const bounces = (quizBounceCounts.get(label) || 0) + 1;
+quizBounceCounts.set(label, bounces);
+if (bounces >= 3) {
+quizStuckLabel = label;
+console.error(`%c这一节（${label}）已经连续 ${bounces} 次被“当前章节还有任务点未完成”带回来，平台又没有重做入口；再点“下一节”只会继续打转，脚本停止在这一节反复尝试。请手动处理这一节的测验（或联系老师开放重做），处理完再点一次书签继续`, 'color:#F44336');
+quizBusy = false;
+return;
+}
+}
 if (recent) {
 // 不能因为“刚跳过一次”就把脚本锁死：以前这里直接 return，页面就永远停在成绩页上。
 // 现在先让 AI 看一眼页面能不能打开重做入口；AI 也没办法时，停滞自检再过一会儿会接着处理。
@@ -3892,6 +3996,46 @@ if (quizPaperStable.count < 2) return null;
 return questions;
 }
 
+// 不走“连续两屏一致”的稳定计数，直接看页面上有没有一份题量对得上的完整试卷。
+// runQuizRedo 开头的“有没有重做入口”判断必须用它：成绩页刚变成可作答试卷时，
+// 稳定计数还是 0，用 editableQuizPaper() 会误判成“没有重做入口”，然后开始跳节死循环。
+function quizPaperAnswerable() {
+const submitDoc = courseDocuments().find((doc) => findQuizSubmit(doc));
+if (!submitDoc) return null;
+const questions = attachTextQuestions(extractQuestions());
+const total = paperQuestionTotal(questions);
+if (!total) return null;
+const paperBody = paperDoc(questions)?.body;
+if (!paperBody) return null;
+const countText = clean(paperBody.innerText).match(/题量\s*[:：]\s*(\d+)/);
+const expectedTotal = countText ? Number(countText[1]) : quizHeadingTotal(paperBody);
+if (expectedTotal && expectedTotal !== total) return null;
+return questions;
+}
+
+// 等试卷稳定两屏再作答：题量对得上且连续两次识别结果一致，避免只渲染了一半就交卷
+async function waitForAnswerableQuizPaper(ms) {
+const deadline = Date.now() + Math.max(1000, ms);
+let previous = '';
+let stable = 0;
+while (!stopped && Date.now() < deadline) {
+const paper = quizPaperAnswerable();
+if (paper) {
+const signature = paper.map((question) => `${question.kind}:${question.title}:${(question.options || []).length}`).join('|');
+stable = signature === previous ? stable + 1 : 0;
+previous = signature;
+if (stable >= 1) return paper;
+} else {
+stable = 0;
+previous = '';
+}
+const doc = courseDocuments().find((item) => findQuizSubmit(item));
+if (doc) await nudgeQuizScroll(doc);
+await sleep(500);
+}
+return quizPaperAnswerable();
+}
+
 async function waitForQuizRedoReady() {
 for (let i = 0; i < 30; i++) {
 if (stopped) return false;
@@ -3901,17 +4045,42 @@ await sleep(500);
 return false;
 }
 
-function readMyAnswer(card) {
+// 判断题的答案在结果页上显示成“我的答案：对 / 错”，不是 A/B 字母。
+// 这里把这类文字答案换回选项字母，否则“判错了”读不到，重做时还会把同一个答案再交一遍。
+const JUDGE_TRUE_TEXT = /^(对|正确|是|√|✓|✔|true|t)$/i;
+const JUDGE_FALSE_TEXT = /^(错|错误|否|×|✗|✘|x|false|f)$/i;
+function answerTextLetters(question, value) {
+const text = clean(value);
+if (!text) return null;
+if (/^[A-H](?:\s*[、,，]?\s*[A-H])*$/i.test(text)) {
+const letters = Array.from(new Set(text.toUpperCase().match(/[A-H]/g) || []));
+return letters.length ? letters : null;
+}
+const options = (question && Array.isArray(question.options)) ? question.options : [];
+const exact = options.find((option) => clean(option.text) === text);
+if (exact) return [exact.letter];
+if (JUDGE_TRUE_TEXT.test(text)) {
+const match = options.find((option) => JUDGE_TRUE_TEXT.test(clean(option.text)));
+return [match ? match.letter : 'A'];
+}
+if (JUDGE_FALSE_TEXT.test(text)) {
+const match = options.find((option) => JUDGE_FALSE_TEXT.test(clean(option.text)));
+return [match ? match.letter : 'B'];
+}
+return null;
+}
+
+function readMyAnswer(card, question) {
 let text = '';
 try { text = clean(card.innerText); } catch (_) { return null; }
-const match = text.match(/(?:我的答案|你的答案)\s*[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)/);
+const match = text.match(/(?:我的答案|你的答案)\s*[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*|对|错|正确|错误|是|否|√|✓|×|✗)/);
 if (!match) return null;
-return Array.from(new Set(match[1].match(/[A-H]/g) || []));
+return answerTextLetters(question, match[1]);
 }
 
 // 结果页上这一题判对还是判错、有没有给出正确答案
 function quizCardOutcome(card) {
-const outcome = { wrong: false, right: false, correct: null };
+const outcome = { wrong: false, right: false, correct: null, correctText: '' };
 if (!card) return outcome;
 let text = '';
 try { text = clean(card.innerText); } catch (_) { text = ''; }
@@ -3932,7 +4101,13 @@ if (/回答错误|答案错误|答错了|答错啦/.test(text)) outcome.wrong = 
 if (outcome.wrong) outcome.right = false;
 else if (/回答正确|答案正确|答对了|答对啦/.test(text)) outcome.right = true;
 const match = text.match(/正确答案\s*[：:]\s*([A-H](?:\s*[、,，]?\s*[A-H])*)/);
-if (match) outcome.correct = Array.from(new Set(match[1].match(/[A-H]/g) || []));
+if (match) {
+outcome.correct = Array.from(new Set(match[1].match(/[A-H]/g) || []));
+} else {
+// 判断/选择题的正确答案也可能写成“正确答案：对 / 错”
+const judge = text.match(/正确答案\s*[：:]\s*(对|错|正确|错误|是|否|√|✓|×|✗)/);
+if (judge) outcome.correctText = judge[1];
+}
 return outcome;
 }
 
@@ -3943,16 +4118,26 @@ if (!items.some((entry) => Array.isArray(entry) && sameLetters(entry, letters)))
 return items;
 }
 
+// 填空/简答的答案是一组文字，按“逐空文字完全相同”去重
+function pushUniqueText(list, values) {
+const items = Array.isArray(list) ? list : [];
+if (!Array.isArray(values) || !values.length) return items;
+if (!items.some((entry) => Array.isArray(entry) && entry.join('~') === values.join('~'))) items.push([...values]);
+return items;
+}
+
 // 把结果页上每题的判定记进记忆：答对的照抄、答错的排除、页面给了正确答案就直接用
 function recordQuizOutcome() {
 let recorded = 0;
 for (const question of extractQuestions()) {
 const key = quizQuestionKey(question);
 const outcome = quizCardOutcome(question.card);
-const mine = readMyAnswer(question.card);
+const mine = readMyAnswer(question.card, question);
+const correct = (outcome.correct && outcome.correct.length ? outcome.correct : null) ||
+answerTextLetters(question, outcome.correctText) || null;
 const mem = quizAnswerMemory.get(key) || { tried: [], wrong: [], correct: null };
-if (outcome.correct && outcome.correct.length) {
-mem.correct = [...outcome.correct];
+if (correct) {
+mem.correct = [...correct];
 } else if (outcome.wrong) {
 mem.correct = null;
 if (mine) mem.wrong = pushUniqueAnswer(mem.wrong, mine);
@@ -4024,8 +4209,16 @@ quizAnswerMemory.set(key, mem);
 function splitTextAnswer(text, count) {
 const value = clean(text);
 if (!value) return [];
-if (count <= 1) return [value];
-const parts = value.split(/\s*[；;|｜]\s*/).map((part) => clean(part)).filter(Boolean);
+// 成绩页上多个空的答案常写成“第一空：甲 第二空：乙”，先把空号本身当作分隔符
+const parts = value
+.replace(/第\s*[0-9一二三四五六七八九十]+\s*空\s*[：:]?\s*/g, '；')
+.split(/\s*[；;|｜]\s*/)
+.map((part) => clean(part))
+.filter(Boolean);
+if (count <= 1) {
+const whole = parts.length ? parts.join('；') : '';
+return whole ? [whole] : [];
+}
 return parts.length === count ? parts : [];
 }
 
@@ -4062,7 +4255,18 @@ return answers;
 // 结果页上填空题/简答题的“我的答案 / 正确答案”
 function recordQuizTextOutcome() {
 let recorded = 0;
+const cards = new Set();
+const list = [];
 for (const question of extractTextQuestions()) {
+cards.add(question.card);
+list.push(question);
+}
+// 成绩页输入框已经收起来了，也要能读“正确答案”，否则重做时只会把上次的答案再交一遍
+for (const question of reviewTextQuestions()) {
+if (cards.has(question.card)) continue;
+list.push(question);
+}
+for (const question of list) {
 let cardText = '';
 try { cardText = clean(question.card.innerText); } catch (_) { continue; }
 const correct = cardText.match(/正确答案\s*[：:]\s*([\s\S]*?)(?=\s*(?:我的答案|答案解析|得分|回答正确|回答错误)\s*[：:]?|$)/);
@@ -4084,6 +4288,13 @@ if (values.length) {
 mem.last = values;
 changed = true;
 }
+}
+// 上次这个空答错了、页面又没给正确答案：别在重做时原样再交一遍，
+// 清掉“上次答案”，让重做流程重新问一次
+if (!correct && quizCardOutcome(question.card).wrong) {
+if (mem.last) delete mem.last;
+mem.wrong = pushUniqueText(mem.wrong, mine ? splitTextAnswer(mine[1], question.blanks.length) : []);
+changed = true;
 }
 if (changed) quizTextMemory.set(key, mem);
 }
@@ -4154,7 +4365,7 @@ quizRedoActive = true;
 try {
 // 这一节刚确认过平台不提供重做入口：别再等入口/刷新/问 AI，直接按“已提交”继续往下学。
 // 页面若又出现了新的可作答试卷或“重做”按钮，说明平台改主意了，照常处理
-if (quizNoRedoKnown() && !findQuizRedoButton() && !editableQuizPaper()) {
+if (quizNoRedoKnown() && !findQuizRedoButton() && !quizPaperAnswerable()) {
 console.warn('%c这一节之前确认过平台没有重做入口，不再重复查找，直接继续下一节', 'color:#FF9800');
 return 'no-retry';
 }
@@ -4277,8 +4488,9 @@ await sleep(5000);
 await sleep(2000);
 continue;
 }
-// 没有“重做”按钮：平台点“确定”后可能直接回到可作答的试卷
-const paper = editableQuizPaper();
+// 没有“重做”按钮：平台点“确定”后可能直接回到可作答的试卷。
+// 刚切回来的这一屏稳定计数可能还没攒够，这里多等几秒，别把整份卷子当成“没有重做入口”
+const paper = editableQuizPaper() || await waitForAnswerableQuizPaper(8000);
 if (paper) {
 // 原地重交不会刷新页面，平台的每次重建都留在同一个渲染进程里；
 // 这条路最多交 6 次，再多就停下，避免把标签页撑爆
@@ -4317,7 +4529,7 @@ if (app._nextUnitPending) return 'no-retry';
 // AI 点开的可能是“确定要重做吗”的提示框
 await confirmQuizRedoDialog();
 await waitForQuizRedoReady();
-if (findQuizRedoButton() || editableQuizPaper()) continue;
+if (findQuizRedoButton() || quizPaperAnswerable()) continue;
 }
 }
 // 还找不到就别再原地重建页面了：反复重新进节/刷框架正是把渲染进程撑到崩溃的动作。
@@ -6241,6 +6453,8 @@ return true;
 // 停滞自检先别再做别的动作（AI 正在识别或刚刚点了东西）。
 _aiRescueTick(now) {
 if (this._destroyed || this._refreshing) return false;
+// 这一节已经确认是“平台不给重做又不让离开”的死结：别再让 AI 反复点下一节
+if (typeof this._quizStuckHere === 'function' && this._quizStuckHere()) return false;
 if (this._aiRescueRunning) return true;
 if (typeof this._aiPageRescue !== 'function') return false;
 if (!this._lastProgressAt || now - this._lastProgressAt < AI_RESCUE_IDLE) return false;
@@ -6276,6 +6490,8 @@ return;
 const now = Date.now();
 // 给辅助窗口一个“脚本还活着”的信号：JS 线程真死了心跳才会停
 try { PAGE.__xuexitongLastBeat = now; } catch (_) { /* 忽略 */ }
+// 已经停在这一节等待手动处理：不再重启/自动跳节，避免反复刷屏
+if (typeof this._quizStuckHere === 'function' && this._quizStuckHere()) return;
 if (docTaskBusy) {
 if (docTaskBusySince && now - docTaskBusySince > 20000) {
 docTaskBusy = false;

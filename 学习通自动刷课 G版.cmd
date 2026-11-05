@@ -124,6 +124,72 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
     throw new Error(`${lastProblem}；重试后仍未获得完整答案，没有选择或提交题目`);
 }
 
+// 页面长时间没有进展时，把页面文字和可点元素发给模型，让它选一个能继续学习的动作。
+// 注意：DeepSeek 的对话接口只收文字，不收截图，所以这里传的是“页面内容识别结果”，不是图片像素。
+const ACTION_SYSTEM_PROMPT = '你是“学习通”网课自动学习脚本的页面恢复助手。脚本在一张页面上长时间没有任何进展，需要你根据页面文字和可点元素，选出一个最可能让学习继续下去的操作。只能从以下动作里选一个：{"action":"click","id":编号,"reason":"简短理由"} 点击编号对应的元素；{"action":"scroll","reason":"简短理由"} 页面下方可能还有没加载出来的内容；{"action":"next","reason":"简短理由"} 当前小节确实无法继续，跳到下一节；{"action":"wait","reason":"简短理由"} 还需要等页面加载；{"action":"skip","reason":"简短理由"} 当前小节无法自动完成，跳过。优先选“重做、重新作答、继续学习、开始答题、下一题、确定、关闭、去学习”这类能让流程继续的元素；页面内容明显没显示完时选 scroll；确实无法继续才选 next 或 skip。禁止选择“交卷、提交、删除、清空、退出”类元素。id 必须是 controls 里存在的编号。不确定时选 wait。只输出 JSON，不要输出其它文字。';
+
+function validAction(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    if (!['click', 'scroll', 'next', 'wait', 'skip'].includes(value.action)) return false;
+    if (value.action === 'click' && !Number.isInteger(value.id)) return false;
+    return true;
+}
+
+async function requestAction(snapshot, apiKey, fetchImpl = fetch) {
+    let lastProblem = '';
+    for (const [index, settings] of ATTEMPTS.entries()) {
+        const body = {
+            model: 'deepseek-flash',
+            stream: false,
+            response_format: { type: 'json_object' },
+            ...settings,
+            messages: [
+                { role: 'system', content: ACTION_SYSTEM_PROMPT },
+                { role: 'user', content: JSON.stringify(snapshot) },
+            ],
+        };
+        let response;
+        try {
+            response = await fetchImpl(API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+                body: JSON.stringify(body),
+                signal: AbortSignal.timeout(180000),
+            });
+        } catch (error) {
+            if (index + 1 < ATTEMPTS.length && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+                lastProblem = 'DeepSeek 请求超时（180 秒）';
+                console.warn(`${lastProblem}，改用降级配置重试`);
+                continue;
+            }
+            throw error;
+        }
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+            const detail = data?.error?.message || data?.error || data?.message || '';
+            throw new Error(`DeepSeek API 返回 HTTP ${response.status}${detail ? `：${detail}` : ''}`);
+        }
+        const choice = data?.choices?.[0];
+        const reason = choice?.finish_reason;
+        if (reason === 'length') {
+            lastProblem = 'DeepSeek 输出达到长度上限';
+        } else if (reason !== 'stop') {
+            throw new Error(`DeepSeek 未正常结束（finish_reason=${reason ?? '缺失'}）`);
+        } else {
+            try {
+                const parsed = JSON.parse(choice.message?.content || '');
+                const action = parsed?.action && typeof parsed.action === 'object' ? parsed.action : parsed;
+                if (validAction(action)) return action;
+                lastProblem = 'DeepSeek 返回的操作格式不正确';
+            } catch {
+                lastProblem = 'DeepSeek 返回空内容或无法解析 JSON';
+            }
+        }
+        if (index + 1 < ATTEMPTS.length) console.warn(`${lastProblem}，正在重试`);
+    }
+    throw new Error(`${lastProblem}；没有获得可执行的页面恢复动作`);
+}
+
 function readBrowserSource() {
     const sourcePath = process.env.XXT_SELF;
     if (!sourcePath) throw new Error('请通过“学习通自动刷课 G版.cmd”启动本地服务');
@@ -389,6 +455,21 @@ function validQuestions(questions) {
         q.options.every((o) => /^[A-H]$/.test(o.letter) && typeof o.text === 'string' && o.text.length > 0 && o.text.length <= 500));
 }
 
+function validSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) return false;
+    if (typeof snapshot.reason !== 'string' || snapshot.reason.length > 300) return false;
+    if (snapshot.url !== undefined && (typeof snapshot.url !== 'string' || snapshot.url.length > 2000)) return false;
+    if (snapshot.title !== undefined && (typeof snapshot.title !== 'string' || snapshot.title.length > 200)) return false;
+    if (snapshot.chapter !== undefined && (typeof snapshot.chapter !== 'string' || snapshot.chapter.length > 200)) return false;
+    if (typeof snapshot.text !== 'string' || snapshot.text.length > 6000) return false;
+    if (!Array.isArray(snapshot.controls) || snapshot.controls.length > 60) return false;
+    return snapshot.controls.every((c, i) => c && typeof c === 'object' &&
+        Number.isInteger(c.id) && c.id === i + 1 &&
+        typeof c.tag === 'string' && c.tag.length > 0 && c.tag.length <= 24 &&
+        typeof c.text === 'string' && c.text.length > 0 && c.text.length <= 160 &&
+        (c.cls === undefined || (typeof c.cls === 'string' && c.cls.length <= 160)));
+}
+
 // 弹题和章节测验可能同时向本地服务要答案。以前只允许一个请求在跑，后到的
 // 直接回 429“上一批题目仍在处理”，脚本收到就放弃作答，测验页停在原地不动。
 // 现在改成排队：先到先做，后面的按顺序等，最多排 8 个。
@@ -517,7 +598,7 @@ const server = createServer(async (req, res) => {
         send(res, 200, { ok: true, hasKey: Boolean(apiKey) }, origin);
         return;
     }
-    if (req.method !== 'POST' || req.url !== '/answer') {
+    if (req.method !== 'POST' || (req.url !== '/answer' && req.url !== '/act')) {
         send(res, 404, { error: '未找到接口' }, origin);
         return;
     }
@@ -529,15 +610,19 @@ const server = createServer(async (req, res) => {
         send(res, 415, { error: '仅接受 JSON' }, origin);
         return;
     }
-    let questions;
+    let payload;
     try {
         let raw = '';
         for await (const chunk of req) {
             raw += chunk.toString('utf8');
             if (raw.length > 100000) throw new Error('请求内容过大');
         }
-        questions = JSON.parse(raw).questions;
-        if (!validQuestions(questions)) throw new Error('题目格式不正确');
+        payload = JSON.parse(raw);
+        if (req.url === '/answer') {
+            if (!validQuestions(payload.questions)) throw new Error('题目格式不正确');
+        } else if (!validSnapshot(payload.snapshot)) {
+            throw new Error('页面内容格式不正确');
+        }
     } catch (error) {
         send(res, 502, { error: error.message }, origin);
         return;
@@ -548,7 +633,13 @@ const server = createServer(async (req, res) => {
     }
     if (queued > 0) console.log(`前面还有 ${queued} 批题目在排队，本次等它们做完再调用 DeepSeek`);
     try {
-        const answers = await enqueueAnswer(() => requestAnswers(questions, apiKey));
+        if (req.url === '/act') {
+            const action = await enqueueAnswer(() => requestAction(payload.snapshot, apiKey));
+            console.log(`页面恢复建议：${action.action}${action.id ? ` #${action.id}` : ''}（${action.reason || '无理由'}）`);
+            send(res, 200, { action }, origin);
+            return;
+        }
+        const answers = await enqueueAnswer(() => requestAnswers(payload.questions, apiKey));
         send(res, 200, { answers }, origin);
     } catch (error) {
         send(res, 502, { error: error.message }, origin);
@@ -668,6 +759,8 @@ const MEMORY_RELOAD_HEAP = 1200 * 1024 * 1024;
 const MEMORY_RELOAD_URGENT_HEAP = 1600 * 1024 * 1024;
 const MEMORY_RELOAD_UPTIME = 3 * 60 * 60 * 1000;
 const MEMORY_RELOAD_BUSY_WAIT = 3 * 60 * 1000;
+// 页面连续多久没有任何进展才让 AI 识别页面（停滞自检的 75 秒重启之后再等一会儿）
+const AI_RESCUE_IDLE = 90000;
 // 达到条件返回 true。busy=true（答题/等 AI/图文滚动）时先等空闲；
 // 但内存已经很危险或已经等满 3 分钟，就算忙也要刷——宁可重做一轮，也不能让标签页崩。
 function memoryRefreshDecision(input) {
@@ -2995,6 +3088,214 @@ console.log('视频诊断结果（请把这一条展开后截图）：', result)
 return result;
 };
 
+// —— 卡住时的 AI 页面恢复 ——
+// 有些页面脚本认不出下一步该点哪里（例如成绩页只剩一条“未达到及格线，请重做”，
+// 平台的“重做”入口被藏了起来），于是整段脚本就停在原地。这里把当前页面能看到的文字
+// 和可点元素整理成一份快照发给 DeepSeek，让它在有限的动作里选一个，脚本照着做。
+// DeepSeek 的对话接口只收文字、不收图片：所谓“识别屏幕内容”，就是把屏幕上显示的内容读成文字。
+const AI_RESCUE_COOLDOWN = 45000;
+const AI_RESCUE_MAX = 12;
+// 这些按钮一旦点错就是不可挽回的操作（交卷、删数据、退出），AI 不准碰
+const AI_RESCUE_BLOCKED = /交卷|提交试卷|删除|清空|退出登录|注销|退课|取消报名/;
+let aiRescueBusy = false;
+let aiRescueAt = 0;
+let aiRescueCount = 0;
+let aiRescueKey = '';
+let aiRescueLimitWarned = false;
+
+function aiRescuePageKey() {
+try {
+const label = activeCatalogLabel() || app._currentStepTitle() || '';
+return `${String(location.pathname || '')}${String(location.search || '')}|${label}`;
+} catch (_) {
+return '';
+}
+}
+
+// 把页面上看得见的内容整理成文字快照：整页文字给 AI 看上下文，短文字控件给 AI 选。
+// 先放真正可点的按钮，再放任务点/标签，最后才放普通 div/span（“未达到及格线，请重做”这类徽标）。
+function buildPageSnapshot(reason) {
+const elements = [];
+const textParts = [];
+const docs = courseDocuments();
+for (const doc of docs) {
+try {
+const text = clean(doc.body?.innerText || '');
+if (text) textParts.push(text);
+} catch (_) { /* 跨域框架读不到就算了 */ }
+}
+const groups = [
+{ selector: 'button,a,input,[role="button"],[onclick]', max: 60 },
+{ selector: 'label,li,td,th', max: 40 },
+{ selector: 'div,span,p', max: 24, innermost: true },
+];
+for (const group of groups) {
+for (const doc of docs) {
+if (elements.length >= 40) break;
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll(group.selector)); } catch (_) { continue; }
+for (const el of nodes) {
+if (elements.length >= 40) break;
+if (!visible(el)) continue;
+let label = '';
+try { label = clean(el.getAttribute('aria-label') || el.value || el.innerText || el.getAttribute('placeholder') || ''); } catch (_) { label = ''; }
+if (!label || label.length > group.max) continue;
+if (AI_RESCUE_BLOCKED.test(label)) continue;
+// 只要最里层的元素：外层容器带同样的文字，点它会点偏
+let hasInner = false;
+try { hasInner = Boolean(el.querySelector('button,a,input,[role="button"],[onclick]')); } catch (_) { hasInner = false; }
+if (hasInner) continue;
+if (group.innermost) {
+// 纯容器（div>span 同一行字）只保留真正显示文字的那一层，点击事件还能正常冒泡上去
+let innerSame = false;
+try {
+innerSame = Array.from(el.children || []).some((child) => clean(child.innerText || '').replace(/\s+/g, '') === label.replace(/\s+/g, ''));
+} catch (_) { innerSame = false; }
+if (innerSame) continue;
+}
+const tag = String(el.tagName || '').toLowerCase();
+if (!tag) continue;
+if (elements.some((item) => item.text === label)) continue;
+elements.push({ id: elements.length + 1, tag, text: label, cls: String(el.className || '').slice(0, 60), el });
+}
+}
+}
+const payload = {
+reason: String(reason || '').slice(0, 300),
+url: String(location.href || '').slice(0, 2000),
+title: clean(document.title || '').slice(0, 200),
+chapter: clean(activeCatalogLabel() || '').slice(0, 200),
+text: clean(textParts.join(' ')).slice(0, 2500),
+controls: elements.map(({ id, tag, text, cls }) => ({ id, tag, text, cls })),
+};
+return { payload, elements };
+}
+
+async function requestPageAction(snapshot) {
+if (DIRECT_MODE) {
+if (typeof PAGE.__deepseekAct === 'function') return PAGE.__deepseekAct(snapshot);
+return null;
+}
+let wait = 5000;
+for (let attempt = 1; ; attempt++) {
+if (stopped) throw new Error('脚本已停止');
+let response;
+try {
+response = await fetch(`${LOCAL_URL}/act`, {
+method: 'POST',
+headers: { 'Content-Type': 'application/json', 'X-Xuexitong-Token': LOCAL_TOKEN },
+body: JSON.stringify({ snapshot }),
+signal: AbortSignal.timeout(120000),
+});
+} catch (error) {
+if (attempt >= 3) throw new Error(`连接本地 DeepSeek 服务失败：${error.message}`);
+console.warn(`连接本地 DeepSeek 服务失败（${error.message}），${Math.round(wait / 1000)} 秒后重试`);
+await sleep(wait);
+wait = Math.min(Math.round(wait * 1.5), 20000);
+continue;
+}
+const data = await response.json().catch(() => null);
+if (response.ok) return data && data.action ? data.action : null;
+const message = (data && data.error) || `本地服务返回 HTTP ${response.status}`;
+const retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+if (retryable && attempt < 3) {
+console.warn(`AI 页面恢复请求暂时失败（${message}），${Math.round(wait / 1000)} 秒后重试`);
+await sleep(wait);
+wait = Math.min(Math.round(wait * 1.5), 20000);
+continue;
+}
+throw new Error(message);
+}
+}
+
+// 执行 AI 选的动作。返回 true 表示确实做了点什么，false 表示“等待”或没做成。
+async function runPageAction(action, built) {
+if (!action || typeof action !== 'object') return false;
+const name = String(action.action || '');
+const reason = clean(action.reason || '') || '无理由';
+console.log(`%cAI 选择的操作：${name}${action.id ? ` #${action.id}` : ''}（${reason}）`, 'color:#2196F3');
+if (name === 'click') {
+const target = built.elements[Number(action.id) - 1];
+if (!target || !target.el || !target.el.isConnected) {
+console.warn(`%cAI 选中的第 ${action.id} 个元素已经不在页面上了，这次不点`, 'color:#FF9800');
+return false;
+}
+fireClick(target.el);
+console.log(`%c已点击“${target.text}”，等页面响应`, 'color:#4CAF50');
+await sleep(1500);
+app._noteProgress();
+return true;
+}
+if (name === 'scroll') {
+for (const doc of courseDocuments()) {
+try { doc.defaultView?.scrollTo?.(0, doc.documentElement.scrollHeight); } catch (_) { /* 忽略 */ }
+}
+await sleep(1200);
+app._noteProgress();
+return true;
+}
+if (name === 'next') {
+app._noteProgress();
+if (typeof app.nextUnit === 'function') app.nextUnit();
+return true;
+}
+if (name === 'skip') {
+app._noteProgress();
+// AI 明确判断这一节做不了：允许它再跳一次（否则会被“刚跳过一次”的冷却挡住）
+lastSkippedQuiz = { label: '', at: 0 };
+await skipQuizSection('AI 判断这一节无法继续');
+return true;
+}
+// wait：什么也不做，把页面交回停滞自检
+return false;
+}
+
+// 页面长时间没进展时调用一次：识别页面 → 问 AI → 执行。同一页最多试 AI_RESCUE_MAX 次，
+// 两次之间至少隔 AI_RESCUE_COOLDOWN，避免把请求和点击刷爆。
+async function aiPageRescue(reason) {
+if (stopped || aiRescueBusy || app._destroyed || app._refreshing) return false;
+const now = Date.now();
+const key = aiRescuePageKey();
+if (key !== aiRescueKey) {
+aiRescueKey = key;
+aiRescueCount = 0;
+aiRescueLimitWarned = false;
+}
+if (aiRescueCount >= AI_RESCUE_MAX) {
+if (!aiRescueLimitWarned) {
+aiRescueLimitWarned = true;
+console.warn(`%c这一页已经让 AI 尝试过 ${AI_RESCUE_MAX} 次，不再重复识别，交给停滞自检处理`, 'color:#F44336');
+}
+return false;
+}
+if (aiRescueAt && now - aiRescueAt < AI_RESCUE_COOLDOWN) return false;
+aiRescueAt = now;
+aiRescueCount += 1;
+aiRescueBusy = true;
+app._aiRescueRunning = true;
+console.log(`%c页面长时间没有进展（${reason}），把屏幕上显示的内容发给 DeepSeek，让它决定下一步`, 'color:#2196F3');
+try {
+const built = buildPageSnapshot(reason);
+if (!built.elements.length && !built.payload.text) {
+console.warn('%c当前页面既没有文字也没有可点元素，AI 无法判断，交给停滞自检处理', 'color:#FF9800');
+return false;
+}
+const action = await requestPageAction(built.payload);
+if (!action) {
+console.warn('%cDeepSeek 没有给出可执行的动作，交给停滞自检处理', 'color:#FF9800');
+return false;
+}
+return await runPageAction(action, built);
+} catch (error) {
+console.warn(`%cAI 页面恢复没有成功（${error && error.message ? error.message : error}），交给停滞自检处理`, 'color:#FF9800');
+return false;
+} finally {
+aiRescueBusy = false;
+app._aiRescueRunning = false;
+}
+}
+app._aiPageRescue = aiPageRescue;
+
 // 这一节没法自动作答（内容是空的 / 题目一直加载不出来）时，跳过它继续往下学。
 // 用户要的是全自动，所以不停下来等人：点“下一节”就走。
 // 两种情况下不再硬跳：同一节刚跳过又被平台带回来（说明这里确实有未完成任务点），
@@ -3003,7 +3304,24 @@ async function skipQuizSection(reason) {
 const label = activeCatalogLabel() || app._currentStepTitle() || '';
 const recent = lastSkippedQuiz.label && lastSkippedQuiz.label === label && Date.now() - lastSkippedQuiz.at < 180000;
 if (recent) {
-console.warn(`%c这一节（${label}）刚跳过一次又被带回来了，说明平台认为这里还有未完成任务点；自动答题暂停，手动完成后可执行 app.nextUnit() 继续`, 'color:#FF9800');
+// 不能因为“刚跳过一次”就把脚本锁死：以前这里直接 return，页面就永远停在成绩页上。
+// 现在先让 AI 看一眼页面能不能打开重做入口；AI 也没办法时，停滞自检再过一会儿会接着处理。
+quizBusy = false;
+const labelText = label || '当前小节';
+console.warn(`%c这一节（${labelText}）刚跳过一次又被带回来了，说明平台认为这里还有未完成任务点；让 AI 看看页面上有没有能继续的操作`, 'color:#FF9800');
+aiPageRescue(`这一节刚跳过一次又被带回来：${reason}`).then((acted) => {
+if (stopped || app._destroyed) return;
+if (!acted) {
+console.warn('%cAI 也没找到能让这一节继续的操作；如果确认这一节不用做，可执行 app.nextUnit() 手动继续', 'color:#FF9800');
+return;
+}
+quizBusy = false;
+setTimeout(() => {
+if (stopped || app._destroyed || app._nextUnitPending) return;
+if (typeof app.play === 'function') app.play();
+else app._advanceChapterTest();
+}, 1500);
+}).catch(() => { /* aiPageRescue 自己会打日志 */ });
 return;
 }
 if (emptyQuizSkips >= 10) {
@@ -3149,6 +3467,38 @@ return el;
 return null;
 }
 
+// 平台把“重做”做成一条带字的小卡片/徽标（“未达到及格线，请重做”）时，按按钮文字匹配不到。
+// 这里找“文字很短、含重做字样、里面没有再套控件”的最里层元素：它可能是真入口，
+// 也可能只是状态文字。点完由调用方确认页面有没有变化，不会仅凭它下结论。
+function findLooseRedoControl() {
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('button,a,input,[role="button"],[onclick],label,li,td,th,span,div,p')); } catch (_) { continue; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+let text = '';
+try { text = clean(el.innerText || el.value || '').replace(/\s+/g, ''); } catch (_) { text = ''; }
+if (!text || text.length > 24) continue;
+if (!/重做|重测|重考|重新作答|重新答题/.test(text)) continue;
+// 弹窗里的文字不是重做入口；真正的入口在弹窗后面
+let inDialog = false;
+try { inDialog = Boolean(el.closest('#popcontent,.layui-layer,.layui-layer-dialog,.el-dialog,.el-message-box,[role="dialog"],[role="alertdialog"]')); } catch (_) { inDialog = false; }
+if (inDialog) continue;
+let hasInner = false;
+try { hasInner = Boolean(el.querySelector('button,a,input,[role="button"],[onclick]')); } catch (_) { hasInner = false; }
+if (hasInner) continue;
+// 外层容器和里面的文字子元素会同时命中：取真正显示文字的那一层，点击事件照样冒泡
+let innerSame = false;
+try {
+innerSame = Array.from(el.children || []).some((child) => clean(child.innerText || '').replace(/\s+/g, '') === text);
+} catch (_) { innerSame = false; }
+if (innerSame) continue;
+return el;
+}
+}
+return null;
+}
+
 // 找不到重做入口时，把页面上能点的按钮都打出来，下一次一看日志就知道平台改成了什么文案
 function quizEntryCandidates() {
 const rows = [];
@@ -3250,6 +3600,7 @@ let scrolled = false;
 let startClicked = false;
 let tabClicked = false;
 let pointClicked = false;
+let looseClicked = false;
 for (let i = 0; i < rounds && !stopped; i++) {
 if (quizFailureDialog()) {
 await dismissQuizFailureDialog();
@@ -3287,6 +3638,19 @@ tabClicked = true;
 console.log('%c点击“学习测验”页签，切换到测验卡片', 'color:#2196F3');
 fireClick(tab);
 await sleep(800);
+continue;
+}
+}
+// 常规入口都点过一遍还是没有：试着点带“重做”字样的卡片/徽标（可能是平台换的新入口）
+if (!looseClicked) {
+const loose = findLooseRedoControl();
+if (loose) {
+looseClicked = true;
+console.log('%c找到带“重做”字样的元素，点击它看能不能打开重做入口', 'color:#2196F3');
+fireClick(loose);
+await sleep(1200);
+// 平台可能先弹“确定要重做吗”，确定后才会出现试卷
+if (typeof confirmQuizRedoDialog === 'function') await confirmQuizRedoDialog();
 continue;
 }
 }
@@ -3720,6 +4084,8 @@ try {
 // 平台就只会原样再判一次不及格，还会白白重建一遍页面——必须拦住。
 let lastAnswerSignature = '';
 let paperRounds = 0;
+// 整份重做只让 AI 找一次入口：找到就继续，找不到再走刷新/跳过，避免每轮都在同一页上重复问
+let quizRedoAiTried = false;
 // 重新作答一轮：选答案、交卷、等结果；返回 'passed' / 'failed' / 'memory' / 'exhausted'
 const answerAndSubmit = async (questions, attempt) => {
 // 交卷前先确认页面还没到崩溃边缘；到了就这一轮都不交，改让整页刷新把内存清掉
@@ -3863,6 +4229,19 @@ continue;
 console.warn('%c成绩未达标，先等页面把“重做”入口渲染出来', 'color:#FF9800');
 let entry = await waitForQuizRedoEntry(15000);
 if (entry) continue;
+// 任务点、开始按钮、学习测验页签、带“重做”字样的元素都点过还是没有入口：
+// 让 AI 看一遍页面，选一个能让流程继续的操作（比如平台藏在别处的入口）
+if (!quizRedoAiTried && typeof app === 'object' && app && typeof app._aiPageRescue === 'function') {
+quizRedoAiTried = true;
+if (await app._aiPageRescue('成绩未达标，但页面找不到重做入口')) {
+// AI 可能选了“跳过/下一节”：这一节已经有安排了，别再刷新页面
+if (app._nextUnitPending) return 'no-retry';
+// AI 点开的可能是“确定要重做吗”的提示框
+await confirmQuizRedoDialog();
+await waitForQuizRedoReady();
+if (findQuizRedoButton() || editableQuizPaper()) continue;
+}
+}
 // 还找不到就别再原地重建页面了：反复重新进节/刷框架正是把渲染进程撑到崩溃的动作。
 // 改成整页刷新一次——平台的任务点状态会重新拉取，“重做”入口常常就出来了；
 // 同时渲染进程的内存被清零。辅助窗口会在刷新后自动重启脚本。同一节只刷一次。
@@ -3903,6 +4282,7 @@ return false;
 app._advanceChapterTest = function () {
 if (stopped || quizBusy) return;
 quizBusy = true;
+if (typeof app._noteProgress === 'function') app._noteProgress();
 let quizAnswered = false;
 (async () => {
 // 目录里这一节已经打勾：不管它是纯测验、还是视频+测验混排，整节任务点都已完成，
@@ -5776,6 +6156,35 @@ console.warn('自动刷新页面失败，请手动按 F5:', error);
 }, 800);
 return true;
 },
+// 页面长时间不动时，先让 AI 看一眼再考虑重启/刷新。返回 true 表示“这一轮交给 AI 了”，
+// 停滞自检先别再做别的动作（AI 正在识别或刚刚点了东西）。
+_aiRescueTick(now) {
+if (this._destroyed || this._refreshing) return false;
+if (this._aiRescueRunning) return true;
+if (typeof this._aiPageRescue !== 'function') return false;
+if (!this._lastProgressAt || now - this._lastProgressAt < AI_RESCUE_IDLE) return false;
+// 播放中不算卡住：播放器在走，进度由视频自己推进
+let playing = false;
+try { playing = typeof this._visibleVideoState === 'function' && this._visibleVideoState().playing; } catch (_) { playing = false; }
+if (playing) return false;
+// 图文滚动、切换小节、答题/等 AI 结果本来就可能很久，别插一脚
+if (docTaskBusy || this._nextUnitPending) return false;
+if (this._videoQuizActive || this._videoQuizPending) return false;
+if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) return false;
+const rescue = this._aiPageRescue(`已经 90 秒没有任何进展（步骤：${this._currentStepTitle() || '未识别'}）`);
+// aiPageRescue 的冷却/次数上限是在第一个 await 之前同步判断的：没真正开始就别拦着停滞自检
+if (this._aiRescueRunning !== true) return false;
+rescue.then((acted) => {
+if (!acted || this._destroyed || this._refreshing) return;
+if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) return;
+// AI 点过东西之后，让播放器重新识别页面，接着走正常的答题/播放流程
+setTimeout(() => {
+if (this._destroyed || this._nextUnitPending) return;
+try { this.play(); } catch (_) { /* 忽略 */ }
+}, 1500);
+}).catch(() => { /* aiPageRescue 自己会打日志 */ });
+return true;
+},
 _watchdogTick() {
 try {
 if (this._destroyed) {
@@ -5813,8 +6222,20 @@ if (!this._lastProgressAt) { this._lastProgressAt = now; return; }
 if (this._safeStopped) return;
 if (now - this._lastProgressAt < 75000) return;
 if (this._watchdogRestartAt && now - this._watchdogRestartAt < 60000) return;
+// 75 秒没进展：先让 AI 识别页面并试着操作；它选“等待”或做不了时，再走原来的重启逻辑
+if (this._aiRescueTick(now)) return;
 // 这些阶段本来就慢（等题目、等 DeepSeek、等测验页、等视频），不算卡住
-if (this._isChapterTest()) return;
+if (this._isChapterTest()) {
+// 答题流程还在跑（等题目、等 DeepSeek、交卷）本来就可能很久，绝不能打断
+if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) return;
+// 测验页不是永远不能碰：答题流程其实空闲太久，就按卡住处理重新识别页面；
+// 连续几次后停滞自检会跳到下一节，不会永远停在这一页
+if (now - this._lastProgressAt >= 120000) {
+console.warn(`%c章节测验页已经 ${Math.round((now - this._lastProgressAt) / 1000)} 秒没有任何动作，重新识别页面`, 'color:#FF9800');
+this._watchdogRestart('章节测验页没有响应');
+}
+return;
+}
 if (this._videoQuizActive || this._videoQuizPending) return;
 if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) return;
 let playing = false;

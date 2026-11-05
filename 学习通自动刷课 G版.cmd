@@ -126,7 +126,7 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
 
 // 页面长时间没有进展时，把页面文字和可点元素发给模型，让它选一个能继续学习的动作。
 // 注意：DeepSeek 的对话接口只收文字，不收截图，所以这里传的是“页面内容识别结果”，不是图片像素。
-const ACTION_SYSTEM_PROMPT = '你是“学习通”网课自动学习脚本的页面恢复助手。脚本在一张页面上长时间没有任何进展，需要你根据页面文字和可点元素，选出一个最可能让学习继续下去的操作。只能从以下动作里选一个：{"action":"click","id":编号,"reason":"简短理由"} 点击编号对应的元素；{"action":"scroll","reason":"简短理由"} 页面下方可能还有没加载出来的内容；{"action":"next","reason":"简短理由"} 当前小节确实无法继续，跳到下一节；{"action":"wait","reason":"简短理由"} 还需要等页面加载；{"action":"skip","reason":"简短理由"} 当前小节无法自动完成，跳过。优先选“重做、重新作答、继续学习、开始答题、下一题、确定、关闭、去学习”这类能让流程继续的元素；页面内容明显没显示完时选 scroll；确实无法继续才选 next 或 skip。禁止选择“交卷、提交、删除、清空、退出”类元素。页面上的“未达到及格线，请重做”只是成绩状态文字，不是按钮，不要选它。id 必须是 controls 里存在的编号。不确定时选 wait。只输出 JSON，不要输出其它文字。';
+const ACTION_SYSTEM_PROMPT = '你是“学习通”网课自动学习脚本的页面恢复助手。脚本在一张页面上长时间没有任何进展，需要你根据页面文字和可点元素，选出一个最可能让学习继续下去的操作。只能从以下动作里选一个：{"action":"click","id":编号,"reason":"简短理由"} 点击编号对应的元素；{"action":"scroll","reason":"简短理由"} 页面下方可能还有没加载出来的内容；{"action":"next","reason":"简短理由"} 当前小节确实无法继续，跳到下一节；{"action":"wait","reason":"简短理由"} 还需要等页面加载；{"action":"skip","reason":"简短理由"} 当前小节无法自动完成，跳过。优先选“重做、重新作答、继续学习、开始答题、下一题、确定、关闭、去学习”这类能让流程继续的元素；页面内容明显没显示完时选 scroll；确实无法继续才选 next 或 skip。禁止选择“交卷、提交、删除、清空、退出”类元素。页面上的“未达到及格线，请重做”只是成绩状态文字，不是按钮，不要选它。如果页面显示的是测验成绩未达标/请重做，绝对不要点“视频、播放、音频、观看、目录、章节名”这类会离开成绩页的入口，也不要选 next/skip，只在“重做、开始答题、继续、确定、关闭、查看详情”这类测验相关元素里选；找不到就选 scroll 或 wait。id 必须是 controls 里存在的编号。不确定时选 wait。只输出 JSON，不要输出其它文字。';
 
 function validAction(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -3242,6 +3242,9 @@ let aiRescueAt = 0;
 let aiRescueCount = 0;
 let aiRescueKey = '';
 let aiRescueLimitWarned = false;
+// 正在为“成绩未达标”的测验找重做入口：这段时间 AI 只能点测验相关元素，
+// 不能再点视频/目录/章节名，否则会离开成绩页、把视频倒回开头
+let aiRescueQuizMode = false;
 
 function aiRescuePageKey() {
 try {
@@ -3258,6 +3261,12 @@ function buildPageSnapshot(reason) {
 const elements = [];
 const textParts = [];
 const docs = courseDocuments();
+// 成绩未达标的页面只把测验相关元素交给 AI。以前 AI 会点“视频/目录/章节名”，
+// 把页面带回视频开头重看，看起来像脚本在倒退
+let quizMode = aiRescueQuizMode;
+if (!quizMode) {
+try { quizMode = quizFailureShown(); } catch (_) { quizMode = false; }
+}
 for (const doc of docs) {
 try {
 const text = clean(doc.body?.innerText || '');
@@ -3283,6 +3292,13 @@ if (!label || label.length > group.max) continue;
 if (AI_RESCUE_BLOCKED.test(label)) continue;
 // 成绩状态文字（“未达到及格线，请重做”）不是可点入口，别让 AI 去点
 if (quizStatusText.test(label)) continue;
+if (quizMode) {
+// 视频/播放/目录/章节名都会离开成绩页（点章节名还可能把视频倒回开头）
+if (/视频|播放|音频|观看|目录|章节列表/.test(label)) continue;
+// 只保留能让测验继续的入口
+// 注意不含“下一节”：成绩页上让 AI 点下一节，只会撞上“还有任务点未完成”被带回来
+if (!/重做|重新|再做|重测|重考|开始答题|开始测验|答题|测验|继续|去学习|去完成|确定|确认|关闭|取消|查看|详情|下一题|返回|学习测验|章节测验/.test(label)) continue;
+}
 // 只要最里层的元素：外层容器带同样的文字，点它会点偏
 let hasInner = false;
 try { hasInner = Boolean(el.querySelector('button,a,input,[role="button"],[onclick]')); } catch (_) { hasInner = false; }
@@ -3362,6 +3378,15 @@ if (!target || !target.el || !target.el.isConnected) {
 console.warn(`%cAI 选中的第 ${action.id} 个元素已经不在页面上了，这次不点`, 'color:#FF9800');
 return false;
 }
+let quizMode = aiRescueQuizMode;
+if (!quizMode) {
+try { quizMode = quizFailureShown(); } catch (_) { quizMode = false; }
+}
+// 兜底：就算 AI 还是选了视频/播放入口，也不能点——点了会离开成绩页
+if (quizMode && /视频|播放|音频|观看|目录/.test(target.text || '')) {
+console.warn(`%cAI 想点“${target.text}”，这是视频/目录入口；成绩未达标的页面不能离开测验，这次不点`, 'color:#FF9800');
+return false;
+}
 fireClick(target.el);
 console.log(`%c已点击“${target.text}”，等页面响应`, 'color:#4CAF50');
 await sleep(1500);
@@ -3375,6 +3400,18 @@ try { doc.defaultView?.scrollTo?.(0, doc.documentElement.scrollHeight); } catch 
 await sleep(1200);
 app._noteProgress();
 return true;
+}
+if (name === 'next' || name === 'skip') {
+let quizMode = aiRescueQuizMode;
+if (!quizMode) {
+try { quizMode = quizFailureShown(); } catch (_) { quizMode = false; }
+}
+// 成绩未达标时不能再跳节：平台会弹“任务点未完成”把页面带回来，
+// 就是用户看到的那种循环。找入口的事交给 runQuizRedo 的固定流程
+if (quizMode) {
+console.warn('%c成绩未达标的页面上不能让 AI 跳节，先继续找重做入口', 'color:#FF9800');
+return false;
+}
 }
 if (name === 'next') {
 app._noteProgress();
@@ -3502,6 +3539,77 @@ const quizAnswerMemory = new Map();
 // 填空题/简答题的答案：AI 给过的原样保存（重做时不用再问一遍），
 // 结果页给出“正确答案”时直接换成正确答案
 const quizTextMemory = new Map();
+
+// 错题记忆只放在内存里的话，脚本“整页刷新重新找重做入口”后就全没了，
+// 刷新回来又会把原来那些错答案再交一遍。存进 sessionStorage，刷新后接着用。
+const QUIZ_MEMORY_STORAGE = 'xxtQuizMemory:v1';
+function pruneQuizLists(list) {
+return (Array.isArray(list) ? list : []).filter((item) => Array.isArray(item) && item.length).slice(-24);
+}
+function saveQuizMemory() {
+try {
+const answers = {};
+let answerCount = 0;
+for (const [key, mem] of quizAnswerMemory) {
+if (!mem || typeof mem !== 'object') continue;
+const trimmed = { tried: pruneQuizLists(mem.tried), wrong: pruneQuizLists(mem.wrong) };
+if (Array.isArray(mem.correct) && mem.correct.length) trimmed.correct = [...mem.correct];
+if (Array.isArray(mem.lastAnswer) && mem.lastAnswer.length) trimmed.lastAnswer = [...mem.lastAnswer];
+if (!trimmed.tried.length && !trimmed.wrong.length && !trimmed.correct && !trimmed.lastAnswer) continue;
+// 只保留最近 200 道题，防止一学期下来把 sessionStorage 撑爆
+if (answerCount >= 200) break;
+answers[key] = trimmed;
+answerCount++;
+}
+const texts = {};
+let textCount = 0;
+for (const [key, mem] of quizTextMemory) {
+if (!mem || typeof mem !== 'object') continue;
+const trimmed = {};
+if (Array.isArray(mem.correct) && mem.correct.length) trimmed.correct = [...mem.correct];
+if (Array.isArray(mem.last) && mem.last.length) trimmed.last = [...mem.last];
+if (Array.isArray(mem.wrong) && mem.wrong.length) trimmed.wrong = pruneQuizLists(mem.wrong);
+if (!trimmed.correct && !trimmed.last && !trimmed.wrong) continue;
+if (textCount >= 100) break;
+texts[key] = trimmed;
+textCount++;
+}
+window.sessionStorage.setItem(QUIZ_MEMORY_STORAGE, JSON.stringify({ answers, texts, at: Date.now() }));
+} catch (_) { /* 存不了就算了，不影响流程 */ }
+}
+function loadQuizMemory() {
+try {
+const raw = window.sessionStorage.getItem(QUIZ_MEMORY_STORAGE);
+if (!raw) return;
+const data = JSON.parse(raw);
+if (!data || typeof data !== 'object') return;
+// 超过一天的记忆不要了：课程改题、题库换题后旧答案只会帮倒忙
+if (Number(data.at) && Date.now() - Number(data.at) > 24 * 60 * 60 * 1000) {
+window.sessionStorage.removeItem(QUIZ_MEMORY_STORAGE);
+return;
+}
+for (const key of Object.keys(data.answers || {})) {
+const mem = data.answers[key];
+if (!key || !mem || typeof mem !== 'object') continue;
+quizAnswerMemory.set(key, {
+tried: pruneQuizLists(mem.tried),
+wrong: pruneQuizLists(mem.wrong),
+correct: Array.isArray(mem.correct) && mem.correct.length ? [...mem.correct] : null,
+lastAnswer: Array.isArray(mem.lastAnswer) && mem.lastAnswer.length ? [...mem.lastAnswer] : undefined,
+});
+}
+for (const key of Object.keys(data.texts || {})) {
+const mem = data.texts[key];
+if (!key || !mem || typeof mem !== 'object') continue;
+const loaded = {};
+if (Array.isArray(mem.correct) && mem.correct.length) loaded.correct = [...mem.correct];
+if (Array.isArray(mem.last) && mem.last.length) loaded.last = [...mem.last];
+if (Array.isArray(mem.wrong) && mem.wrong.length) loaded.wrong = pruneQuizLists(mem.wrong);
+quizTextMemory.set(key, loaded);
+}
+} catch (_) { /* 读不了就当没有记忆 */ }
+}
+loadQuizMemory();
 let quizRedoActive = false;
 // 平台确实不给重做入口的小节：记下来，短时间内不再等入口、整页刷新、点成绩文字，
 // 避免在成绩页上来回打转（成绩页本身没有“重做”按钮时，再找一万次也不会出现）
@@ -3576,6 +3684,7 @@ const QUIZ_FAILURE_PATTERN = /未达到及格线|未达到合格线|不及格|�
 // 这些内容要先去掉，否则交卷前和结果页上的同一道题会被当成两道，记忆就对不上了
 function quizQuestionKey(question) {
 const title = clean(question.title)
+.replace(/得分\s*[：:][\s\S]*$/, '')
 .replace(/我的答案\s*[：:][\s\S]*$/, '')
 .replace(/正确答案\s*[：:][\s\S]*$/, '')
 .replace(/回答(?:正确|错误)[\s\S]*$/, '')
@@ -3606,11 +3715,14 @@ return value;
 function findQuizRedoButton() {
 for (const doc of courseDocuments()) {
 let nodes = [];
-try { nodes = Array.from(doc.querySelectorAll('button,a,input,label,li,td,th,div,span,[role="button"],[onclick]')); } catch (_) { continue; }
+try { nodes = Array.from(doc.querySelectorAll('button,a,input,label,li,td,th,div,span,p,i,b,strong,em,[role="button"],[onclick]')); } catch (_) { continue; }
 for (const el of nodes) {
 if (!visible(el)) continue;
 let text = '';
-try { text = clean(el.value || el.innerText || '').replace(/\s+/g, ''); } catch (_) { text = ''; }
+try {
+// 有的重做入口是纯图标，只有 title/aria-label 写着“重做”
+text = clean(el.value || el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, '');
+} catch (_) { text = ''; }
 if (!text || text.length > 16) continue;
 // “重做（剩余 2 次）”这类带次数说明的写法：去掉括号内容再判断
 const label = text.replace(/[（(][^）)]*[）)]/g, '');
@@ -3646,11 +3758,13 @@ return null;
 function findLooseRedoControl() {
 for (const doc of courseDocuments()) {
 let nodes = [];
-try { nodes = Array.from(doc.querySelectorAll('button,a,input,[role="button"],[onclick],label,li,td,th,span,div,p')); } catch (_) { continue; }
+try { nodes = Array.from(doc.querySelectorAll('button,a,input,[role="button"],[onclick],label,li,td,th,span,div,p,i,b,strong,em')); } catch (_) { continue; }
 for (const el of nodes) {
 if (!visible(el)) continue;
 let text = '';
-try { text = clean(el.innerText || el.value || '').replace(/\s+/g, ''); } catch (_) { text = ''; }
+try {
+text = clean(el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '').replace(/\s+/g, '');
+} catch (_) { text = ''; }
 if (!text || text.length > 24) continue;
 if (!/重做|重测|重考|重新作答|重新答题/.test(text)) continue;
 // “未达到及格线，请重做”是成绩状态文字，不是按钮：点它不会有任何反应
@@ -3731,7 +3845,11 @@ if (!visible(el)) continue;
 let text = '';
 try { text = clean(el.innerText || ''); } catch (_) { continue; }
 const normalized = text.replace(/[\s\d（）()]+/g, '');
-if (normalized !== '章节测验' && normalized !== '测验任务') continue;
+// 任务点行常带状态：“章节测验 未完成”“章节测验（已提交）”。
+// 只认“章节测验/测验任务”开头、文字很短的行，避免把整块目录当成任务点
+const isQuizRow = normalized === '章节测验' || normalized === '测验任务' ||
+((normalized.startsWith('章节测验') || normalized.startsWith('测验任务')) && normalized.length <= 12);
+if (!isQuizRow) continue;
 let hasInner = false;
 try {
 hasInner = Array.from(el.children || []).some((child) => clean(child.innerText || '').replace(/[\s\d（）()]+/g, '') === normalized);
@@ -3752,7 +3870,9 @@ if (!visible(el)) continue;
 let text = '';
 try { text = clean(el.innerText || ''); } catch (_) { continue; }
 const normalized = text.replace(/[\s\d（）()]+/g, '');
-if (normalized !== '章节测验' && normalized !== '测验任务') continue;
+const isQuizRow = normalized === '章节测验' || normalized === '测验任务' ||
+((normalized.startsWith('章节测验') || normalized.startsWith('测验任务')) && normalized.length <= 12);
+if (!isQuizRow) continue;
 let hint = '';
 try { hint = `${el.className || ''} ${el.id || ''}`.toLowerCase(); } catch (_) { hint = ''; }
 if (!(/task|point|job|mission|rw/.test(hint) || /^(LI|DD|DT)$/.test(el.tagName))) continue;
@@ -3812,7 +3932,11 @@ if (tab) {
 tabClicked = true;
 console.log('%c点击“学习测验”页签，切换到测验卡片', 'color:#2196F3');
 fireClick(tab);
-await sleep(800);
+// 测验卡片渲染比页签慢，等久一点再判断，别刚切过去就说没有重做入口
+await sleep(1600);
+for (const doc of courseDocuments()) {
+try { await nudgeQuizScroll(doc); } catch (_) { /* 忽略 */ }
+}
 continue;
 }
 }
@@ -3839,6 +3963,11 @@ try {
 const last = extractQuestions().slice(-1)[0];
 if (last && last.card) last.card.scrollIntoView({ block: 'end' });
 } catch (_) { /* 忽略 */ }
+}
+// 有些页面的滚动容器不是整页，而是播放器里的一个 div：每轮都往底部推一下，
+// 成绩页最下面的“重做”按钮才会被渲染出来
+for (const doc of courseDocuments()) {
+try { await nudgeQuizScroll(doc); } catch (_) { /* 忽略 */ }
 }
 await sleep(500);
 }
@@ -4085,14 +4214,40 @@ if (!card) return outcome;
 let text = '';
 try { text = clean(card.innerText); } catch (_) { text = ''; }
 try {
-for (const el of card.querySelectorAll('i,span,em,b,img,div')) {
-const cls = String(el.className || '').toLowerCase();
-const src = `${el.getAttribute('src') || ''} ${el.getAttribute('alt') || ''}`.toLowerCase();
-if (/(^|[\s_-])(cuo|wrong|error)([\s_-]|$)|icon-?cuo|answer-?wrong|wrong-?icon/.test(cls) || /cuo|wrong/.test(src)) outcome.wrong = true;
-if (/(^|[\s_-])(dui|right|correct)([\s_-]|$)|icon-?dui|answer-?right|right-?icon/.test(cls) || /dui/.test(src)) outcome.right = true;
-const glyph = clean(el.textContent || '');
-if (glyph && glyph.length <= 3 && /^[✓✔√✗✘×✕]+$/.test(glyph)) {
-if (/[✗✘×✕]/.test(glyph)) outcome.wrong = true;
+// 整个题目容器的类名也可能直接标着错（如 "TiMu cuo"）
+const cardHint = `${String(card.className || '')} ${String(card.id || '')}`.toLowerCase();
+if (/cuo|wrong|incorrect|icon-?cha/.test(cardHint)) outcome.wrong = true;
+if (/dui|icon-?gou/.test(cardHint)) outcome.right = true;
+// 成绩页的对错图标通常只有一个小图标：有的用 class="cuo"/"dui"，有的用
+// icon-cuowu、背景图、SVG，甚至只是给元素上红色/绿色。这里把能读到的线索全拼起来判断，
+// 否则“我的答案”读到了、红色的叉没认出来，就会把错题当成未判定，重做时原样再交一遍
+for (const el of card.querySelectorAll('i,span,em,b,img,div,p,label,li,td,tr,svg,use,a')) {
+let hint = '';
+let glyphText = '';
+try {
+hint = `${String(el.className || '')} ${String(el.id || '')} ` +
+`${el.getAttribute('src') || ''} ${el.getAttribute('alt') || ''} ${el.getAttribute('title') || ''} ` +
+`${el.getAttribute('aria-label') || ''} ${el.getAttribute('xlink:href') || ''} ${el.getAttribute('href') || ''}`.toLowerCase();
+glyphText = clean(el.textContent || '');
+const style = el.ownerDocument.defaultView.getComputedStyle(el);
+const bg = String(style.backgroundImage || '').toLowerCase();
+if (bg && bg !== 'none') hint += ` ${bg}`;
+// 纯图标元素（没有文字或只有一个小符号）按颜色兜底：红叉=错，绿勾=对
+if (!glyphText || glyphText.length <= 2) {
+const rgb = String(style.color || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+if (rgb) {
+const r = Number(rgb[1]);
+const g = Number(rgb[2]);
+const b = Number(rgb[3]);
+if (r >= 180 && g <= 110 && b <= 110) hint += ' cuo-red';
+else if (g >= 120 && r <= 120 && b <= 140) hint += ' dui-green';
+}
+}
+} catch (_) { hint = ''; }
+if (/cuo|wrong|incorrect|icon-?cha|answer-?no|叉/.test(hint)) outcome.wrong = true;
+if (/dui|icon-?gou|勾/.test(hint)) outcome.right = true;
+if (glyphText && glyphText.length <= 3 && /^[✓✔√✗✘×✕]+$/.test(glyphText)) {
+if (/[✗✘×✕]/.test(glyphText)) outcome.wrong = true;
 else outcome.right = true;
 }
 }
@@ -4129,7 +4284,10 @@ return items;
 // 把结果页上每题的判定记进记忆：答对的照抄、答错的排除、页面给了正确答案就直接用
 function recordQuizOutcome() {
 let recorded = 0;
-for (const question of extractQuestions()) {
+let wrongCount = 0;
+let rightCount = 0;
+const questions = extractQuestions();
+questions.forEach((question, index) => {
 const key = quizQuestionKey(question);
 const outcome = quizCardOutcome(question.card);
 const mine = readMyAnswer(question.card, question);
@@ -4141,13 +4299,39 @@ mem.correct = [...correct];
 } else if (outcome.wrong) {
 mem.correct = null;
 if (mine) mem.wrong = pushUniqueAnswer(mem.wrong, mine);
+wrongCount++;
+if (mine) {
+console.log(`%c成绩页：第 ${index + 1} 题（${question.kind}）判错，我的答案 ${mine.join('')}，重做时换别的选项`, 'color:#FF9800');
+} else {
+console.warn(`%c成绩页：第 ${index + 1} 题（${question.kind}）判错，但没读到“我的答案”，只能逐项试`, 'color:#FF9800');
+}
 } else if (outcome.right && mine) {
 mem.correct = [...mine];
+rightCount++;
 }
 quizAnswerMemory.set(key, mem);
 recorded++;
+});
+if (wrongCount || rightCount) {
+console.log(`%c成绩页识别：答错 ${wrongCount} 题、答对 ${rightCount} 题${correctShownHint(questions) ? '（页面给了正确答案的题会直接按正确答案作答）' : ''}`, 'color:#FF9800');
+} else if (questions.length) {
+// 对错图标又换样式时，至少把第一题的页面结构打出来，下一次好定位
+console.warn('%c成绩页上没读到任何对错标记（平台可能换了图标样式），这轮把所有题都当成“未确认”，重做时逐题换答案', 'color:#FF9800');
+try {
+const html = String(questions[0].card.outerHTML || '').replace(/\s+/g, ' ').slice(0, 600);
+console.warn(`第一题页面结构：${html}`);
+} catch (_) { /* 忽略 */ }
 }
+saveQuizMemory();
 return recorded;
+}
+
+// 结果页是否给出了“正确答案”：只是用于日志说明
+function correctShownHint(questions) {
+return questions.some((question) => {
+const outcome = quizCardOutcome(question.card);
+return Boolean((outcome.correct && outcome.correct.length) || outcome.correctText);
+});
 }
 
 // 重新作答时怎么选：页面给了正确答案用正确答案，答错过的用排除法换一个，
@@ -4203,6 +4387,7 @@ mem.tried = pushUniqueAnswer(mem.tried, letters);
 mem.lastAnswer = [...letters];
 quizAnswerMemory.set(key, mem);
 });
+saveQuizMemory();
 }
 
 // 把“正确答案：甲；乙”这类文字拆成每空的答案；拆不开就当作没读到，不乱改
@@ -4248,6 +4433,7 @@ const mem = quizTextMemory.get(key) || {};
 mem.last = [...values];
 quizTextMemory.set(key, mem);
 });
+saveQuizMemory();
 }
 return answers;
 }
@@ -4298,6 +4484,7 @@ changed = true;
 }
 if (changed) quizTextMemory.set(key, mem);
 }
+saveQuizMemory();
 return recorded;
 }
 
@@ -4438,7 +4625,9 @@ await submitQuiz(paperDoc(questions));
 const result = await waitForQuizResult();
 return result.failed ? 'failed' : 'passed';
 };
-for (let attempt = 1; attempt <= 12; attempt++) {
+// 答错一题换一个选项，逐轮把所有选项走一遍（用户要求“又错了就穷举”）。
+// 每次交卷前都有内存保护，页面撑不住会先停下刷新，不会把标签页弄崩
+for (let attempt = 1; attempt <= 24; attempt++) {
 if (stopped) return 'stopped';
 // 只有“取消/确定”的提示框先关掉，成绩页/重做按钮才会露出来
 if (quizFailureDialog()) {
@@ -4495,11 +4684,11 @@ if (paper) {
 // 原地重交不会刷新页面，平台的每次重建都留在同一个渲染进程里；
 // 这条路最多交 6 次，再多就停下，避免把标签页撑爆
 paperRounds++;
-if (paperRounds > 6) {
-console.error('%c同一张试卷原地重交了 6 次仍未通过，先停下（再交下去只会在同一份答案上打转，还容易把标签页撑崩）', 'color:#F44336');
+if (paperRounds > 10) {
+console.error('%c同一张试卷原地重交了 10 次仍未通过，先停下（再交下去只会在同一份答案上打转，还容易把标签页撑崩）', 'color:#F44336');
 return 'gave-up';
 }
-console.log(`%c平台已回到可重新作答的试卷，直接换答案重交（第 ${attempt} 次，这条路第 ${paperRounds}/6 次）`, 'color:#FF9800');
+console.log(`%c平台已回到可重新作答的试卷，直接换答案重交（第 ${attempt} 次，这条路第 ${paperRounds}/10 次）`, 'color:#FF9800');
 try {
 const status = await answerAndSubmit(paper, attempt);
 if (status === 'passed') {
@@ -4523,7 +4712,14 @@ if (entry) continue;
 // 让 AI 看一遍页面，选一个能让流程继续的操作（比如平台藏在别处的入口）
 if (!quizRedoAiTried && typeof app === 'object' && app && typeof app._aiPageRescue === 'function') {
 quizRedoAiTried = true;
-if (await app._aiPageRescue('成绩未达标，但页面找不到重做入口')) {
+let aiActed = false;
+aiRescueQuizMode = true;
+try {
+aiActed = await app._aiPageRescue('成绩未达标，但页面找不到重做入口');
+} finally {
+aiRescueQuizMode = false;
+}
+if (aiActed) {
 // AI 可能选了“跳过/下一节”：这一节已经有安排了，别再刷新页面
 if (app._nextUnitPending) return 'no-retry';
 // AI 点开的可能是“确定要重做吗”的提示框
@@ -4550,7 +4746,7 @@ console.error('%c成绩未达标，但页面上确实没有“重做”按钮也
 markQuizNoRedo();
 return 'no-retry';
 }
-console.error('%c章节测验重做 12 次仍未通过：答对的题一直照抄，答错的题已经换遍选项，请手动处理这一节', 'color:#F44336');
+console.error('%c章节测验重做 24 次仍未通过：答对的题一直照抄，答错的题已经换遍选项，请手动处理这一节', 'color:#F44336');
 return 'gave-up';
 } finally {
 quizRedoActive = false;

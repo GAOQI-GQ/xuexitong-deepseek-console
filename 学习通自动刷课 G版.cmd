@@ -1019,6 +1019,20 @@ const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 const visible = (el) => Boolean(el && el.isConnected && el.getClientRects().length &&
 el.ownerDocument.defaultView.getComputedStyle(el).visibility !== 'hidden');
 const kindPattern = /[\[【](单选题|多选题|判断题)[\]】]/;
+// 新版卷面会把同一个题型标签重复渲染（标题里出现两个【单选题】）。重复的同名标签
+// 只算一种题型，不能像两种题型那样把外层容器排除掉，否则整道题都会被跳过
+function distinctKindTags(text, pattern) {
+const tags = String(text || '').match(new RegExp(pattern.source, 'g')) || [];
+return new Set(tags.map((tag) => clean(tag).replace(/[\[\]【】]/g, '')));
+}
+// 目录/搜索框长得很像填空输入框：有搜索字样时一律不当成填空，避免凭空多出一道填空题
+function searchLikeInput(el) {
+if (!el || el.tagName !== 'INPUT') return false;
+const type = String(el.type || '').toLowerCase();
+const hint = `${el.placeholder || ''} ${el.getAttribute('aria-label') || ''} ${el.id || ''} ${el.className || ''} ${el.name || ''}`;
+if (type === 'search' && !/第\s*[0-9一二三四五六七八九十]+\s*空/.test(hint)) return true;
+return /搜索|查找|search|keyword/i.test(hint);
+}
 // 成绩状态文字（“未达到及格线，请重做”）：它不是按钮，既不能点，也不能让 AI 当成入口
 const quizStatusText = /未达到|未达标|不及格|未通过|已提交|已完成/;
 
@@ -2186,8 +2200,8 @@ let card = node.parentElement;
 let options = [];
 for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
 const cardText = clean(card.innerText);
-const kinds = cardText.match(new RegExp(kindPattern.source, 'g')) || [];
-if (kinds.length > 1) break;
+// 同名题型标签重复出现不算“爬到两道题”，只有出现不同题型才停
+if (distinctKindTags(cardText, kindPattern).size > 1) break;
 options = optionElements(card);
 if (options.length >= 2 && options.length <= 8) break;
 }
@@ -2197,12 +2211,61 @@ const full = card.innerText || '';
 const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
 const title = clean(firstOption >= 0 ? full.slice(0, firstOption) :
 (node.parentElement.innerText || full))
-.replace(/^\d+\s*/, '').replace(kindPattern, '').trim();
+.replace(/^\d+\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
 if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
 questions.push({ kind, title, options, card, doc });
 }
 }
 return questions;
+}
+
+// 题型标签缺失、重复或换了写法时，按“选项输入框”的结构把题目补回来：
+// 每道选择题都有 2-8 个 radio/checkbox，从输入框往上找到刚好包住这一组选项的容器。
+// 题型优先读标签，读不出来就按结构判断（对/错两项是判断题，多个 checkbox 是多选题）。
+// 这一步只在正常识别题量不够时兜底，不参与常规识别，避免把页头搜索框之类误当成题目。
+function structuralKindOf(card, options) {
+const texts = options.map((option) => clean(option.text));
+if (texts.length === 2 && texts.every((text) => /^(对|错|正确|错误|√|×|T|F|是|否)$/i.test(text))) return '判断题';
+try {
+if (card.querySelectorAll('input[type="checkbox"]').length >= 2) return '多选题';
+} catch (_) { /* 忽略 */ }
+return '单选题';
+}
+
+function structuralQuizQuestions(onlyDocs) {
+const found = [];
+for (const doc of (Array.isArray(onlyDocs) ? onlyDocs : courseDocuments())) {
+if (!doc.body) continue;
+const seenCards = new Set();
+let inputs = [];
+try { inputs = Array.from(doc.querySelectorAll('input[type="radio"],input[type="checkbox"]')); } catch (_) { continue; }
+for (const input of inputs) {
+if (!visible(input)) continue;
+let card = input.parentElement;
+let options = [];
+for (let depth = 0; card && card !== doc.body && depth < 9; depth++, card = card.parentElement) {
+const cardText = clean(card.innerText);
+// 只有出现不同题型标签时才算爬到多道题外层；同名标签重复渲染不算
+if (distinctKindTags(cardText, kindPattern).size > 1) { options = []; break; }
+options = optionElements(card);
+if (options.length >= 2 && options.length <= 8) break;
+}
+if (!card || card === doc.body || options.length < 2 || options.length > 8 || seenCards.has(card)) continue;
+seenCards.add(card);
+const full = String(card.innerText || '');
+// 一道题的容器里只该有一个题号；能数到多个题号说明这个容器装了好几道题，不能整块当成一题。
+// 明确是题目卡片（TiMu/Zy_）的例外：题干里可能自带“1. 2.”这种列举
+const questionBox = /TiMu|Zy_|timu|question|exercise/i.test(`${card.className || ''} ${card.id || ''}`);
+if (!questionBox && (full.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length > 1) continue;
+const kind = clean(full).match(kindPattern)?.[1] || structuralKindOf(card, options);
+const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
+const title = clean(firstOption >= 0 ? full.slice(0, firstOption) : full)
+.replace(/^\d+\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
+found.push({ kind, title, options, card, doc });
+}
+}
+return found;
 }
 
 // —— 填空题/简答题 ——
@@ -2289,6 +2352,8 @@ blankLabeled = /第\s*[0-9一二三四五六七八九十]+\s*空/.test(scopeText
 } catch (_) { blankLabeled = false; }
 const fields = list.filter((el) => {
 if (!visible(el)) return false;
+// 目录/页头搜索框也是 input[type=text]，它不是题目里的空，绝不能算成“填空输入框”
+if (el.tagName === 'INPUT' && searchLikeInput(el)) return false;
 if ((el.disabled || el.readOnly === true) && !blankLabeled) return false;
 if (el.tagName === 'INPUT') {
 const type = String(el.type || '').toLowerCase();
@@ -2316,7 +2381,7 @@ function textQuestionTitle(card, kind) {
 let text = '';
 try { text = clean(card.innerText || card.textContent); } catch (_) { return ''; }
 return text
-.replace(textKindPattern, '')
+.replace(new RegExp(textKindPattern.source, 'g'), '')
 .replace(/^\s*\d+\s*[.、．:：]?\s*/, '')
 // 成绩页会把“我的答案/正确答案/答案解析”拼在题干后面：题干只留到这些标记之前，
 // 否则同一道题在作答页和成绩页会被当成两道，纠错记忆对不上
@@ -2355,6 +2420,29 @@ if (questionMarks <= 1 && text.length >= 6) return card;
 return null;
 }
 
+// 没有【填空题】标签时，只能靠输入框兜底识别。兜底必须保守：目录搜索框挂在整页容器里，
+// 往上爬到卷面根节点时文字也“够长”，以前会凭空多出一道填空题，整卷题量就永远对不上。
+// 只认真正的题目容器：写着“第N空”，或者容器本身是题目卡片（TiMu/Zy_/question 之类）
+function textQuestionCardLooksReal(card) {
+if (!card) return false;
+const doc = card.ownerDocument;
+if (!doc || card === doc.body) return false;
+let raw = '';
+try { raw = String(card.innerText || ''); } catch (_) { return false; }
+if (!raw.trim() || raw.length > 2400) return false;
+if (/第\s*[0-9一二三四五六七八九十]+\s*空/.test(raw)) return true;
+const hint = `${card.className || ''} ${card.id || ''}`;
+let questionBox = /TiMu|Zy_|timu|question|exercise/i.test(hint);
+if (!questionBox && card.closest) {
+try { questionBox = Boolean(card.closest('.TiMu,[class*="TiMu"],[class*="Zy_"],[class*="timu"],[class*="question"],[class*="Question"]')); } catch (_) { questionBox = false; }
+}
+if (!questionBox) return false;
+// 整卷容器（同时写着“题量：N”和多个题号）不是一道题
+const marks = (raw.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length;
+if (/题量\s*[:：]\s*\d+/.test(raw) && marks > 1) return false;
+return true;
+}
+
 let quizBlankDiagAt = 0;
 function taggedTextQuestions(doc, usedInputs) {
 const found = [];
@@ -2373,8 +2461,7 @@ for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
 suspect = card;
 let cardText = '';
 try { cardText = clean(card.innerText); } catch (_) { cardText = ''; }
-const kinds = cardText.match(new RegExp(textKindPattern.source, 'g')) || [];
-if (kinds.length > 1) break;
+if (distinctKindTags(cardText, textKindPattern).size > 1) break;
 if (optionElements(card).length >= 2) break;
 const inputs = fillableElements(card);
 if (!inputs.length) continue;
@@ -2411,7 +2498,7 @@ const seenCards = new Set();
 for (const input of fillableElements(doc.body)) {
 if (usedInputs.has(input)) continue;
 const card = textQuestionCardFor(input);
-if (!card || seenCards.has(card)) continue;
+if (!card || seenCards.has(card) || !textQuestionCardLooksReal(card)) continue;
 seenCards.add(card);
 const blanks = fillableElements(card);
 const longForm = blanks.some((el) => el.tagName === 'TEXTAREA' ||
@@ -2454,8 +2541,7 @@ let chosen = null;
 for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
 let cardText = '';
 try { cardText = clean(card.innerText); } catch (_) { cardText = ''; }
-const kinds = cardText.match(new RegExp(textKindPattern.source, 'g')) || [];
-if (kinds.length > 1) break;
+if (distinctKindTags(cardText, textKindPattern).size > 1) break;
 if (optionElements(card).length >= 2) break;
 if (fillableElements(card).length) break;
 if (!/我的答案|你的答案|正确答案/.test(cardText)) continue;
@@ -2735,9 +2821,17 @@ if (!name) continue;
 info.tags[name] = (info.tags[name] || 0) + 1;
 }
 info.pager = /下一题|下一页|下页|上一题|上一页/.test(text);
+// 目录/页头搜索框也是 input[type=text]，以前诊断日志里那个凭空的
+// “填空/简答输入框 1 个”就是它，误导排查；统计时把搜索框排除掉
 try {
-info.textInputs = body.querySelectorAll('input[type="text"],textarea,[contenteditable="true"]').length;
-} catch (_) { /* 忽略 */ }
+info.textInputs = Array.from(body.querySelectorAll('input[type="text"],input[type="search"],textarea,[contenteditable="true"]'))
+.filter((el) => {
+const type = String(el.type || '').toLowerCase();
+if (type === 'search') return false;
+const hint = `${el.placeholder || ''} ${el.id || ''} ${el.className || ''}`;
+return !/搜索|查找|search|keyword/i.test(hint);
+}).length;
+} catch (_) { info.textInputs = 0; }
 return info;
 }
 
@@ -2830,8 +2924,9 @@ if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
 // 只按“提交按钮所在框架”找题：平台切页时会把上一份成绩页留在别的隐藏框架里，
 // 混着数题会一直和卷面题量对不上；按钮在外层、题目在别的框架时退回全页面识别
-const paperDocs = docsWithin(submitDoc);
-let questions = attachTextQuestions(extractQuestions(paperDocs), paperDocs);
+// 统一走 quizPaperCandidates：题型标签缺失/重复时会按选项结构自动补题，
+// 补回来的题和正常识别的题一样交给 DeepSeek 作答
+let questions = quizPaperCandidates(submitDoc) || [];
 if (!paperQuestionTotal(questions)) questions = attachTextQuestions(extractQuestions());
 const textQuestions = questions.textQuestions || [];
 const total = questions.length + textQuestions.length;
@@ -3309,7 +3404,9 @@ console.error('切换下一学习步骤失败:', error);
 };
 
 app.inspectQuiz = function () {
-const questions = attachTextQuestions(extractQuestions());
+// 和真正作答时用同一套识别（含按选项结构的兜底补题），排查时看到的就是脚本实际会答的题
+const submitDoc = quizSubmitDoc();
+const questions = (submitDoc && quizPaperCandidates(submitDoc)) || attachTextQuestions(extractQuestions());
 return [
 ...questions.map((q, i) => ({
 id: i + 1, type: q.kind, question: q.title,
@@ -4288,22 +4385,53 @@ if (uniqueText.length) unique.textQuestions = uniqueText;
 return unique;
 }
 
+function expectedQuizTotal(doc) {
+if (!doc || !doc.body) return null;
+let text = '';
+try { text = clean(doc.body.innerText); } catch (_) { return null; }
+const countText = text.match(/题量\s*[:：]\s*(\d+)/);
+return countText ? Number(countText[1]) : quizHeadingTotal(doc.body);
+}
+
+let quizStructuralLogKey = '';
 // 只按“提交按钮所在框架”来识别试卷；提交按钮在外层、题目在别的框架时退回全页面识别
 function quizPaperCandidates(submitDoc) {
 if (!submitDoc) return null;
 const scoped = docsWithin(submitDoc);
 let questions = attachTextQuestions(extractQuestions(scoped), scoped);
 if (!paperQuestionTotal(questions)) questions = attachTextQuestions(extractQuestions());
+const total = paperQuestionTotal(questions);
+const expected = expectedQuizTotal(submitDoc);
+// 正常识别题量不够时，按选项结构补题（题型标签没渲染、重复渲染或换了写法都能补回来）。
+// 只补到卷面题量为止：补多了反而会因为“识别数 > 题量”永远判定不完整
+if (total < (expected || 1)) {
+const knownCards = questions.map((question) => question.card).filter(Boolean);
+const extra = structuralQuizQuestions(scoped).filter((question) =>
+!knownCards.some((card) => card === question.card ||
+(card.contains && card.contains(question.card)) ||
+(question.card.contains && question.card.contains(card))));
+const room = expected ? Math.max(0, expected - total) : extra.length;
+if (extra.length && room > 0) {
+const texts = questions.textQuestions || [];
+const added = extra.slice(0, room);
+questions = questions.slice().concat(added);
+if (texts.length) questions.textQuestions = texts;
+// 这就是“题目识别不了就交给 AI”的兜底：题型标签缺失/重复时先按选项结构把题补全，
+// 再把补全后的完整题干和选项发给 DeepSeek 识别题型并作答（DeepSeek 接口只收文字，收不了图片）
+const key = `${total}:${expected || 0}:${added.length}`;
+if (key !== quizStructuralLogKey) {
+quizStructuralLogKey = key;
+console.log(`%c卷面题型标签不完整，已按选项结构自动补全 ${added.length} 道题（识别到 ${total} 道，补后 ${questions.length} 道），再交给 DeepSeek 作答`, 'color:#4CAF50');
+}
+}
+}
 return dedupePaperQuestions(questions || []);
 }
 
 function quizPaperExpected(questions) {
 const paperBody = paperDoc(questions)?.body || null;
 if (!paperBody) return { paperBody: null, expectedTotal: null };
-let text = '';
-try { text = clean(paperBody.innerText); } catch (_) { text = ''; }
-const countText = text.match(/题量\s*[:：]\s*(\d+)/);
-return { paperBody, expectedTotal: countText ? Number(countText[1]) : quizHeadingTotal(paperBody) };
+return { paperBody, expectedTotal: expectedQuizTotal(paperBody.ownerDocument) };
 }
 
 // 找到了提交按钮、题量却对不上时，把“识别到几题 / 卷面几题 / 分节和输入框情况”打出来，
@@ -4323,7 +4451,14 @@ try {
 const info = typeof quizPaperSnapshot === 'function' ? quizPaperSnapshot(paperDoc(questions)?.body) : null;
 if (info && typeof describeQuizPaper === 'function') detail = describeQuizPaper(info);
 } catch (_) { detail = ''; }
-console.warn(`%c卷面识别：找到“提交”按钮，识别到 ${total} 题，卷面标注 ${expectedTotal ? `${expectedTotal} 题` : '题量未知'}${detail ? `（${detail}）` : ''}，先不交卷，等页面渲染完再核对`, 'color:#FF9800');
+// 把已识别到的题逐条列出来：题量对不上时能直接看出缺的是哪一类、哪一题
+let list = '';
+try {
+list = paperQuestions(questions).map((question, index) =>
+`${index + 1}.${question.kind}:${clean(question.title).slice(0, 16)}${question.options ? `(${question.options.length}选项)` : ''}`
+).join('；');
+} catch (_) { list = ''; }
+console.warn(`%c卷面识别：找到“提交”按钮，识别到 ${total} 题，卷面标注 ${expectedTotal ? `${expectedTotal} 题` : '题量未知'}${detail ? `（${detail}）` : ''}${list ? `。已识别：${list}` : ''}，先不交卷，等页面渲染完再核对`, 'color:#FF9800');
 }
 
 // 点掉提示框后，平台要么跳到成绩页（带对错标记和“重做”按钮），要么直接回到可作答的试卷。

@@ -5680,6 +5680,11 @@ const match = String(text || '').match(/已答对\s*(\d+)\s*题/);
 return match ? Number(match[1]) : -1;
 }
 
+function quizTotalCount(text) {
+const match = String(text || '').match(/共\s*(\d+)\s*题/);
+return match ? Number(match[1]) : -1;
+}
+
 function isVideoQuizSuccess(text) {
 return /您的回答正确|回答正确[！!。\s]|回答正确$|答案正确[！!。\s]|答案正确$|答对了[！!。\s]|答对了$|答对啦|全部正确|完全正确|太棒了|恭喜你|恭喜答对|恭喜.*正确/.test(text);
 }
@@ -6273,7 +6278,23 @@ app._videoQuizPending = false;
 videoQuizContinueAt = Date.now();
 if (app._videoEndedDuringQuiz) scheduleVideoEndedNext(1500);
 } else {
-console.warn('%c视频弹题已答对，但暂时没找到“继续学习”按钮，2 秒后重试', 'color:#FF9800');
+// 平台已经显示“已答对 N 题/回答正确”，但面板还停在题目上、没有“继续学习”。
+// 这种面板会把视频一直顶住暂停，不能干等：再点一次“提交”让它收起
+//（答案已经判对，重复提交同一个答案不会改判），收不起也先松开对视频的等待标记
+let closed = false;
+const located = locateVideoQuizSubmit(question);
+if (located.button) {
+console.log('%c视频弹题已答对，但面板还停着：再点一次“提交”让它收起', 'color:#FF9800');
+try { located.button.scrollIntoView({ block: 'center' }); } catch (_) { /* 忽略 */ }
+fireClick(located.button);
+await confirmVideoQuizSubmit(located.question.card);
+await sleep(600);
+try { closed = dismissVideoQuiz(located.question.card); } catch (_) { closed = false; }
+}
+if (!closed) console.warn('%c视频弹题已答对，但面板仍没收起；先松开等待标记，交给视频保活恢复', 'color:#FF9800');
+activeVideoQuiz = null;
+app._videoQuizPending = false;
+videoQuizContinueAt = Date.now();
 }
 setTimeout(() => {
 if (typeof app._resumeAfterVideoQuiz === 'function') app._resumeAfterVideoQuiz();
@@ -6385,7 +6406,18 @@ app._videoQuizActive = false;
 }
 
 app._videoQuizVisibleNow = function () {
-return Boolean(findVideoQuizCard()) || videoQuizSuccessVisible();
+const question = findVideoQuizCard();
+if (question) {
+// 面板已经写着“共 N 题，已答对 N 题”、又没有“重新作答”入口时，它只是没自动收起的
+// 回顾面板；继续当成“还有弹题没做”会把视频永久拦住，永远恢复不了播放
+let text = '';
+try { text = clean(question.card.innerText); } catch (_) { text = ''; }
+const total = quizTotalCount(text);
+const answered = correctCount(text);
+if (total > 0 && answered >= total && !findRetryButton(question.card)) return false;
+return true;
+}
+return videoQuizSuccessVisible();
 };
 
 app.inspectVideoQuiz = function () {

@@ -737,19 +737,53 @@ let keeper;
 try {
 keeper = PAGE.open('', 'xuexitongConsoleKeeper', 'width=360,height=150');
 if (!keeper) throw new Error('浏览器阻止了辅助窗口');
+try {
 keeper.document.title = '学习通自动任务辅助窗口';
+} catch (error) {
+// 同名的窗口如果是别的页面留下的（跨域，读不到它的内容），先关掉再开一个干净的。
+// 以前这里直接放弃，残留的旧窗口会一直显示“自动恢复遇到错误”。
+try { keeper.close(); } catch (_) { /* 忽略 */ }
+keeper = PAGE.open('', 'xuexitongConsoleKeeper', 'width=360,height=150');
+if (!keeper) throw new Error('浏览器阻止了辅助窗口');
+keeper.document.title = '学习通自动任务辅助窗口';
+}
 keeper.document.body.innerHTML = '<p style="font:16px sans-serif;padding:12px">GQ提醒您：学习通自动任务正在运行。请保持此窗口打开；课程页整页跳转后，它会重新启动脚本。</p>';
 keeper.__xuexitongSource = `(${xuexitongMain.toString()})();`;
 keeper.__xuexitongLastUrl = location.href;
 keeper.__xuexitongLastInjectionAt = Date.now();
 if (!keeper.__xuexitongKeeperTimer) {
 keeper.eval(`window.__xuexitongKeeperTimer = setInterval(function () {
+                    function note(text) {
+                        var status = window.document.getElementById('xxtKeeperStatus');
+                        if (!status) {
+                            status = window.document.createElement('p');
+                            status.id = 'xxtKeeperStatus';
+                            status.style.cssText = 'font:13px sans-serif;padding:0 12px 10px;color:#c62828';
+                            window.document.body.appendChild(status);
+                        }
+                        status.textContent = text;
+                    }
                     try {
                         var page = window.opener;
-                        if (!page || page.closed) { clearInterval(window.__xuexitongKeeperTimer); window.close(); return; }
-                        if (!/^https:\\/\\/([a-z0-9-]+\\.)*chaoxing\\.com\\/mycourse\\/studentstudy/i.test(page.location.href)) return;
-                        if (page.location.href !== window.__xuexitongLastUrl) {
-                            window.__xuexitongLastUrl = page.location.href;
+                        if (!page) return;
+                        var closed = true;
+                        try { closed = page.closed; } catch (e) { closed = true; }
+                        if (closed) { clearInterval(window.__xuexitongKeeperTimer); window.close(); return; }
+                        var href = '';
+                        try {
+                            href = page.location.href;
+                        } catch (e) {
+                            // 打开者已经不在学习通（旧页面关掉了，或者这个窗口是上一轮残留的）：
+                            // 这里什么也做不了。不要每秒报错，等用户在课程页重新点书签时，
+                            // 页面会把这个窗口关掉重新打开。
+                            note('GQ提醒您：这个辅助窗口对应的课程页已经关闭或跳到了别的站点，请在课程页重新点一次书签。');
+                            return;
+                        }
+                        var status = window.document.getElementById('xxtKeeperStatus');
+                        if (status) status.textContent = '';
+                        if (!/^https:\\/\\/([a-z0-9-]+\\.)*chaoxing\\.com\\/mycourse\\/studentstudy/i.test(href)) return;
+                        if (href !== window.__xuexitongLastUrl) {
+                            window.__xuexitongLastUrl = href;
                             window.__xuexitongLastInjectionAt = Date.now() - 30000;
                         }
                         if (page.document.readyState !== 'complete' || !page.document.querySelector('#coursetree')) return;
@@ -770,7 +804,7 @@ keeper.eval(`window.__xuexitongKeeperTimer = setInterval(function () {
                     } catch (error) {
                         if (Date.now() - (window.__xuexitongLastErrorAt || 0) > 30000) {
                             window.__xuexitongLastErrorAt = Date.now();
-                            window.document.body.textContent = '整页跳转后的自动恢复遇到错误：' + error.message;
+                            note('GQ提醒您：整页跳转后的自动恢复暂时出错：' + error.message);
                             console.warn('学习通整页跳转后的自动恢复暂不可用:', error);
                         }
                     }
@@ -2170,6 +2204,72 @@ await sleep(120);
 }
 }
 
+// 试卷的滚动容器：题目有时不是一次性全部渲染，往下滚一点才会加载出来。
+// 只认真正能滚的大容器，避免把页面里各种小弹层都滚一遍。
+function quizScrollCandidates(doc) {
+const list = [];
+if (!doc || !doc.body) return list;
+const roots = [doc.scrollingElement, ...Array.from(doc.querySelectorAll('div,section,main,article,form'))];
+for (const el of roots) {
+if (!el || list.includes(el)) continue;
+try {
+if (el.scrollHeight <= el.clientHeight + 100) continue;
+const style = doc.defaultView.getComputedStyle(el);
+if (!/(auto|scroll)/.test(style.overflowY)) continue;
+list.push(el);
+} catch (_) { /* 忽略 */ }
+if (list.length >= 4) break;
+}
+return list;
+}
+
+async function nudgeQuizScroll(doc) {
+for (const scroller of quizScrollCandidates(doc)) {
+try {
+const bottom = scroller.scrollHeight - scroller.clientHeight;
+if (bottom <= 0) continue;
+scroller.scrollTop = Math.min(bottom, scroller.scrollTop + Math.max(400, scroller.clientHeight * 0.8));
+} catch (_) { /* 忽略 */ }
+}
+await sleep(200);
+}
+
+// 诊断用：题量对不上时，把卷面分节（一、单选题（共2题）…）、题型标签、填空/简答输入框
+// 数量列出来。这样下次再卡住，控制台日志就能直接看出缺的是哪一类题。
+function quizPaperSnapshot(doc) {
+const info = { headings: [], tags: {}, textInputs: 0, pager: false };
+// 传进来的是框架文档（页面里就是这么用的），测试里也可能直接传题目容器
+const body = doc && (doc.body || (doc.nodeType === 1 ? doc : null));
+if (!body) return info;
+let text = '';
+try { text = String(body.innerText || body.textContent || ''); } catch (_) { return info; }
+const headingPattern = /[一二三四五六七八九十]+、\s*([^\s（(]{1,12})\s*(?:[（(]\s*共\s*(\d+)\s*题\s*[）)])?/g;
+let match;
+while ((match = headingPattern.exec(text)) && info.headings.length < 12) {
+info.headings.push({ label: clean(match[1]), count: match[2] ? Number(match[2]) : 0 });
+}
+for (const tag of text.match(/[\[【]([^\]】]{1,8})[\]】]/g) || []) {
+const name = clean(tag.replace(/[\[【\]】]/g, ''));
+if (!name) continue;
+info.tags[name] = (info.tags[name] || 0) + 1;
+}
+info.pager = /下一题|下一页|下页|上一题|上一页/.test(text);
+try {
+info.textInputs = body.querySelectorAll('input[type="text"],textarea,[contenteditable="true"]').length;
+} catch (_) { /* 忽略 */ }
+return info;
+}
+
+function describeQuizPaper(info) {
+const parts = [];
+if (info.headings.length) {
+parts.push(`分节：${info.headings.map((item) => `${item.label}${item.count ? `×${item.count}` : ''}`).join('、')}`);
+}
+if (info.textInputs) parts.push(`填空/简答输入框 ${info.textInputs} 个（脚本不自动作答）`);
+if (info.pager) parts.push('卷面有分页按钮');
+return parts.join('；');
+}
+
 const QUIZ_START_LABELS = ['开始答题', '开始测验', '开始考试', '进入答题', '继续答题', '继续作答'];
 
 async function waitForQuizQuestions() {
@@ -2250,10 +2350,18 @@ if (stableCount >= 3) return questions;
 stableCount = 0;
 previousSignature = '';
 }
-if (attempt > 0 && attempt % 30 === 0) console.log(`测验题目仍在加载，已等待 ${attempt / 2} 秒；当前识别 ${questions.length} 道`);
+// 题目可能分段渲染：等待期间持续往下滚一点，别只滚动一次就干等
+if (attempt > 0 && attempt % 10 === 0) await nudgeQuizScroll(submitDoc);
+if (attempt > 0 && attempt % 30 === 0) {
+const info = quizPaperSnapshot(submitDoc);
+const extra = describeQuizPaper(info);
+const expectedText = expected ? `，卷面写着题量 ${expected} 道` : '';
+console.log(`测验题目仍在加载，已等待 ${attempt / 2} 秒；当前识别 ${questions.length} 道${expectedText}${extra ? `；${extra}` : ''}`);
+}
 await sleep(500);
 }
-throw new Error('测验框架已打开，但等待 120 秒仍未识别完整题目。可运行 app.inspectQuiz() 查看当前识别结果');
+const timeoutInfo = describeQuizPaper(quizPaperSnapshot(submitDoc));
+throw new Error(`测验框架已打开，但等待 120 秒仍未识别完整题目${timeoutInfo ? `（${timeoutInfo}）` : ''}。可运行 app.inspectQuiz() 查看当前识别结果`);
 }
 
 async function askDeepSeek(questions) {

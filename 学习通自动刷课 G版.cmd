@@ -73,7 +73,7 @@ async function requestAnswers(questions, apiKey, fetchImpl = fetch) {
             response_format: { type: 'json_object' },
             ...settings,
             messages: [
-                { role: 'system', content: '按题意回答全部题目。注意：题干或选项可能经过网页防复制处理，出现个别汉字被替换、插入无关字，或词语看起来不通顺。先结合上下文和选项在内部还原最可能的原句，再按还原后的题意作答；不要把明显异常的替换字当作专业术语，也不要因无法逐字还原而放弃。每题都必须作答：带 options 的选择题只用该题提供的选项字母且不可重复，单选和判断选一个，多选列出所有正确项，放在 letters 里；带 blanks 的填空题/简答题不用字母，按空的数量依次给出文字答案，放在 texts 里，texts 的数量必须等于 blanks，简答/论述/名词解释题给一段完整、简洁的作答。不确定时选最可能的答案。id须对应题号。只输出JSON：{"answers":[{"id":1,"letters":["A"]},{"id":2,"texts":["答案一","答案二"]}]}。' },
+                { role: 'system', content: '按题意回答全部题目。注意：题干或选项可能经过网页防复制处理，出现个别汉字被替换、插入无关字，或词语看起来不通顺。先结合上下文和选项在内部还原最可能的原句，再按还原后的题意作答；不要把明显异常的替换字当作专业术语，也不要因无法逐字还原而放弃。每题都必须作答：带 options 的选择题只用该题提供的选项字母且不可重复，单选和判断选一个，多选必须逐项判断每一个选项、列出全部正确项（正确项可能是 2 个、3 个、4 个甚至全部选项，不要默认或凑成 3 个），放在 letters 里；带 blanks 的填空题/简答题不用字母，按空的数量依次给出文字答案，放在 texts 里，texts 的数量必须等于 blanks，简答/论述/名词解释题给一段完整、简洁的作答。不确定时选最可能的答案。id须对应题号。只输出JSON：{"answers":[{"id":1,"letters":["A"]},{"id":2,"letters":["A","B","C","D"]},{"id":3,"texts":["答案一","答案二"]}]}。' },
                 { role: 'user', content: JSON.stringify(questions) },
             ],
         };
@@ -5928,13 +5928,19 @@ const pool = usable.length ? usable : options;
 const untried = pool.filter((letter) => !tried.some((entry) => entry.length === 1 && entry[0] === letter));
 return [(untried.length ? untried : pool)[0]];
 }
-// 多选：把所有非空组合从小到大排好，先避开判错的组合，再优先没试过的组合
+// 多选：把所有非空组合排好，先避开判错的组合，再优先没试过的组合。
+// 排序不能只按“项数从少到多”：3 项的组合被判错后，按老顺序要先试完所有 1 项、2 项组合，
+// 重做次数用完了都轮不到 4 项，看起来就像“多选永远只选 3 个”。
+// 现在按离上一次答案的项数距离排：先试同等项数的其它组合，再优先“多加一项”，最后才“少选一项”。
 const combos = [];
 const total = Math.pow(2, options.length);
 for (let mask = 1; mask < total; mask++) {
 combos.push(options.filter((_, index) => mask & Math.pow(2, index)));
 }
-combos.sort((a, b) => a.length - b.length || a.join('').localeCompare(b.join('')));
+const lastAnswer = wrong.length ? wrong[wrong.length - 1] : tried.length ? tried[tried.length - 1] : null;
+const anchor = Array.isArray(lastAnswer) ? lastAnswer.length : 0;
+const sizeRank = (size) => (size >= anchor ? size - anchor : 1000 + (anchor - size));
+combos.sort((a, b) => sizeRank(a.length) - sizeRank(b.length) || a.length - b.length || a.join('').localeCompare(b.join('')));
 const notWrong = combos.filter((combo) => !wrong.some((entry) => sameLetters(entry, combo)));
 const pool = notWrong.length ? notWrong : combos;
 const untried = pool.filter((combo) => !tried.some((entry) => sameLetters(entry, combo)));
@@ -5972,7 +5978,7 @@ const avoid = wrong.length ? wrong : tried;
 const avoidedText = avoid.map((entry) => entry.join('、')).join('；');
 const feedback = videoQuizFeedbackText(feedbackText);
 const feedbackHint = feedback ? `页面反馈：“${feedback}”。` : '';
-const multiHint = question.kind === '多选题' ? '；多选题判错可能是多选了某一项，也可能是漏选了某一项，请逐项重新核对，并选全所有正确项' : '';
+const multiHint = question.kind === '多选题' ? '；多选题判错可能是多选了某一项，也可能是漏选了某一项，请逐项重新核对，并选全所有正确项，正确项不一定只有 3 个' : '';
 // 只提交过、页面没认出来判错的那些，别在提示里说成“判错了”，免得把 AI 带偏
 const avoidedLabel = wrong.length ? '已被判为错误' : '已经提交过、页面没有判对';
 const hint = `（注意：以下选择${avoidedLabel}：${avoidedText}。${feedbackHint}请重新审题，必须换一个不同于这些的答案${multiHint}。）`;

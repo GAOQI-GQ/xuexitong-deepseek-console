@@ -445,14 +445,24 @@ button.primary:disabled{opacity:.6;cursor:not-allowed}
 </html>`;
 }
 
+const CHOICE_TYPES = ['单选题', '多选题', '判断题'];
+const TEXT_TYPES = ['填空题', '简答题', '论述题', '名词解释'];
+// 模拟考试动辄 80 道题，这里不再限制题目总数量；页面会分批发送，
+// 每批的题号重新编成 1..n，所以仍要求 id 连续。
 function validQuestions(questions) {
-    if (!Array.isArray(questions) || questions.length < 1 || questions.length > 30) return false;
-    return questions.every((q, i) => Number.isInteger(q.id) && q.id === i + 1 &&
-        ['单选题', '多选题', '判断题'].includes(q.type) &&
-        typeof q.question === 'string' && q.question.length > 0 && q.question.length <= 500 &&
-        Array.isArray(q.options) && q.options.length >= 2 && q.options.length <= 8 &&
-        new Set(q.options.map((o) => o.letter)).size === q.options.length &&
-        q.options.every((o) => /^[A-H]$/.test(o.letter) && typeof o.text === 'string' && o.text.length > 0 && o.text.length <= 500));
+    if (!Array.isArray(questions) || questions.length < 1) return false;
+    return questions.every((q, i) => {
+        if (!q || typeof q !== 'object' || typeof q.type !== 'string') return false;
+        if (!Number.isInteger(q.id) || q.id !== i + 1) return false;
+        if (typeof q.question !== 'string' || q.question.length < 1 || q.question.length > 2000) return false;
+        // 填空/简答没有选项，只校验空的数量。以前这里只认选择题，
+        // 这类题发到本地服务会被当成“题目格式不正确”直接拒掉。
+        if (TEXT_TYPES.includes(q.type)) return Number.isInteger(q.blanks) && q.blanks >= 1 && q.blanks <= 20;
+        if (!CHOICE_TYPES.includes(q.type)) return false;
+        return Array.isArray(q.options) && q.options.length >= 2 && q.options.length <= 8 &&
+            new Set(q.options.map((o) => o.letter)).size === q.options.length &&
+            q.options.every((o) => o && /^[A-H]$/.test(o.letter) && typeof o.text === 'string' && o.text.length > 0 && o.text.length <= 500);
+    });
 }
 
 function validSnapshot(snapshot) {
@@ -615,7 +625,7 @@ const server = createServer(async (req, res) => {
         let raw = '';
         for await (const chunk of req) {
             raw += chunk.toString('utf8');
-            if (raw.length > 100000) throw new Error('请求内容过大');
+            if (raw.length > 2000000) throw new Error('请求内容过大');
         }
         payload = JSON.parse(raw);
         if (req.url === '/answer') {
@@ -2982,8 +2992,31 @@ console.log(`本次发送给 DeepSeek 的填空题/简答题：${JSON.stringify(
 return requestDeepSeekAnswers(payload);
 }
 
+// 一份模拟考试可能有几十上百道题。整卷一次发给模型，输出容易过长被截断，
+// 本地服务也要一次吞下整卷。这里按 20 道一批顺序请求：每批把题号重新编成 1..n，
+// 返回后换回原来的题号再合并，后面的校验逻辑完全不用改。
+const ANSWER_BATCH_SIZE = 20;
 async function requestDeepSeekAnswers(payload) {
 if (DIRECT_MODE) return PAGE.__deepseekAsk(payload);
+const batches = [];
+for (let i = 0; i < payload.length; i += ANSWER_BATCH_SIZE) batches.push(payload.slice(i, i + ANSWER_BATCH_SIZE));
+if (batches.length <= 1) return requestDeepSeekAnswersBatch(payload);
+console.log(`%c共 ${payload.length} 道题，分成 ${batches.length} 批发送给 DeepSeek（每批最多 ${ANSWER_BATCH_SIZE} 道）`, 'color:#2196F3');
+const merged = [];
+for (let i = 0; i < batches.length; i++) {
+if (typeof stopped !== 'undefined' && stopped) throw new Error('脚本已停止');
+const batch = batches[i];
+const offset = i * ANSWER_BATCH_SIZE;
+console.log(`%c第 ${i + 1}/${batches.length} 批：${batch.length} 道题`, 'color:#607D8B');
+const chunk = batch.map((item, index) => ({ ...item, id: index + 1 }));
+const answers = await requestDeepSeekAnswersBatch(chunk);
+if (!Array.isArray(answers) || answers.length !== batch.length) throw new Error(`第 ${i + 1} 批题目 AI 返回数量不匹配`);
+for (const answer of answers) merged.push({ ...answer, id: offset + answer.id });
+}
+return merged;
+}
+
+async function requestDeepSeekAnswersBatch(payload) {
 // DeepSeek 上游忙的时候会回 “HTTP 503 Service is too busy”，本地服务再把它包成 502 转发给页面。
 // 以前只重试 429/503，一遇到 502 就当作致命错误，整节测验停在原地。现在所有 5xx、429 和网络抖动
 // 都按指数退避一直重试（最多约两小时），只要服务恢复就接着作答；配置错误（Key 无效、没设置 Key）
@@ -5287,7 +5320,7 @@ return;
 }
 const textQuestions = questions.textQuestions || [];
 const paperTotal = questions.length + textQuestions.length;
-if (paperTotal > 30) throw new Error('题目数量超过 30，已停止自动提交');
+// 模拟考试可能有 80 道甚至更多题，不再限制整卷题量；题量大时由 requestDeepSeekAnswers 分批发送
 const paperList = paperQuestions(questions);
 const docs = new Set(paperList.map((q) => q.doc));
 if (docs.size !== 1) throw new Error('题目跨多个框架，已停止自动提交');

@@ -1664,7 +1664,8 @@ await sleep(160);
 
 function documentCompletionShown() {
 try {
-if (document.querySelector('.posCatalog_active .icon_Completed')) return true;
+const activeEl = document.querySelector('.posCatalog_active');
+if (activeEl && catalogNodeCompleted(activeEl)) return true;
 } catch (_) {}
 for (const item of contentFrameDocs()) {
 if (/任务点已完成|阅读已完成|已完成阅读|本篇已完成/.test(item.text)) return true;
@@ -1760,6 +1761,55 @@ for (const item of docs) parts.push(`${textFingerprint(item.text)}/${item.images
 return `${cardsFrameSrcs()}#${parts.join('||')}`;
 }
 
+// 目录里的“打勾”不只一种画法：常见的是 .icon_Completed，也有课程用 icon-completed、
+// 图标 img、或者一行“已完成”状态字。逐个元素判断，别只认一个 class 名。
+function catalogElementCompleted(el) {
+if (!el) return false;
+try {
+if (el.classList && el.classList.contains('icon_Completed')) return true;
+const cls = typeof el.className === 'string' ? el.className : '';
+if (cls && /completed/i.test(cls) && !/uncompleted|incomplete|not[_-]?completed|no[_-]?completed/i.test(cls)) return true;
+const title = el.getAttribute ? clean(el.getAttribute('title') || '') : '';
+if (title && /^(已完成|完成|已学完)$/.test(title)) return true;
+if (el.tagName === 'IMG') {
+const src = String(el.getAttribute('src') || '');
+if (/(completed|finish|done|wancheng|duigou)/i.test(src)) return true;
+}
+if (el.classList && /status|state/i.test(cls)) {
+const text = clean(el.textContent || '');
+if (text && text.length <= 12 && /已完成|已学完/.test(text)) return true;
+}
+} catch (_) { /* 忽略异常节点 */ }
+return false;
+}
+
+// 这一节目录节点是不是已经打勾。勾有时画在节点里面，有时画在同一行 li 的旁边。
+// 同一行 li 里别的节的勾不算：只认没有被别的 .posCatalog_select 包住的元素。
+function catalogNodeCompleted(node) {
+if (!node) return false;
+if (catalogElementCompleted(node)) return true;
+try {
+for (const el of node.querySelectorAll('*')) {
+// 传进来的是整行 li 时，里面别的节的勾不能算到这一节头上
+const host = el.closest ? el.closest('.posCatalog_select') : null;
+if (host && host !== node) continue;
+if (catalogElementCompleted(el)) return true;
+}
+} catch (_) { /* 忽略 */ }
+let li = null;
+try { li = node.closest ? node.closest('li') : null; } catch (_) { li = null; }
+if (!li || !li.contains(node)) return false;
+try {
+for (const el of li.querySelectorAll('*')) {
+if (node.contains(el)) continue;
+const host = el.closest ? el.closest('.posCatalog_select') : null;
+if (host && host !== node) continue;
+if (catalogElementCompleted(el)) return true;
+}
+} catch (_) { /* 忽略 */ }
+return false;
+}
+
 // 左侧目录里每一节（含完成标记），用于核对“这一节到底打没打勾”
 function catalogItems() {
 const items = [];
@@ -1771,9 +1821,15 @@ const nameEl = node.querySelector('.posCatalog_name');
 const label = clean((nameEl && (nameEl.getAttribute('title') || nameEl.textContent)) || node.textContent);
 if (!label || label.length > 80) continue;
 if (items.some((item) => item.label === label)) continue;
-let done = false;
-try { done = Boolean(node.querySelector('.icon_Completed')); } catch (_) { done = false; }
-items.push({ label, done, el: node, active: node.classList.contains('posCatalog_active') });
+const done = catalogNodeCompleted(node);
+let active = node.classList.contains('posCatalog_active');
+if (!active) {
+try {
+const li = node.closest ? node.closest('li') : null;
+active = Boolean(li && li.classList.contains('posCatalog_active'));
+} catch (_) { active = false; }
+}
+items.push({ label, done, el: node, active });
 }
 } catch (_) { /* 目录结构变化时忽略 */ }
 return items;
@@ -1820,6 +1876,44 @@ doneSectionSkipped = { label, at: now };
 return true;
 }
 app._sectionAlreadyCompleted = sectionAlreadyCompleted;
+
+// 用户确认过的规则：目录里当前这一节已经打勾，就直接切到下一节，不要停在“未发现视频”。
+// 和上面的 sectionAlreadyCompleted 分工：上面那条要求整棵目录先出现过勾、用来防止误跳；
+// 这条只看“当前高亮节点自己有没有勾/完成字”，用来兜住完成标记样式不一样的课程，
+// 以及“重试 20 次仍没找到视频”时最后那道保险。同一节 45 秒内只推一次、最多推 3 次，
+// 万一平台的“下一节”没点动，不会原地疯狂点击。
+let tickAdvanceState = { label: '', at: 0, count: 0 };
+function currentSectionTicked() {
+let activeEl = null;
+try { activeEl = document.querySelector('.posCatalog_active'); } catch (_) { activeEl = null; }
+if (activeEl) {
+try {
+const host = activeEl.closest ? (activeEl.closest('.posCatalog_select') || activeEl) : activeEl;
+if (catalogNodeCompleted(host)) return true;
+} catch (_) { /* 忽略 */ }
+}
+return false;
+}
+function sectionTickAdvanceReady() {
+let ticked = false;
+try { ticked = currentSectionTicked() || documentCompletionShown(); } catch (_) { ticked = false; }
+if (!ticked) return false;
+const label = activeSectionKey() || activeCatalogLabel() || '';
+const now = Date.now();
+if (tickAdvanceState.label === label) {
+if (now - tickAdvanceState.at < 45000) return false;
+tickAdvanceState.count += 1;
+} else {
+tickAdvanceState = { label, at: now, count: 1 };
+}
+tickAdvanceState.at = now;
+if (tickAdvanceState.count > 3) {
+console.warn(`%c目录里的“${label || '当前小节'}”一直显示已完成，连推 3 次仍没离开这一节，先停下请手动检查`, 'color:#FF9800');
+return false;
+}
+return true;
+}
+app._sectionTickAdvanceReady = sectionTickAdvanceReady;
 
 // 当前显示的任务点编号（内容框架 src 里的 num）：这一节里的第几个任务点。
 // 用它给“任务点已完成”的跳过做冷却，同一节同一个任务点只跳一次。
@@ -6858,6 +6952,16 @@ if (noVideoRetries < 20) {
 this._noVideoRetryTimes = noVideoRetries + 1;
 console.log(`%c暂未找到视频元素，1.5秒后重试 (${this._noVideoRetryTimes}/20)`, "color:#FF9800");
 setTimeout(() => this.play(), 1500);
+return;
+}
+// 目录里这一节已经打勾 = 平台认定这一节做完了（用户确认：看到打勾就直接下一步），
+// 不要停在“未发现视频”等人手动继续
+if (typeof this._sectionTickAdvanceReady === 'function' && this._sectionTickAdvanceReady()) {
+this._isPlaying = false;
+this._clearCheckInterval();
+this._noVideoRetryTimes = 0;
+console.warn('%c目录里这一节已经打勾（任务点已完成），跳过它直接切换下一节', 'color:#4CAF50');
+setTimeout(() => this.nextUnit(), 800);
 return;
 }
 this._isPlaying = false;

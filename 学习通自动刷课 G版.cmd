@@ -2301,6 +2301,40 @@ return [
 return [];
 }
 
+// “A 对 / B 错”型判断题：字母和判断词在同一段文字里，letterOf 和“纯对/错”都不认。
+// 只认最里层元素，并且题卡里不能还有其他字母开头的行，免得把“A 是 / B 否 / C 其他”
+// 这种三选项题裁成两个选项
+function letteredJudgeOptions(card) {
+const pattern = /^([A-H])\s*[.、．:：]?\s*(正确|错误|对|错|√|×|是|否|T|F)$/i;
+const found = new Map();
+let nodes = [];
+try { nodes = Array.from(card.querySelectorAll('span,div,label,li,p,b,i,strong,a,button')); } catch (_) { return []; }
+for (const el of nodes) {
+let text = '';
+try { text = clean(el.textContent); } catch (_) { continue; }
+const match = text.match(pattern);
+if (!match) continue;
+if (!visible(el)) continue;
+let innerSame = false;
+try { innerSame = Array.from(el.children || []).some((child) => clean(child.textContent) === text); } catch (_) { innerSame = false; }
+if (innerSame) continue;
+const letter = match[1].toUpperCase();
+if (found.has(letter)) continue;
+found.set(letter, { letter, text: match[2], element: el });
+}
+if (found.size < 2) return [];
+// 题卡里还有别的字母开头、但没套进判断题格式的行：说明这是普通选择题，别硬套
+for (const el of nodes) {
+let text = '';
+try { text = clean(el.textContent); } catch (_) { continue; }
+if (!/^[A-H](?![A-Za-z])\s*\S/.test(text)) continue;
+const letter = text[0].toUpperCase();
+if (found.has(letter)) continue;
+return [];
+}
+return Array.from(found.values()).sort((a, b) => a.letter.localeCompare(b.letter));
+}
+
 function optionElements(card) {
 const labels = Array.from(card.querySelectorAll('span,div,label,li,p,b,i,strong,a'))
 .filter((el) => letterOf(el) && !Array.from(el.children).some((child) => letterOf(child)));
@@ -2339,6 +2373,9 @@ if (found.size >= 2) return Array.from(found.values()).sort((a, b) => a.letter.l
 // 判断题：没有字母，“正确/错误”两个选项
 const judge = judgeOptionElements(card);
 if (judge.length >= 2) return judge;
+// 判断题的另一种画法：“A 对 / B 错”整段写在一个块里，没有单独的字母元素
+const letteredJudge = letteredJudgeOptions(card);
+if (letteredJudge.length >= 2) return letteredJudge;
 const inputs = Array.from(card.querySelectorAll('input[type="radio"],input[type="checkbox"]'));
 if (inputs.length >= 2 && inputs.length <= 8) {
 inputs.forEach((input, index) => {
@@ -2375,6 +2412,13 @@ for (let depth = 0; card && depth < 9; depth++, card = card.parentElement) {
 const cardText = clean(card.innerText);
 // 同名题型标签重复出现不算“爬到两道题”，只有出现不同题型才停
 if (distinctKindTags(cardText, kindPattern).size > 1) break;
+// 同一个容器里装着好几道题（能数到多个题号）时不能整块当成一题：
+// 同题型的相邻两题会被并成一道，识别数就永远比卷面少
+const rawCard = String(card.innerText || '');
+const cardNumbers = new Set((rawCard.match(/(?:^|\n)\s*(\d{1,3})\s*[.、．]/g) || []).map((item) => item.replace(/[^\d]/g, '')));
+const kindTags = (cardText.match(new RegExp(kindPattern.source, 'g')) || []).length;
+const questionBox = /TiMu|Zy_|timu|question|exercise/i.test(`${card.className || ''} ${card.id || ''}`);
+if (cardNumbers.size > 1 && (!questionBox || kindTags > 1)) { options = []; break; }
 options = optionElements(card);
 if (options.length >= 2 && options.length <= 8) break;
 }
@@ -2384,7 +2428,7 @@ const full = card.innerText || '';
 const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
 const title = clean(firstOption >= 0 ? full.slice(0, firstOption) :
 (node.parentElement.innerText || full))
-.replace(/^\d+\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+.replace(/^\d+\s*[.、．]?\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
 if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
 questions.push({ kind, title, options, card, doc });
 }
@@ -2433,7 +2477,36 @@ if (!questionBox && (full.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length > 1
 const kind = clean(full).match(kindPattern)?.[1] || structuralKindOf(card, options);
 const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
 const title = clean(firstOption >= 0 ? full.slice(0, firstOption) : full)
-.replace(/^\d+\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+.replace(/^\d+\s*[.、．]?\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
+found.push({ kind, title, options, card, doc });
+}
+}
+return found;
+}
+
+// 最后一道保险：直接按题目卡片识别。题型标签没渲染、选项输入框被样式藏起来时，
+// 前面两条扫描都会漏掉这道题；题目卡片本身（TiMu/Zy_）还在，就把题干和选项读回来。
+function cardQuizQuestions(onlyDocs) {
+const found = [];
+for (const doc of (Array.isArray(onlyDocs) ? onlyDocs : courseDocuments())) {
+if (!doc.body) continue;
+let cards = [];
+try { cards = Array.from(doc.querySelectorAll('.TiMu,[class*="TiMu"],[class*="Zy_"],[class*="timu"]')); } catch (_) { continue; }
+for (const card of cards) {
+if (!visible(card)) continue;
+let full = '';
+try { full = String(card.innerText || ''); } catch (_) { continue; }
+if (!full.trim() || full.length > 3000) continue;
+// 卡片里能数到多个题号：这是包着好几道题的容器，不是一道题
+const numbers = new Set((full.match(/(?:^|\n)\s*(\d{1,3})\s*[.、．]/g) || []).map((item) => item.replace(/[^\d]/g, '')));
+if (numbers.size > 1) continue;
+const options = optionElements(card);
+if (options.length < 2 || options.length > 8) continue;
+const kind = clean(full).match(kindPattern)?.[1] || structuralKindOf(card, options);
+const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
+const title = clean(firstOption >= 0 ? full.slice(0, firstOption) : full)
+.replace(/^\d+\s*[.、．]?\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
 if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
 found.push({ kind, title, options, card, doc });
 }
@@ -3092,6 +3165,7 @@ if (!submitDoc) throw new Error('进入章节测验后等待 120 秒，仍未找
 await revealQuizQuestions();
 let previousSignature = '';
 let stableCount = 0;
+let shortStableCount = 0;
 for (let attempt = 0; attempt < 240; attempt++) {
 if (stopped) throw new Error('脚本已停止');
 if (quizCompleted()) return null;
@@ -3112,8 +3186,22 @@ const signature = questions.map((q) => `${q.kind}:${q.title}:${q.options.length}
 stableCount = signature === previousSignature ? stableCount + 1 : 0;
 previousSignature = signature;
 if (stableCount >= 3) return questions;
+} else if (total && expected && quizShortfallAcceptable(total, expected)) {
+// 少一两道题、而且识别结果 20 秒都没变化：说明剩下那道确实读不出来，
+// 再等下去只会卡死在“等题目”这一步。先按已识别的题作答
+const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}:${q.blanks.length}`).join('|');
+const signature = questions.map((q) => `${q.kind}:${q.title}:${q.options.length}`).join('|') +
+(textSignature ? `|${textSignature}` : '');
+shortStableCount = signature === previousSignature ? shortStableCount + 1 : 0;
+previousSignature = signature;
+stableCount = 0;
+if (shortStableCount >= 40) {
+console.warn(`%c卷面识别少 ${expected - total} 道题（识别 ${total}/${expected}），继续等也不会出现，先按已识别的题作答`, 'color:#FF9800');
+return questions;
+}
 } else {
 stableCount = 0;
+shortStableCount = 0;
 previousSignature = '';
 }
 // 题目可能分段渲染：等待期间持续往下滚一点，别只滚动一次就干等
@@ -3124,6 +3212,10 @@ const extra = describeQuizPaper(info);
 const expectedText = expected ? `，卷面写着题量 ${expected} 道` : '';
 const split = textQuestions.length ? `（选择 ${questions.length} 道，填空/简答 ${textQuestions.length} 道）` : '';
 console.log(`测验题目仍在加载，已等待 ${attempt / 2} 秒；当前识别 ${total} 道${split}${expectedText}${extra ? `；${extra}` : ''}`);
+// 少识别题时把已识别的题逐条列出来，缺的是哪一道一眼就能看到
+if (expected && total < expected && typeof reportQuizPaperGap === 'function') {
+try { reportQuizPaperGap(questions, expected); } catch (_) { /* 忽略 */ }
+}
 }
 await sleep(500);
 }
@@ -4616,6 +4708,16 @@ const countText = text.match(/题量\s*[:：]\s*(\d+)/);
 return countText ? Number(countText[1]) : quizHeadingTotal(doc.body);
 }
 
+// 识别出的题数比卷面少一两道时（题型标签或选项输入框没渲染出来，怎么扫都读不全），
+// 不能永远停在“等题目”这一步、更不能再走“跳节→被弹回”的死循环：
+// 少得不多就按已识别的题先交，平台判分后由重做流程接着处理；缺得太多才坚决不交。
+function quizShortfallAcceptable(total, expected) {
+if (!expected) return true;
+if (total >= expected) return true;
+const gap = expected - total;
+return gap <= Math.min(3, Math.max(1, Math.round(expected * 0.1)));
+}
+
 let quizStructuralLogKey = '';
 // 只按“提交按钮所在框架”来识别试卷；提交按钮在外层、题目在别的框架时退回全页面识别
 function quizPaperCandidates(submitDoc) {
@@ -4646,6 +4748,22 @@ if (key !== quizStructuralLogKey) {
 quizStructuralLogKey = key;
 console.log(`%c卷面题型标签不完整，已按选项结构自动补全 ${added.length} 道题（识别到 ${total} 道，补后 ${questions.length} 道），再交给 DeepSeek 作答`, 'color:#4CAF50');
 }
+}
+}
+// 结构扫描也没补够：直接按题目卡片再补一次（标签没渲染、输入框被藏起来的题走这条）
+if (paperQuestionTotal(questions) < (expected || 1)) {
+const knownCards = questions.map((question) => question.card).filter(Boolean);
+const extra = cardQuizQuestions(scoped).filter((question) =>
+!knownCards.some((card) => card === question.card ||
+(card.contains && card.contains(question.card)) ||
+(question.card.contains && question.card.contains(card))));
+const room = expected ? Math.max(0, expected - paperQuestionTotal(questions)) : extra.length;
+if (extra.length && room > 0) {
+const texts = questions.textQuestions || [];
+const added = extra.slice(0, room);
+questions = questions.slice().concat(added);
+if (texts.length) questions.textQuestions = texts;
+console.log(`%c题型标签缺失/输入框被隐藏，按题目卡片补回 ${added.length} 道题（补后 ${paperQuestionTotal(questions)} 道）`, 'color:#4CAF50');
 }
 }
 return dedupePaperQuestions(questions || []);
@@ -4702,9 +4820,12 @@ return null;
 }
 const { expectedTotal } = quizPaperExpected(questions);
 if (expectedTotal && expectedTotal !== total) {
-quizPaperStable = { signature: '', count: 0 };
 reportQuizPaperGap(questions, expectedTotal);
+// 少得不多时照样按已识别的题作答；只有缺得多才继续等页面渲染
+if (!quizShortfallAcceptable(total, expectedTotal)) {
+quizPaperStable = { signature: '', count: 0 };
 return null;
+}
 }
 const textSignature = (questions.textQuestions || [])
 .map((question) => `${question.kind}:${question.title}:${question.blanks.length}`).join('|');
@@ -4729,7 +4850,7 @@ const { paperBody, expectedTotal } = quizPaperExpected(questions);
 if (!paperBody) return null;
 if (expectedTotal && expectedTotal !== total) {
 reportQuizPaperGap(questions, expectedTotal);
-return null;
+if (!quizShortfallAcceptable(total, expectedTotal)) return null;
 }
 return questions;
 }
@@ -5553,8 +5674,12 @@ if (docs.size !== 1) throw new Error('题目跨多个框架，已停止自动提
 const paperDocument = paperDoc(questions);
 const countText = clean(paperDocument.body.innerText).match(/题量\s*[:：]\s*(\d+)/);
 const expectedTotal = countText ? Number(countText[1]) : quizHeadingTotal(paperDocument.body);
-if (expectedTotal && expectedTotal !== paperTotal)
+if (expectedTotal && expectedTotal !== paperTotal) {
+reportQuizPaperGap(questions, expectedTotal);
+if (!quizShortfallAcceptable(paperTotal, expectedTotal))
 throw new Error(`页面显示 ${expectedTotal} 道题，脚本只识别 ${paperTotal} 道，已停止提交，避免只答一部分`);
+console.warn(`%c页面显示 ${expectedTotal} 道题，脚本识别 ${paperTotal} 道（少 ${expectedTotal - paperTotal} 道），先按已识别的题作答`, 'color:#FF9800');
+}
 const textSignature = textQuestions.map((q) => `${q.kind}:${q.title}`).join('|');
 const signature = questions.map((q) => `${q.kind}:${q.title}`).join('|') + (textSignature ? `|${textSignature}` : '');
 // 重做流程自己会换答案再交，不算“重复提交同一份答案”；

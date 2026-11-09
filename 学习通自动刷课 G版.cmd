@@ -1129,7 +1129,7 @@ try {
 const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
 let node;
 while ((node = walker.nextNode())) {
-if (!/暂无内容|暂无学习内容|暂无任务点|暂无可学习内容/.test(clean(node.textContent))) continue;
+if (!/暂无内容|暂无学习内容|暂无任务点|暂无可学习内容|教师未创建|教师尚未创建|未创建完成该测验|尚未创建该测验/.test(clean(node.textContent))) continue;
 if (visible(node.parentElement)) return true;
 }
 } catch (_) { /* 跨域或页面正在重建 */ }
@@ -1138,6 +1138,49 @@ return false;
 }
 
 app._pageShowsNoContent = pageShowsNoContent;
+
+// 平台明确写着“教师未创建完成该测验”的小节永远是空的：这一节不会再出现题目或提交按钮。
+// 认出来之后把它记成“没有重做入口”的小节，离开本章的弹窗里就会直接选“下一节”，
+// 而不是点“去学习”又绕回同一张空页面。
+function pageShowsUncreatedQuiz() {
+const marker = /教师未创建|教师尚未创建|未创建完成该测验|尚未创建该测验|教师未上传该测验/;
+for (const doc of courseDocuments()) {
+if (!doc.body) continue;
+try {
+const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT);
+let node;
+while ((node = walker.nextNode())) {
+if (!marker.test(clean(node.textContent))) continue;
+if (!visible(node.parentElement)) continue;
+if (typeof markQuizNoRedo === 'function') markQuizNoRedo();
+return true;
+}
+} catch (_) { /* 跨域或页面正在重建 */ }
+}
+return false;
+}
+
+app._pageShowsUncreatedQuiz = pageShowsUncreatedQuiz;
+
+// 空小节（“暂无内容” / “教师未创建完成该测验”）自动跳过的计数：
+// 同一节连续跳过 3 次还被“还有任务点未完成”带回来，就停下请人处理，别无限打转
+const emptySectionSkipState = { label: '', count: 0 };
+function emptySectionSkipReady() {
+let label = '';
+try { label = activeCatalogLabel() || ''; } catch (_) { label = ''; }
+if (emptySectionSkipState.label !== label) {
+emptySectionSkipState.label = label;
+emptySectionSkipState.count = 0;
+}
+emptySectionSkipState.count += 1;
+if (emptySectionSkipState.count > 3) {
+console.warn(`%c“${label || '当前小节'}”一直没有可学内容（页面写着“教师未创建完成该测验”/“暂无内容”），已经连续跳过 3 次仍被带回来，先停下请手动检查这一节`, 'color:#FF9800');
+return false;
+}
+return true;
+}
+
+app._emptySectionSkipReady = emptySectionSkipReady;
 
 // 目录里标着测验、内容区却什么都没有：测验已经做过，或者这一节压根没放题目。
 // 这种小节永远不会再出现“提交”按钮，以前会干等 120 秒、重试 3 次，最后停下来等人手动处理。
@@ -3020,9 +3063,10 @@ if (!dialog) {
 leaveDialogSeenAt = 0;
 return null;
 }
-// 这一节已经确认过测验没有重做入口：优先点“下一节/继续观看”真的离开，
-// 否则“去学习→成绩页→下一节→又被弹回来”会无限循环
-const skipSection = typeof quizNoRedoKnown === 'function' && quizNoRedoKnown();
+// 这一节已经确认过测验没有重做入口、或者平台写着“教师未创建完成该测验”：优先点“下一节/继续观看”真的离开，
+// 否则“去学习→空页面/成绩页→下一节→又被弹回来”会无限循环
+const skipSection = (typeof quizNoRedoKnown === 'function' && quizNoRedoKnown()) ||
+(typeof pageShowsUncreatedQuiz === 'function' && pageShowsUncreatedQuiz());
 let found = skipSection ? findLeaveChapterDialogProceed(dialog) : null;
 if (!found) found = findLeaveChapterDialogButton(dialog);
 if (!found) {
@@ -7191,7 +7235,29 @@ return;
 }
 const pageEmpty = typeof this._pageShowsNoContent === 'function' && this._pageShowsNoContent();
 const noVideoRetries = this._noVideoRetryTimes || 0;
+// 页面明确写着“教师未创建完成该测验”：这一节永远不会出现题目，别等 20 次重试，直接跳过
+if (typeof this._pageShowsUncreatedQuiz === 'function' && this._pageShowsUncreatedQuiz()) {
+if (typeof this._emptySectionSkipReady !== 'function' || this._emptySectionSkipReady()) {
+this._isPlaying = false;
+this._clearCheckInterval();
+this._noVideoRetryTimes = 0;
+this._safeStopped = false;
+console.warn('%c这一节的测验老师还没创建（页面写着“教师未创建完成该测验”），直接跳过这一节', 'color:#FF9800');
+setTimeout(() => this.nextUnit(), 800);
+return;
+}
+this._isPlaying = false;
+this._clearCheckInterval();
+this._safeStopped = true;
+return;
+}
 if (pageEmpty && noVideoRetries >= 10) {
+if (typeof this._emptySectionSkipReady === 'function' && !this._emptySectionSkipReady()) {
+this._isPlaying = false;
+this._clearCheckInterval();
+this._safeStopped = true;
+return;
+}
 this._isPlaying = false;
 this._clearCheckInterval();
 console.warn('%c当前小节显示“暂无内容”，0.8秒后自动切换到下一小节', 'color:#FF9800');

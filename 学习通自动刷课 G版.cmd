@@ -1137,6 +1137,42 @@ if (!media.paused && !media.ended) state.playing = true;
 return state;
 }
 
+// 媒体元素是不是“当前正在显示的任务点”。
+// 切到下一个任务点（尤其是章节测验）后，上一个任务的播放器框架有时还留着尺寸，
+// 只是被新内容盖住或滚出了屏幕。只按“有没有盒子”判断，会把测验页误判成视频页，
+// 视频流程就会一直去点“下一节”，永远进不了答题流程。
+function mediaIsCurrentTask(media) {
+if (!media || !media.isConnected || !mediaLooksShown(media)) return false;
+try {
+const doc = media.ownerDocument;
+const text = doc && doc.body ? clean(doc.body.innerText || doc.body.textContent || '') : '';
+// 媒体所在的整个文档就是一份完整试卷：这个视频是上一个任务点留下的，不是当前任务
+if (text && text.length <= 50000 && /题量\s*[:：]\s*\d+|交卷|提交试卷/.test(text)) return false;
+} catch (_) { /* 忽略 */ }
+try {
+let frameEl = media.ownerDocument.defaultView && media.ownerDocument.defaultView.frameElement;
+for (let depth = 0; frameEl && depth < 6; depth++) {
+let rect = null;
+try { rect = frameEl.getBoundingClientRect(); } catch (_) { rect = null; }
+// 读不到布局（测试环境、框架还没布局）：沿用原来的“有盒子就算在显示”
+if (!rect || rect.width < 2 || rect.height < 2) return true;
+const parentDoc = frameEl.ownerDocument;
+const parentWin = parentDoc && parentDoc.defaultView;
+if (!parentWin) return true;
+const cx = rect.left + rect.width / 2;
+const cy = rect.top + rect.height / 2;
+// 框架中心已经滚出屏幕
+if (cx < 0 || cy < 0 || cx > (parentWin.innerWidth || 0) || cy > (parentWin.innerHeight || 0)) return false;
+let hit = null;
+try { hit = parentDoc.elementFromPoint(cx, cy); } catch (_) { hit = null; }
+// 框架中心被别人盖住（新任务点的内容压在上面）
+if (hit && hit !== frameEl && !frameEl.contains(hit) && !hit.contains(frameEl)) return false;
+frameEl = parentWin.frameElement;
+}
+} catch (_) { return true; }
+return true;
+}
+
 // —— 视频任务点还在加载 ——
 // 切换小节时，播放器框架和“任务点/观看时长”标题通常先出来，<video> 要再等一两秒。
 // 这段时间如果按“纯图文”去滚内容区（本页的“知识点”也会被当成图文），视频就会一直停着，
@@ -1303,7 +1339,24 @@ function stepProbe() {
 if (Date.now() - stepProbeAt < 800) return stepProbeState;
 stepProbeAt = Date.now();
 const video = visibleVideoState();
-stepProbeState = { videoAny: video.any, videoPlaying: video.playing, quiz: quizFrameEvidence(), quizPage: quizPageEvidence() };
+let videoAny = video.any;
+// 上一个任务点留下的播放器还挂在 DOM 里（被测验页盖住/滚出屏幕）时，不算“本页有视频”
+if (videoAny) {
+try {
+let shownNow = false;
+for (const doc of courseDocuments()) {
+for (const media of doc.querySelectorAll('video, audio')) {
+if (mediaIsCurrentTask(media)) {
+shownNow = true;
+break;
+}
+}
+if (shownNow) break;
+}
+videoAny = shownNow;
+} catch (_) { videoAny = video.any; }
+}
+stepProbeState = { videoAny, videoPlaying: video.playing, quiz: quizFrameEvidence(), quizPage: quizPageEvidence() };
 return stepProbeState;
 }
 
@@ -5807,7 +5860,11 @@ if (app._videoQuizActive || app._videoQuizPending) {
 scheduleVideoEndedNext(2000, attempt);
 return;
 }
-if (findVideoQuizCard() || videoQuizSuccessVisible()) {
+// 章节测验试卷不算弹题：不要让这个定时器一直被它拖着不往下走
+const quizStillOpen = typeof app._videoQuizVisibleNow === 'function'
+? app._videoQuizVisibleNow()
+: (Boolean(findVideoQuizCard()) || videoQuizSuccessVisible());
+if (quizStillOpen) {
 scheduleVideoEndedNext(2000, attempt);
 return;
 }
@@ -6464,6 +6521,9 @@ app._videoQuizActive = false;
 app._videoQuizVisibleNow = function () {
 const question = findVideoQuizCard();
 if (question) {
+// 整份章节测验试卷不能被当成视频弹题：作答交给章节测验流程，
+// 否则视频流程会一直等“弹题做完”，最后只能被停滞自检硬拉走
+try { if (looksLikeChapterQuizPaper(question)) return false; } catch (_) { /* 忽略 */ }
 // 面板已经写着“共 N 题，已答对 N 题”、又没有“重新作答”入口时，它只是没自动收起的
 // 回顾面板；继续当成“还有弹题没做”会把视频永久拦住，永远恢复不了播放
 let text = '';
@@ -7399,6 +7459,16 @@ return this._switchToVideo(next, reason);
 _proceedAfterVideo(reason, endedVideo) {
 if (this._destroyed) return true;
 if (this._nextUnitPending) return true;
+// 屏幕上是章节测验（视频所在的旧任务点已被测验页盖住）：别点“下一节”，
+// 交给 play() 的章节测验流程把这份卷子做完
+if (typeof this._isChapterTest === 'function' && this._isChapterTest()) {
+this._isPlaying = false;
+this._clearCheckInterval();
+setTimeout(() => {
+if (!this._destroyed) this.play();
+}, 800);
+return true;
+}
 if (endedVideo && this._videoEl && this._videoEl !== endedVideo) return true;
 if (endedVideo && endedVideo.isConnected && this._doneVideos) {
 const markedSrc = this._doneVideos.get(endedVideo);

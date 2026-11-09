@@ -4106,7 +4106,14 @@ return true;
 }
 
 const QUIZ_REDO_PATTERN = /^(点击)?(重做(此题|本题|试卷|试题)?|再做一次|再做一遍|重测|重考|再测一次|再考一次|重新测试|重新测验|重新考试|重新作答|重新答题|重新做题|再答一次|再次答题|再次作答)$/;
-const QUIZ_FAILURE_PATTERN = /未达到及格线|未达到合格线|不及格|请重做|未通过|未达标/;
+// 成绩状态文字。注意“不及格/未通过/未达标”这类词也会出现在题目正文里
+// （成绩页会把整张试卷包括 IF 函数示例都显示出来），所以单独匹配到它们还不够，
+// quizFailureShown 里还要看页面显示的数字成绩和“任务点已完成”绿标来排除满分页。
+const QUIZ_FAILURE_PATTERN = /未达到及格线|未达到合格线|未达到分数线|不及格|请重做|未通过|未达标/;
+// 明确写在成绩页上的状态文字：出现就一律按未通过处理，不参考分数
+const QUIZ_FAILURE_STRONG_PATTERN = /未达到及格线|未达到合格线|未达到分数线|请重做/;
+// 及格线默认 60 分；平台“必须满分”的课程会直接写“未达到及格线，请重做”，由强状态文字兜住
+const QUIZ_PASS_SCORE = 60;
 
 // 题目身份用“题型+题干”。结果页会把“我的答案/正确答案/回答正确”混进题干里，
 // 这些内容要先去掉，否则交卷前和结果页上的同一道题会被当成两道，记忆就对不上了
@@ -4131,7 +4138,26 @@ try {
 value = courseDocuments().some((doc) => {
 let text = '';
 try { text = String(doc.body?.innerText || ''); } catch (_) { return false; }
-return QUIZ_FAILURE_PATTERN.test(text);
+if (!QUIZ_FAILURE_PATTERN.test(text)) return false;
+// 有明确的成绩状态文字（“未达到及格线，请重做”）：不管显示什么分数都算未通过
+if (QUIZ_FAILURE_STRONG_PATTERN.test(text)) return true;
+// 没有强状态文字时，页面同时显示及格的数字成绩就按通过处理。
+// 成绩页会把整张试卷的文字都放在 body 里，题目/解析里出现“不及格”这类词很常见
+const scores = [];
+const scoreRes = [
+// “本次成绩 100 分”“最终成绩：100 分”这类成绩页标签，比题干的“成绩大于等于 60”可靠
+/(?:本次成绩|最终成绩|考试成绩)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*分?/g,
+// “成绩：60 分”“得分：60 分”：要求带冒号和“分”，避免把题干里的数字当成成绩
+/(?:成绩|得分)\s*[:：]\s*(\d+(?:\.\d+)?)\s*分/g,
+];
+for (const scoreRe of scoreRes) {
+let match = null;
+while ((match = scoreRe.exec(text)) && scores.length < 30) scores.push(Number(match[1]));
+}
+if (scores.length && Math.max.apply(null, scores) >= QUIZ_PASS_SCORE) return false;
+// 平台已经给当前任务点打上“任务点已完成”的绿标：以平台的完成状态为准
+if (typeof docShowsTaskPointDone === 'function' && docShowsTaskPointDone(doc)) return false;
+return true;
 });
 } catch (_) {
 value = false;
@@ -5080,6 +5106,38 @@ await sleep(250);
 return false;
 }
 
+// 平台上一次重做留下的“确认重做？”提示框：脚本重新注入时它可能还挂着，挡住下面的“下一节”。
+// 只点“取消/关闭”；绝不能点“确定”，那会真的把已经满分的卷子再重做一遍。
+async function dismissQuizRedoDialog() {
+for (const doc of courseDocuments()) {
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('.layui-layer,.layui-layer-dialog,.el-message-box,.el-dialog,[role="dialog"],[role="alertdialog"]')); } catch (_) { continue; }
+for (const el of nodes) {
+if (!visible(el)) continue;
+let text = '';
+try { text = clean(el.innerText); } catch (_) { continue; }
+if (!text || text.length > 200) continue;
+if (!/确认重做|确定重做|是否重做|重做[？?]/.test(text)) continue;
+const cancel = findButtonIn(el, '取消') || findButtonIn(el, '关闭');
+if (cancel) {
+console.log('%c发现上次重做留下的“确认重做”提示框，点“取消”收起它（这份测验已经完成，不再重做）', 'color:#FF9800');
+fireClick(cancel);
+await sleep(800);
+return true;
+}
+let close = null;
+try { close = el.querySelector('.layui-layer-close,.el-message-box__close,.close'); } catch (_) { close = null; }
+if (close) {
+console.log('%c发现上次重做留下的“确认重做”提示框，点关闭收起它（这份测验已经完成，不再重做）', 'color:#FF9800');
+fireClick(close);
+await sleep(800);
+return true;
+}
+}
+}
+return false;
+}
+
 // 交卷后等结果页：明确判错、写着不及格，或者每题都判完了，才算有结论
 async function waitForQuizResult() {
 for (let attempt = 0; attempt < 60; attempt++) {
@@ -5342,6 +5400,8 @@ let quizAnswered = false;
 // 目录里这一节已经打勾：不管它是纯测验、还是视频+测验混排，整节任务点都已完成，
 // 不要再等题目、也不要再提交，直接进下一节（play() 里同一判断会更早拦住，这里兜底直接调用的路径）
 if (sectionAlreadyCompleted()) {
+// 上次卡在重做循环里时，平台上可能还挂着“确认重做？”提示框，先点“取消”收起来
+await dismissQuizRedoDialog();
 console.log('%c这一节在目录里已经打勾（全部任务点已完成），跳过测验直接进入下一节', 'color:#4CAF50');
 await goToNextStep();
 return;
@@ -5386,6 +5446,8 @@ await goToNextStep();
 return;
 }
 if (quizCompleted()) {
+// 上次卡在重做循环里时，平台上可能还挂着“确认重做？”提示框，先点“取消”收起来
+await dismissQuizRedoDialog();
 console.log('检测到当前章节测验已完成，点击“下一节”进入新视频');
 await goToNextStep();
 return;

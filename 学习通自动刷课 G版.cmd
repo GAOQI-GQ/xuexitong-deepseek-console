@@ -943,6 +943,69 @@ console.error('%c脚本启动超时：未检测到课程目录（#coursetree）�
 // 只按“第一个有尺寸的框架”判断会把当前步骤认错：明明屏幕上是已完成的视频，
 // 却被当成章节测验去等永远不会出现的题目。这里按“内容区真正显示的是哪个框架”来选：
 // 先用内容区中心点最上层命中谁（浏览器真实布局），读不到坐标（例如测试环境）再退回面积最大的那个。
+// —— 新版章节页的卷面识别 ——
+// 新版章节页没有 knowledge/cards 框架、也没有 prev_title，章节测验只能从卷面本身认。
+// attachQuizAutomation 和 app 的方法都要用（步骤标题、“视频已完成”分支），所以放在模块层。
+// 判据：当前这一页要有真实露出来的“提交/交卷”按钮 + 题目内容（写着题量，或至少两种题型）。
+// 视频弹题也有“提交”和单选框，但它一般只有一道题，没有题量，所以不会被误判成整份试卷。
+let quizPaperShownCache = { at: 0, value: false };
+
+function visibleQuizSubmitIn(doc) {
+const shown = (el) => {
+if (!el || !el.isConnected) return false;
+try {
+if (!el.getClientRects().length) return false;
+if (el.ownerDocument.defaultView.getComputedStyle(el).visibility === 'hidden') return false;
+} catch (_) { return false; }
+return true;
+};
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('button,a,input[type="button"],input[type="submit"],[role="button"],div,span')); } catch (_) { return false; }
+for (const el of nodes) {
+if (!shown(el) || el.disabled) continue;
+const text = String(el.value || el.innerText || '').replace(/\s+/g, '');
+if (/^(提交|交卷|提交答案|提交试卷|交卷并查看结果)$/.test(text)) return true;
+const hint = `${el.className || ''} ${el.id || ''}`.toLowerCase();
+if (/submit|tijiao/.test(hint)) return true;
+}
+return false;
+}
+
+function pageShowsQuizPaper() {
+const now = Date.now();
+if (quizPaperShownCache.at && now - quizPaperShownCache.at < 800) return quizPaperShownCache.value;
+const docs = [];
+const visit = (doc, depth) => {
+if (!doc || depth > 3 || docs.includes(doc)) return;
+docs.push(doc);
+let frames = [];
+try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) { frames = []; }
+for (const frame of frames) {
+try { visit(frame.contentDocument, depth + 1); } catch (_) { /* 跨域框架读不到 */ }
+}
+};
+try { visit(document, 0); } catch (_) { /* 页面正在重建 */ }
+let value = false;
+for (const doc of docs) {
+if (!doc.body) continue;
+let text = '';
+try { text = String(doc.body.innerText || ''); } catch (_) { continue; }
+const tags = (text.match(/[\[【](单选题|多选题|判断题)[\]】]/g) || []).length;
+const hasCount = /题量\s*[:：]\s*\d+|总题量/.test(text);
+if (!hasCount && tags < 2) continue;
+if (!visibleQuizSubmitIn(doc)) continue;
+let tokens = 0;
+try {
+tokens = doc.querySelectorAll('.TiMu,[class*="TiMu"],[class*="Zy_"],input[type="radio"],input[type="checkbox"],textarea').length;
+} catch (_) { tokens = 0; }
+if (tokens < 2) continue;
+value = true;
+break;
+}
+quizPaperShownCache = { at: now, value };
+return value;
+}
+
 function displayedCardsFrame() {
 const isCards = (frame) => {
 try { return Boolean(frame) && frame.tagName === 'IFRAME' && /\/knowledge\/cards/.test(frame.getAttribute('src') || ''); } catch (_) { return false; }
@@ -7182,6 +7245,18 @@ this._isPlaying = false;
 setTimeout(() => this.play(), 300);
 return;
 }
+// 页面上其实已经是章节测验：_getVideoEl 找到的多半是上一节遗留的播放器（已完成、不可见），
+// 不能因为“这个视频播完了”就当成整页视频完成而跳过卷子
+if (typeof pageShowsQuizPaper === 'function' && pageShowsQuizPaper()) {
+this._videoEl = null;
+this._quizVideo = null;
+this._allDoneChecks = 0;
+this._isPlaying = false;
+this._clearCheckInterval();
+console.warn('%c页面上是章节测验（已完成视频是上一节残留），先去做题，不按“视频已完成”跳过', 'color:#4CAF50');
+this._advanceChapterTest();
+return;
+}
 this._allDoneChecks = (this._allDoneChecks || 0) + 1;
 this._isPlaying = false;
 this._clearCheckInterval();
@@ -7303,7 +7378,10 @@ if (num === '1') return '章节测验';
 }
 const prevTitle = document.getElementsByClassName('prev_title')[0];
 const text = prevTitle ? (prevTitle.title || prevTitle.textContent || '').trim() : '';
-return text === '视频' || text === '章节测验' ? text : '';
+if (text === '视频' || text === '章节测验') return text;
+// 新旧两套结构信号都没有时，按页面上真实的卷面判断（新版章节页就是这样）
+if (typeof pageShowsQuizPaper === 'function' && pageShowsQuizPaper()) return '章节测验';
+return '';
 },
 _isChapterTest() {
 return this._currentStepTitle() === '章节测验';

@@ -1103,16 +1103,33 @@ app._contentFrameDocs = contentFrameDocs;
 let stepProbeAt = 0;
 let stepProbeState = { videoAny: false, videoPlaying: false, quiz: 'none' };
 
+// 音频任务点用的是 <audio>，自定义播放器常把它设成 0x0，真正的界面在父容器上。
+// 这里统一判断“媒体元素在不在可见区域”：视频看自己的盒子，音频可以看父容器。
+function mediaLooksShown(media) {
+if (!media || !media.isConnected) return false;
+try {
+const rects = media.getClientRects();
+if (rects.length && rects[0].width >= 80 && rects[0].height >= 40) return true;
+if (media.tagName !== 'AUDIO') return false;
+const body = media.ownerDocument && media.ownerDocument.body;
+let node = media.parentElement;
+for (let depth = 0; node && node !== body && node !== media.ownerDocument.documentElement && depth < 6; depth++, node = node.parentElement) {
+const parentRects = node.getClientRects();
+if (parentRects.length && parentRects[0].width >= 120 && parentRects[0].height >= 40) return true;
+}
+} catch (_) { return false; }
+return false;
+}
+
 function visibleVideoState() {
 const state = { any: false, playing: false };
 for (const doc of courseDocuments()) {
 try {
-for (const video of doc.querySelectorAll('video')) {
-const rects = video.getClientRects();
-if (!rects.length || rects[0].width < 80 || rects[0].height < 40) continue;
+for (const media of doc.querySelectorAll('video, audio')) {
+if (!mediaLooksShown(media)) continue;
 state.any = true;
 try {
-if (!video.paused && !video.ended) state.playing = true;
+if (!media.paused && !media.ended) state.playing = true;
 } catch (_) { /* 播放器状态暂时读不到 */ }
 }
 } catch (_) { /* 跨域或页面正在重建 */ }
@@ -1134,12 +1151,12 @@ try {
 // 外层页面的视频任务标题栏：只有视频任务点才会出现“观看时长”
 if (doc === document) {
 const pageText = clean(doc.body ? doc.body.innerText : '');
-if (pageText.length <= 50000 && /观看时长|视频任务点/.test(pageText)) return true;
+if (pageText.length <= 50000 && /观看时长|听课时长|视频任务点|音频任务点/.test(pageText)) return true;
 }
 const frames = Array.from(doc.querySelectorAll('iframe'));
 const playerFrame = frames.some((frame) => {
 const src = frame.getAttribute('src') || '';
-if (!/ananas\/modules\/video|modules\/video\/index/i.test(src)) return false;
+if (!/ananas\/modules\/(video|audio)|modules\/(video|audio)\/index/i.test(src)) return false;
 try { return frame.getClientRects().length > 0; } catch (_) { return false; }
 });
 if (playerFrame) return true;
@@ -1236,9 +1253,8 @@ if (QUIZ_TEXT_PATTERN.test(String(doc.body.textContent || ''))) sawText = true;
 if (doc.querySelector(QUIZ_DOM_SELECTOR)) sawDom = true;
 // 单个复选框/单选框可能只是普通控件，至少要有 2 个才算作答选项
 if (!sawDom && doc.querySelectorAll('input[type="radio"],input[type="checkbox"]').length >= 2) sawDom = true;
-for (const video of doc.querySelectorAll('video')) {
-const rects = video.getClientRects();
-if (rects.length && rects[0].width >= 80 && rects[0].height >= 40) {
+for (const media of doc.querySelectorAll('video, audio')) {
+if (mediaLooksShown(media)) {
 videoInside = true;
 break;
 }
@@ -1420,7 +1436,7 @@ try { if (doc.querySelector(QUIZ_DOM_SELECTOR)) continue; } catch (_) {}
 // 视频页（哪怕播放器还没渲染完）不按图文处理，交给视频逻辑
 let hasVideo = false;
 try {
-hasVideo = Boolean(doc.querySelector('video,.vjs-tech,.vjs-big-play-button,#video_html5_api,.ans-video'));
+hasVideo = Boolean(doc.querySelector('video,audio,.vjs-tech,.vjs-big-play-button,#video_html5_api,.ans-video,.ans-audio'));
 } catch (_) { hasVideo = false; }
 if (hasVideo) continue;
 items.push({ doc, text, images });
@@ -1768,7 +1784,7 @@ if (!doc || !doc.body) return false;
 let text = '';
 try { text = clean(doc.body.innerText || doc.body.textContent || ''); } catch (_) { return false; }
 if (!text || text.length > 30000) return false;
-return /任务点已完成|视频任务点已完成|视频已完成/.test(text);
+return /任务点已完成|视频任务点已完成|视频已完成|音频任务点已完成|音频已完成/.test(text);
 }
 
 // 页面上有没有“平台已标记完成”的视频任务点（内容区那行绿字，不是目录里的勾）
@@ -1776,7 +1792,7 @@ function completedVideoTaskPointShown() {
 try {
 for (const doc of courseDocuments()) {
 let hasVideo = false;
-try { hasVideo = Boolean(doc.querySelector('video')); } catch (_) { hasVideo = false; }
+try { hasVideo = Boolean(doc.querySelector('video, audio')); } catch (_) { hasVideo = false; }
 if (hasVideo && docShowsTaskPointDone(doc)) return true;
 }
 } catch (_) { /* 跨域或页面正在重建 */ }
@@ -3459,15 +3475,16 @@ const visit = (doc, depth) => {
 if (!doc || depth > 4 || docs.includes(doc)) return;
 docs.push(doc);
 try {
-for (const video of doc.querySelectorAll('video')) {
+for (const video of doc.querySelectorAll('video, audio')) {
 let rect = null;
 try { rect = video.getClientRects()[0]; } catch (_) {}
 rows.push({
+kind: video.tagName || '',
 frame: String((doc.location && doc.location.href) || '').slice(0, 90),
 id: video.id || '',
 src: String(video.currentSrc || video.getAttribute('src') || '').slice(0, 90),
-visible: Boolean(rect),
-size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '0x0',
+visible: Boolean(rect) || mediaLooksShown(video),
+size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : (mediaLooksShown(video) ? '音频（父容器可见）' : '0x0'),
 ended: video.ended,
 time: Math.round(video.currentTime || 0),
 duration: Math.round(video.duration || 0),
@@ -7253,11 +7270,14 @@ try { src = video.currentSrc || video.getAttribute('src') || ''; } catch (_) {}
 let hasSource = false;
 try { hasSource = Boolean(video.querySelector('source')); } catch (_) {}
 if (!src && !hasSource) return;
-if (!includeHidden) {
-let rects = null;
-try { rects = video.getClientRects(); } catch (_) {}
-if (!rects || !rects.length) return;
-}
+// <audio> 常常没有自己的盒子（自定义播放器把它藏起来，界面是另外画的），
+// 只看 getClientRects 会把它漏掉，所以音频再看一层可见的父容器。
+// 音频不像视频那样可以“先隐藏、播的时候再显示”，一律要求挂在可见容器里，
+// 免得把页面里别的提示音当成任务点。
+const isAudio = video.tagName === 'AUDIO';
+if (isAudio) {
+if (!this._mediaVisible(video)) return;
+} else if (!includeHidden && !this._mediaVisible(video)) return;
 let isPlayer = false;
 try {
 isPlayer = /video_html5/i.test(video.id || '') || /video_html5/i.test(String(video.className || ''));
@@ -7269,7 +7289,7 @@ const visit = (doc, depth, inFrame) => {
 if (!doc || depth > 3 || seenDocs.has(doc)) return;
 seenDocs.add(doc);
 let nodes = [];
-try { nodes = Array.from(doc.querySelectorAll('video')); } catch (_) { nodes = []; }
+try { nodes = Array.from(doc.querySelectorAll('video, audio')); } catch (_) { nodes = []; }
 for (const video of nodes) addVideo(video, inFrame);
 let frames = [];
 try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) { frames = []; }
@@ -7305,8 +7325,25 @@ if (!video) return;
 if (!this._doneVideos) this._doneVideos = new Map();
 try { this._doneVideos.set(video, this._videoSrcOf(video)); } catch (_) {}
 },
+// 媒体元素是否在页面上“看得见”。<audio> 经常是 0x0 的隐藏元素，真正的播放器界面
+// 是外面另外一层 div，所以音频退一步看父容器有没有占位。
+_mediaVisible(media) {
+if (!media || !media.isConnected) return false;
+try {
+const rects = media.getClientRects();
+if (rects && rects.length) return true;
+if (media.tagName !== 'AUDIO') return false;
+const body = media.ownerDocument && media.ownerDocument.body;
+let node = media.parentElement;
+for (let depth = 0; node && node !== body && node !== media.ownerDocument.documentElement && depth < 6; depth++, node = node.parentElement) {
+const rects2 = node.getClientRects();
+if (rects2 && rects2.length && rects2[0].width >= 120 && rects2[0].height >= 40) return true;
+}
+} catch (_) { return false; }
+return false;
+},
 _videoIsVisible(video) {
-try { return Boolean(video && video.isConnected && video.getClientRects().length); } catch (_) { return false; }
+return this._mediaVisible(video);
 },
 _doneSrcSet() {
 const srcs = new Set();
@@ -7582,7 +7619,7 @@ if (this._destroyed || !video.isConnected) return 0;
 if (Math.abs(this._readPlaybackRate(video) - target) <= 0.01) {
 state.applied = target;
 state.drift = 0;
-console.log(`%c视频已调到最高 ${target}x 倍速${reason ? `（${reason}）` : ''}`, 'color:#4CAF50');
+console.log(`%c视频/音频已调到最高 ${target}x 倍速${reason ? `（${reason}）` : ''}`, 'color:#4CAF50');
 return target;
 }
 }
@@ -7592,7 +7629,7 @@ try {
 video.defaultPlaybackRate = 1;
 video.playbackRate = 1;
 } catch (_) {}
-console.log('%c这个视频不允许调倍速（设置后会被还原），保持默认速度', 'color:#9E9E9E');
+console.log('%c这个视频/音频不允许调倍速（设置后会被还原），保持默认速度', 'color:#9E9E9E');
 return 0;
 } finally {
 state.busy = false;
@@ -7618,7 +7655,8 @@ try { video.playbackRate = state.applied; } catch (_) {}
 },
 _handleVideoEnded(e) {
 if (this._destroyed) return;
-const target = e && e.target && e.target.tagName === 'VIDEO' ? e.target : null;
+const tag = e && e.target && e.target.tagName;
+const target = tag === 'VIDEO' || tag === 'AUDIO' ? e.target : null;
 // 迟到的旧视频结束事件、或正在切换小节的过渡期，都不参与推进
 if (target && this._videoEl && target !== this._videoEl) return;
 if (this._nextUnitPending) return;
@@ -7649,7 +7687,8 @@ this.play();
 }
 },
 _handleVideoPlay(e) {
-if (e && e.target && e.target.tagName === 'VIDEO' && this._videoEl && e.target !== this._videoEl) return;
+const tag = e && e.target && e.target.tagName;
+if ((tag === 'VIDEO' || tag === 'AUDIO') && this._videoEl && e.target !== this._videoEl) return;
 const title = this._cellData.currentVideoTitle;
 console.info(`%c============'${title}' 开始播放=============`, "color:#4CAF50");
 this._isPlaying = true;

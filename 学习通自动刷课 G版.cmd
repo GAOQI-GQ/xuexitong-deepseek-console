@@ -2625,7 +2625,8 @@ if (!title || title.length > 500 || options.some((option) => !option.text || opt
 questions.push({ kind, title, options, card, doc });
 }
 }
-return questions;
+// 同页多道题的题干文字一样时按题干图片区分开，否则去重/成绩页纠错会把它们当成同一道
+return disambiguateQuizTitles(questions);
 }
 
 // 题型标签缺失、重复或换了写法时，按“选项输入框”的结构把题目补回来：
@@ -2704,6 +2705,64 @@ found.push({ kind, title, options, card, doc });
 }
 }
 return found;
+}
+
+// —— 题干里的公式图片 ——
+// 新版学习通给题干文字套了 font-cxsecret 字体：DOM 里读到的是乱码，真正的内容在
+// 公式图片里。好几道题的文字部分可能一模一样（都是“判断题”或同一句提示），区别只在
+// 图片上；按“题型+题干”去重时会被当成同一道题合并掉（20 题的卷子只认到 12 题）。
+// 题目身份必须把题干图片的指纹算进去，作答页和成绩页才能对上同一道题。
+function quizStemImageSignature(card) {
+if (!card || typeof card.querySelectorAll !== 'function') return '';
+let scope = null;
+try { scope = card.querySelector('.fontLabel, .Zy_Title, [class*="Title"], [class*="title"]') || card; } catch (_) { scope = card; }
+let imgs = [];
+try { imgs = Array.from(scope.querySelectorAll('img')); } catch (_) { return ''; }
+const keys = [];
+for (const img of imgs) {
+let hint = '';
+try {
+hint = `${img.className || ''} ${img.id || ''} ${img.getAttribute('src') || ''} ${img.getAttribute('data-original') || ''}`.toLowerCase();
+} catch (_) { hint = ''; }
+// 成绩页会把对错图标（dui/cuo/tick/cross）也放进题卡：它不是题干内容，
+// 混进指纹会让作答页和成绩页的题目身份对不上，纠错记忆就失效了
+if (/dui|cuo|icon-?(right|wrong|correct|check|error)|tick|cross|correct|wrong/.test(hint)) continue;
+let src = '';
+try { src = String(img.getAttribute('data-original') || img.getAttribute('src') || img.getAttribute('data-src') || ''); } catch (_) { src = ''; }
+if (!src || /^data:/i.test(src)) continue;
+const file = src.split(/[?#]/)[0].split('/').pop().replace(/\.[a-z0-9]+$/i, '');
+if (!file) continue;
+const key = file.slice(-24);
+if (key && !keys.includes(key)) keys.push(key);
+if (keys.length >= 4) break;
+}
+return keys.join(',');
+}
+
+// 同一页里“题型+题干”完全相同的题：把题干图片指纹补到标题最前面（题号前缀会在
+// quizQuestionKey / dedupePaperQuestions 里截断标题，放末尾会被截掉）。
+// 没有图片的题保持原样：它们本来就是同一道题的重复渲染，应该被去重。
+// 已经带过指纹的跳过，extractQuestions 和 quizPaperCandidates 各调一次也不会叠加。
+function disambiguateQuizTitles(list) {
+const questions = Array.isArray(list) ? list : [];
+const groups = new Map();
+for (const question of questions) {
+if (!question || question.review) continue;
+const key = `${question.kind}:${clean(question.title)}`;
+const group = groups.get(key);
+if (group) group.push(question);
+else groups.set(key, [question]);
+}
+for (const group of groups.values()) {
+if (group.length < 2) continue;
+for (const question of group) {
+if (/^\[图:[^\]]*\]/.test(String(question.title || ''))) continue;
+const signature = quizStemImageSignature(question.card);
+if (!signature) continue;
+question.title = `[图:${signature}]${clean(question.title)}`.slice(0, 500);
+}
+}
+return questions;
 }
 
 // —— 填空题/简答题 ——
@@ -3260,9 +3319,13 @@ if (!name) continue;
 info.tags[name] = (info.tags[name] || 0) + 1;
 }
 info.pager = /下一题|下一页|下页|上一题|上一页/.test(text);
-// 目录/页头搜索框也是 input[type=text]，以前诊断日志里那个凭空的
-// “填空/简答输入框 1 个”就是它，误导排查；统计时把搜索框排除掉
+// 目录/页头搜索框、隐藏模板里的 input 也是 input[type=text]，以前诊断日志里那个
+// 凭空的“填空/简答输入框 1 个”就是它们，误导排查；改用真正可填写的输入框来统计，
+// 只把页面上看得见、能填入内容的框算成填空/简答
 try {
+if (typeof fillableElements === 'function') {
+info.textInputs = fillableElements(body).length;
+} else {
 info.textInputs = Array.from(body.querySelectorAll('input[type="text"],input[type="search"],textarea,[contenteditable="true"]'))
 .filter((el) => {
 const type = String(el.type || '').toLowerCase();
@@ -3270,6 +3333,7 @@ if (type === 'search') return false;
 const hint = `${el.placeholder || ''} ${el.id || ''} ${el.className || ''}`;
 return !/搜索|查找|search|keyword/i.test(hint);
 }).length;
+}
 } catch (_) { info.textInputs = 0; }
 return info;
 }
@@ -4968,6 +5032,9 @@ if (texts.length) questions.textQuestions = texts;
 console.log(`%c题型标签缺失/输入框被隐藏，按题目卡片补回 ${added.length} 道题（补后 ${paperQuestionTotal(questions)} 道）`, 'color:#4CAF50');
 }
 }
+// 补进来的题可能和已有题题干相同（字体加密后乱码一样），用题干图片指纹再分一次，
+// 否则 dedupePaperQuestions 会把图片不同的题合并掉
+if (typeof disambiguateQuizTitles === 'function') disambiguateQuizTitles(questions);
 return dedupePaperQuestions(questions || []);
 }
 

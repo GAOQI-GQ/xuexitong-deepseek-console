@@ -2586,6 +2586,49 @@ if (text && !found.has(letter)) found.set(letter, { letter, text, element: row }
 return Array.from(found.values()).sort((a, b) => a.letter.localeCompare(b.letter));
 }
 
+// 版面上的题号有两种写法：“1. 题干”和“1 【判断题】题干”（新版页面没有点号）。
+// 题号是题目身份的一部分：同一份卷面上题号不会重复，两道题题干文字完全一样时，
+// 只有题号能说明它们是两道题（公式渲染成图片、指纹又取不到的时候很常见）。
+const QUESTION_NUMBER_RE = /(?:^|\n)\s*(\d{1,3})\s*(?:[.、．:：]|[\[【])/g;
+
+// 一段文字里能数到哪些题号。容器里数到多个题号，说明它不是一道题、而是装着好几道题。
+function questionNumberSet(text) {
+const numbers = new Set();
+const source = String(text || '');
+QUESTION_NUMBER_RE.lastIndex = 0;
+let match;
+while ((match = QUESTION_NUMBER_RE.exec(source))) {
+numbers.add(Number(match[1]));
+if (numbers.size >= 60) break;
+}
+return numbers;
+}
+
+// 题目卡片开头的题号（“1 【判断题】…” / “1. …”）。取不到返回 0：
+// 去重时没有题号的题仍按“题干+选项相同就算重复”的老规则处理。
+function quizCardNumber(question) {
+let card = question && question.card;
+let text = '';
+try { text = String(card && card.innerText || ''); } catch (_) { text = ''; }
+const match = text.match(/^\s*(\d{1,3})\s*(?:[.、．:：]|[\[【])/);
+return match ? Number(match[1]) : 0;
+}
+
+// 题干完全由公式图片组成、DOM 里读不到文字时，用题干图片指纹当标题，别把整道题丢掉。
+// 三道扫描（按题型标签、按选项结构、按题卡）共用这一份标题规则。
+function quizTitleFromText(card, text) {
+let title = clean(text)
+.replace(/^\d+\s*[.、．]?\s*/, '')
+.replace(new RegExp(kindPattern.source, 'g'), '')
+.trim();
+if (!title) {
+let signature = '';
+try { signature = quizStemImageSignature(card); } catch (_) { signature = ''; }
+if (signature) title = `[图:${signature}]`;
+}
+return title;
+}
+
 // onlyDocs：只在这些框架里找题（识别“能不能重新作答”时用，避免把隐藏框架里
 // 上一份成绩页的题目混进来，题量永远对不上）
 function extractQuestions(onlyDocs) {
@@ -2607,7 +2650,8 @@ if (distinctKindTags(cardText, kindPattern).size > 1) break;
 // 同一个容器里装着好几道题（能数到多个题号）时不能整块当成一题：
 // 同题型的相邻两题会被并成一道，识别数就永远比卷面少
 const rawCard = String(card.innerText || '');
-const cardNumbers = new Set((rawCard.match(/(?:^|\n)\s*(\d{1,3})\s*[.、．]/g) || []).map((item) => item.replace(/[^\d]/g, '')));
+// 题号可能写成“1.”，也可能写成“1 【判断题】”（新版页面没有点号），两种都要能数到
+const cardNumbers = questionNumberSet(rawCard);
 const kindTags = (cardText.match(new RegExp(kindPattern.source, 'g')) || []).length;
 const questionBox = /TiMu|Zy_|timu|question|exercise/i.test(`${card.className || ''} ${card.id || ''}`);
 if (cardNumbers.size > 1 && (!questionBox || kindTags > 1)) { options = []; break; }
@@ -2618,9 +2662,8 @@ if (!card || options.length < 2 || options.length > 8 || seenCards.has(card)) co
 seenCards.add(card);
 const full = card.innerText || '';
 const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
-const title = clean(firstOption >= 0 ? full.slice(0, firstOption) :
-(node.parentElement.innerText || full))
-.replace(/^\d+\s*[.、．]?\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+const title = quizTitleFromText(card, firstOption >= 0 ? full.slice(0, firstOption) :
+(node.parentElement.innerText || full));
 if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
 questions.push({ kind, title, options, card, doc });
 }
@@ -2666,11 +2709,10 @@ const full = String(card.innerText || '');
 // 一道题的容器里只该有一个题号；能数到多个题号说明这个容器装了好几道题，不能整块当成一题。
 // 明确是题目卡片（TiMu/Zy_）的例外：题干里可能自带“1. 2.”这种列举
 const questionBox = /TiMu|Zy_|timu|question|exercise/i.test(`${card.className || ''} ${card.id || ''}`);
-if (!questionBox && (full.match(/(?:^|\n)\s*\d+\s*[.、．]/g) || []).length > 1) continue;
+if (!questionBox && questionNumberSet(full).size > 1) continue;
 const kind = clean(full).match(kindPattern)?.[1] || structuralKindOf(card, options);
 const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
-const title = clean(firstOption >= 0 ? full.slice(0, firstOption) : full)
-.replace(/^\d+\s*[.、．]?\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+const title = quizTitleFromText(card, firstOption >= 0 ? full.slice(0, firstOption) : full);
 if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
 found.push({ kind, title, options, card, doc });
 }
@@ -2692,14 +2734,12 @@ let full = '';
 try { full = String(card.innerText || ''); } catch (_) { continue; }
 if (!full.trim() || full.length > 3000) continue;
 // 卡片里能数到多个题号：这是包着好几道题的容器，不是一道题
-const numbers = new Set((full.match(/(?:^|\n)\s*(\d{1,3})\s*[.、．]/g) || []).map((item) => item.replace(/[^\d]/g, '')));
-if (numbers.size > 1) continue;
+if (questionNumberSet(full).size > 1) continue;
 const options = optionElements(card);
 if (options.length < 2 || options.length > 8) continue;
 const kind = clean(full).match(kindPattern)?.[1] || structuralKindOf(card, options);
 const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
-const title = clean(firstOption >= 0 ? full.slice(0, firstOption) : full)
-.replace(/^\d+\s*[.、．]?\s*/, '').replace(new RegExp(kindPattern.source, 'g'), '').trim();
+const title = quizTitleFromText(card, firstOption >= 0 ? full.slice(0, firstOption) : full);
 if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
 found.push({ kind, title, options, card, doc });
 }
@@ -2707,33 +2747,114 @@ found.push({ kind, title, options, card, doc });
 return found;
 }
 
+// 题号兜底：题干完全由公式组成、题型标签或选项又换了写法时，前面几条扫描都可能漏题。
+// 新版页面的题号是单独一个元素（<i>1</i> 或 <span>1</span>，后面跟“【判断题】”），
+// 就按题号找：从题号往上找到刚好包住这道题选项的容器，容器里只允许出现这一个题号。
+// 目录、答题卡里的数字旁边没有题型标签和选项，不会被当成题目。
+function numberedQuizQuestions(onlyDocs) {
+const found = [];
+for (const doc of (Array.isArray(onlyDocs) ? onlyDocs : courseDocuments())) {
+if (!doc.body) continue;
+let nodes = [];
+try { nodes = Array.from(doc.querySelectorAll('i,span,b,em,strong,label,p,div')); } catch (_) { continue; }
+for (const el of nodes) {
+let text = '';
+try { text = clean(el.textContent); } catch (_) { continue; }
+if (!/^\d{1,3}$/.test(text)) continue;
+if (!visible(el)) continue;
+// 只要最里层：外面包着的容器也会带着同一个数字
+let innerSame = false;
+try { innerSame = Array.from(el.children || []).some((child) => clean(child.textContent) === text); } catch (_) { innerSame = false; }
+if (innerSame) continue;
+// 题号所在的那一块里得有题型标签或题目内容，目录/答题卡的数字过不了这一关
+let hint = '';
+try { hint = clean(`${el.parentElement ? el.parentElement.innerText : ''} ${el.nextElementSibling ? el.nextElementSibling.textContent : ''}`); } catch (_) { hint = ''; }
+if (!kindPattern.test(hint)) continue;
+let card = el.parentElement;
+let options = [];
+let ok = false;
+for (let depth = 0; card && card !== doc.body && depth < 9; depth++, card = card.parentElement) {
+const cardText = clean(card.innerText);
+if (distinctKindTags(cardText, kindPattern).size > 1) { options = []; break; }
+options = optionElements(card);
+if (options.length >= 2 && options.length <= 8) { ok = true; break; }
+}
+if (!ok || !card) continue;
+const full = String(card.innerText || '');
+// 题卡必须以这个题号开头，并且里面不能再数到别的题号（否则是装着好几道题的容器）
+const lead = full.match(/^\s*(\d{1,3})\s*(?:[.、．:：]|[\[【])/);
+if (!lead || Number(lead[1]) !== Number(text)) continue;
+if (questionNumberSet(full).size > 1) continue;
+const kind = clean(full).match(kindPattern)?.[1] || structuralKindOf(card, options);
+const firstOption = full.search(/(?:^|\n)\s*A\s*(?:[.、．]|\S)/);
+const title = quizTitleFromText(card, firstOption >= 0 ? full.slice(0, firstOption) : full);
+if (!title || title.length > 500 || options.some((option) => !option.text || option.text.length > 500)) continue;
+found.push({ kind, title, options, card, doc });
+}
+}
+return disambiguateQuizTitles(found);
+}
+
 // —— 题干里的公式图片 ——
 // 新版学习通给题干文字套了 font-cxsecret 字体：DOM 里读到的是乱码，真正的内容在
-// 公式图片里。好几道题的文字部分可能一模一样（都是“判断题”或同一句提示），区别只在
-// 图片上；按“题型+题干”去重时会被当成同一道题合并掉（20 题的卷子只认到 12 题）。
-// 题目身份必须把题干图片的指纹算进去，作答页和成绩页才能对上同一道题。
+// 公式里。好几道题的文字部分可能一模一样（都是“判断题”或同一句提示），区别只在
+// 公式上；按“题型+题干”去重时会被当成同一道题合并掉（20 题的卷子只认到 12 题）。
+// 公式的渲染方式不止 <img>：还有内联 SVG（MathJax）、data: URI 图片和 MathML/KaTeX。
+// 只认 <img src> 时，后几种页面的题目身份仍然只剩文字，照样会被合并。
+// 题目身份必须把题干公式的指纹算进去，作答页和成绩页才能对上同一道题。
+function stemFingerprintHash(value) {
+const text = String(value || '');
+let hash = 5381;
+for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) >>> 0;
+return hash.toString(36);
+}
+
+// 成绩页会把对错图标（dui/cuo/tick/cross）也放进题卡：它不是题干内容，
+// 混进指纹会让作答页和成绩页的题目身份对不上，纠错记忆就失效了
+const STEM_ICON_HINT = /dui|cuo|icon-?(right|wrong|correct|check|error)|tick|cross|correct|wrong/;
+
 function quizStemImageSignature(card) {
 if (!card || typeof card.querySelectorAll !== 'function') return '';
 let scope = null;
 try { scope = card.querySelector('.fontLabel, .Zy_Title, [class*="Title"], [class*="title"]') || card; } catch (_) { scope = card; }
-let imgs = [];
-try { imgs = Array.from(scope.querySelectorAll('img')); } catch (_) { return ''; }
 const keys = [];
+const add = (key) => { if (key && !keys.includes(key) && keys.length < 4) keys.push(key); };
+let imgs = [];
+try { imgs = Array.from(scope.querySelectorAll('img')); } catch (_) { imgs = []; }
 for (const img of imgs) {
 let hint = '';
 try {
 hint = `${img.className || ''} ${img.id || ''} ${img.getAttribute('src') || ''} ${img.getAttribute('data-original') || ''}`.toLowerCase();
 } catch (_) { hint = ''; }
-// 成绩页会把对错图标（dui/cuo/tick/cross）也放进题卡：它不是题干内容，
-// 混进指纹会让作答页和成绩页的题目身份对不上，纠错记忆就失效了
-if (/dui|cuo|icon-?(right|wrong|correct|check|error)|tick|cross|correct|wrong/.test(hint)) continue;
+if (STEM_ICON_HINT.test(hint)) continue;
 let src = '';
 try { src = String(img.getAttribute('data-original') || img.getAttribute('src') || img.getAttribute('data-src') || ''); } catch (_) { src = ''; }
-if (!src || /^data:/i.test(src)) continue;
+if (!src) continue;
+// 公式有时内联成 data: URI：整串太长，用短哈希当指纹
+if (/^data:/i.test(src)) {
+add(`d${stemFingerprintHash(src)}`);
+continue;
+}
 const file = src.split(/[?#]/)[0].split('/').pop().replace(/\.[a-z0-9]+$/i, '');
 if (!file) continue;
-const key = file.slice(-24);
-if (key && !keys.includes(key)) keys.push(key);
+add(file.slice(-24));
+}
+// 内联 SVG / MathML / KaTeX：同样的公式每次渲染出来的路径数据和文字是稳定的，
+// 取一份短指纹。外层容器和里层元素都取到也没关系，最多取 4 个。
+let graphics = [];
+try { graphics = Array.from(scope.querySelectorAll('svg,math,.katex,mjx-container,[class*="MathJax"],[class*="mathjax"],[class*="katex"]')); } catch (_) { graphics = []; }
+for (const el of graphics) {
+let hint = '';
+try { hint = `${el.getAttribute('class') || ''} ${el.id || ''}`.toLowerCase(); } catch (_) { hint = ''; }
+if (STEM_ICON_HINT.test(hint)) continue;
+let payload = '';
+try {
+const paths = Array.from(el.querySelectorAll('path')).map((path) => path.getAttribute('d') || '').join('|');
+payload = `${paths}|${el.textContent || ''}`;
+} catch (_) { payload = ''; }
+// 空 SVG / 空容器没有区分度
+if (!payload.replace(/[|\s]/g, '')) continue;
+add(`v${stemFingerprintHash(payload)}`);
 if (keys.length >= 4) break;
 }
 return keys.join(',');
@@ -3279,8 +3400,13 @@ for (const el of roots) {
 if (!el || list.includes(el)) continue;
 try {
 if (el.scrollHeight <= el.clientHeight + 100) continue;
+// 整页滚动时滚动容器是 <html>/<body>，它们的 overflowY 是 visible，不能按 auto/scroll 过滤；
+// 新版页面有些题要滚到位置才继续渲染，漏掉文档滚动就永远只认到前面几道题
+const isRoot = el === doc.scrollingElement || el === doc.documentElement || el === doc.body;
+if (!isRoot) {
 const style = doc.defaultView.getComputedStyle(el);
 if (!/(auto|scroll)/.test(style.overflowY)) continue;
+}
 list.push(el);
 } catch (_) { /* 忽略 */ }
 if (list.length >= 4) break;
@@ -3355,6 +3481,16 @@ const info = quizPaperSnapshot(docOrBody);
 if (!info.headings.length) return null;
 const total = info.headings.reduce((sum, item) => sum + (Number(item.count) || 0), 0);
 return total > 0 ? total : null;
+}
+
+// 卷面文字里能数到多少个题号（“1.”和“1 【判断题】”都算）。识别数比题量少时用它
+// 区分两种情况：页面根本没渲染出后面的题（题号也少），还是渲染了但没认出来（题号是全的）。
+function quizNumberedTotal(docOrBody) {
+const body = docOrBody && (docOrBody.body || (docOrBody.nodeType === 1 ? docOrBody : null));
+if (!body) return 0;
+let text = '';
+try { text = String(body.innerText || body.textContent || ''); } catch (_) { return 0; }
+return questionNumberSet(text).size;
 }
 
 const QUIZ_START_LABELS = ['开始答题', '开始测验', '开始考试', '进入答题', '继续答题', '继续作答'];
@@ -4941,15 +5077,37 @@ return docs;
 }
 
 // 同一道题在页面上出现两份（旧成绩页副本还在同一个框架里）时按题型+题干+选项去重，
-// 否则交卷时会把同一道题算两遍、题量和卷面对不上
-function dedupePaperQuestions(questions) {
-const seen = new Set();
+// 否则交卷时会把同一道题算两遍、题量和卷面对不上。
+// 但“题干文字一样”不等于“同一道题”：公式渲染成图片/符号、指纹又取不到时，
+// 20 道判断题的文字部分可能完全一样（卷子只认到 12 道就是这么来的）。
+// 题号不同的两道题一定不是同一道；题号相同的重复渲染才合并。
+function dedupePaperQuestions(questions, ignoreNumbers) {
+const seen = ignoreNumbers ? new Set() : new Map();
 const unique = [];
 for (const question of (Array.isArray(questions) ? questions : [])) {
 const options = (question.options || []).map((option) => clean(option.text)).join('/');
-const key = `${question.kind}:${clean(question.title).slice(0, 120)}:${options}`;
-if (seen.has(key)) continue;
-seen.add(key);
+const base = `${question.kind}:${clean(question.title).slice(0, 120)}:${options}`;
+// ignoreNumbers：极少数页面会把同一道题连着编两次号，按题号区分反而比卷面题量多，
+// 这时退回“题干相同就去重”的老规则，免得“识别数 > 题量”永远卡住
+if (ignoreNumbers) {
+if (seen.has(base)) continue;
+seen.add(base);
+unique.push(question);
+continue;
+}
+const number = quizCardNumber(question);
+let numbers = seen.get(base);
+if (!numbers) { numbers = new Set(); seen.set(base, numbers); }
+if (!numbers.size) {
+numbers.add(number);
+unique.push(question);
+continue;
+}
+// 已经留过一道：没有题号的一律按重复渲染处理（老规则）；
+// 都有题号时，题号相同才是同一道
+if (!number || numbers.has(0)) continue;
+if (numbers.has(number)) continue;
+numbers.add(number);
 unique.push(question);
 }
 const texts = (questions && Array.isArray(questions.textQuestions)) ? questions.textQuestions : [];
@@ -4985,14 +5143,31 @@ return gap <= Math.min(3, Math.max(1, Math.round(expected * 0.1)));
 }
 
 let quizStructuralLogKey = '';
+let quizDedupeLogKey = '';
 // 只按“提交按钮所在框架”来识别试卷；提交按钮在外层、题目在别的框架时退回全页面识别
 function quizPaperCandidates(submitDoc) {
 if (!submitDoc) return null;
 const scoped = docsWithin(submitDoc);
 let questions = attachTextQuestions(extractQuestions(scoped), scoped);
 if (!paperQuestionTotal(questions)) questions = attachTextQuestions(extractQuestions());
-const total = paperQuestionTotal(questions);
+let total = paperQuestionTotal(questions);
 const expected = expectedQuizTotal(submitDoc);
+// 只认到一部分题时，把“提交按钮框架之外、但当前可见”的框架也扫一遍：
+// 新版页面有的把题目放在提交按钮外面的兄弟框架里。隐藏框架里的旧成绩页副本不参与，
+// 免得把上一份卷子的题混进来。只有扫出来的题更接近卷面题量才采用。
+if (total < (expected || 1)) {
+let visibleDocs = [];
+try { visibleDocs = courseDocuments().filter((doc) => !scoped.includes(doc) && frameVisible(doc)); } catch (_) { visibleDocs = []; }
+if (visibleDocs.length) {
+const wide = attachTextQuestions(extractQuestions(visibleDocs), visibleDocs);
+const wideTotal = paperQuestionTotal(wide);
+if (wideTotal > total && (!expected || wideTotal <= expected)) {
+console.log(`%c提交按钮框架外还识别到 ${wideTotal - total} 道题，一并纳入作答`, 'color:#2196F3');
+questions = wide;
+total = wideTotal;
+}
+}
+}
 // 正常识别题量不够时，按选项结构补题（题型标签没渲染、重复渲染或换了写法都能补回来）。
 // 只补到卷面题量为止：补多了反而会因为“识别数 > 题量”永远判定不完整
 if (total < (expected || 1)) {
@@ -5032,10 +5207,41 @@ if (texts.length) questions.textQuestions = texts;
 console.log(`%c题型标签缺失/输入框被隐藏，按题目卡片补回 ${added.length} 道题（补后 ${paperQuestionTotal(questions)} 道）`, 'color:#4CAF50');
 }
 }
+// 题目卡片也没有可用的类名时，最后按“题号 + 选项”再补一次
+if (paperQuestionTotal(questions) < (expected || 1)) {
+const knownCards = questions.map((question) => question.card).filter(Boolean);
+const extra = numberedQuizQuestions(scoped).filter((question) =>
+!knownCards.some((card) => card === question.card ||
+(card.contains && card.contains(question.card)) ||
+(question.card.contains && question.card.contains(card))));
+const room = expected ? Math.max(0, expected - paperQuestionTotal(questions)) : extra.length;
+if (extra.length && room > 0) {
+const texts = questions.textQuestions || [];
+const added = extra.slice(0, room);
+questions = questions.slice().concat(added);
+if (texts.length) questions.textQuestions = texts;
+console.log(`%c题卡类名/题型标签都不可用时，按题号补回 ${added.length} 道题（补后 ${paperQuestionTotal(questions)} 道）`, 'color:#4CAF50');
+}
+}
 // 补进来的题可能和已有题题干相同（字体加密后乱码一样），用题干图片指纹再分一次，
 // 否则 dedupePaperQuestions 会把图片不同的题合并掉
 if (typeof disambiguateQuizTitles === 'function') disambiguateQuizTitles(questions);
-return dedupePaperQuestions(questions || []);
+let unique = dedupePaperQuestions(questions || []);
+// 按题号区分后反而比卷面题量还多（极少数页面会把同一道题编号渲染两次）：
+// 退回老规则，避免“识别数 > 题量”让等待循环永远稳定不下来
+if (expected && paperQuestionTotal(unique) > expected) {
+unique = dedupePaperQuestions(questions || [], true);
+}
+// 去重合并掉了多少道也打出来：题量对不上时能直接分清是“页面没渲染”还是“被去重吞了”
+const mergedCount = (questions || []).length - unique.length;
+if (mergedCount > 0) {
+const key = `${(questions || []).length}:${unique.length}`;
+if (key !== quizDedupeLogKey) {
+quizDedupeLogKey = key;
+console.log(`%c按题干去重合并了 ${mergedCount} 道重复题（去重前 ${questions.length} 道，保留 ${unique.length} 道）`, 'color:#9E9E9E');
+}
+}
+return unique;
 }
 
 function quizPaperExpected(questions) {
@@ -5061,6 +5267,12 @@ try {
 const info = typeof quizPaperSnapshot === 'function' ? quizPaperSnapshot(paperDoc(questions)?.body) : null;
 if (info && typeof describeQuizPaper === 'function') detail = describeQuizPaper(info);
 } catch (_) { detail = ''; }
+// 页面上能数到几个题号：和识别数差得多，说明题目渲染出来了只是没认出来；
+// 题号也少，说明页面还没把后面的题渲染出来，继续等/滚动才有意义
+try {
+const numbered = typeof quizNumberedTotal === 'function' ? quizNumberedTotal(paperDoc(questions)?.body) : 0;
+if (numbered) detail += `${detail ? '；' : ''}页面数到 ${numbered} 个题号`;
+} catch (_) { /* 忽略 */ }
 // 把已识别到的题逐条列出来：题量对不上时能直接看出缺的是哪一类、哪一题
 let list = '';
 try {

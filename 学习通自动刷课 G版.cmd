@@ -7156,6 +7156,9 @@ currentVideoTitle: "",
 },
 run() {
 console.log("%c=== 学习通视频与章节测验助手 V800 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
+// 脚本是辅助窗口启动时读进内存的：改了脚本必须重启辅助窗口才会生效。
+// 这条版本标记用来确认浏览器实际跑到的是哪一版，排查“改了没生效”时先看它。
+console.log("%c脚本构建：2026-11-12 题干图片指纹版（字体加密的判断题不再被合并）", "color:#2196F3");
 this._installWatchdog();
 this._installMemoryGuard();
 this._noteProgress();

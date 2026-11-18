@@ -995,12 +995,45 @@ return true;
 } catch (_) { return false; }
 }
 
+// 卷面上的题目结构：旧版卷面有 .TiMu/Zy_ 题卡或单选/复选输入框；
+// 新版卷面可能只剩“题量/满分 + 分节题量/题号”，这类文字结构同样能确认是一份试卷
+function quizPaperStructurePresent(doc, marker) {
+let tokens = 0;
+try {
+tokens = doc.querySelectorAll('.TiMu,[class*="TiMu"],[class*="Zy_"],input[type="radio"],input[type="checkbox"],textarea').length;
+} catch (_) { tokens = 0; }
+if (tokens >= 2) return true;
+if (marker.hasCount && ((marker.headings || 0) >= 1 || (marker.stems || 0) >= 2)) return true;
+if ((marker.headings || 0) >= 2) return true;
+return false;
+}
+
+// 模块级的文档遍历：attachQuizAutomation 里另有一份同名的 courseDocuments，
+// 模块层函数拿不到它（scope 审计会报 ReferenceError），这里自己走一遍
+function allPageDocuments() {
+const result = [];
+const visit = (doc, depth) => {
+if (!doc || depth > 3 || result.includes(doc)) return;
+result.push(doc);
+let frames = [];
+try { frames = Array.from(doc.querySelectorAll('iframe')); } catch (_) { frames = []; }
+for (const frame of frames) {
+try { visit(frame.contentDocument, depth + 1); } catch (_) { /* 跨域框架读不到 */ }
+}
+};
+visit(document, 0);
+return result;
+}
+
 // 卷面的硬标志：题量/满分，或分节标题“一、多选题（共1题）”
 function quizPaperMarkerInfo(text) {
 const source = String(text || '');
 const headings = (source.match(/(?:单选题|多选题|判断题|填空题|简答题)[^\n]{0,16}?共\s*\d+\s*题/g) || []).length;
+// 题号（“1 【单选题】”“2. 题干”）：新版卷面可能既没有 .TiMu 类名、也没有单选输入框，
+// 题量 + 题号/分节题量同样足以确认这是一份试卷
+const stems = (source.match(/(?:^|\n)\s*\d{1,3}\s*(?:[.、．:：]|[\[【])/g) || []).length;
 const hasCount = /题量\s*[:：]\s*\d+|总题量|满分\s*[:：]?\s*\d+/.test(source);
-return { hasCount, headings };
+return { hasCount, headings, stems };
 }
 
 function pageShowsQuizPaper() {
@@ -1036,11 +1069,7 @@ const tags = (text.match(/[\[【](单选题|多选题|判断题|填空题|简答
 const marker = quizPaperMarkerInfo(text);
 // 题量、满分、分节题量是卷面的硬标志；都没有时才要求两种以上题型标签
 if (!marker.hasCount && marker.headings < 1 && tags < 2) continue;
-let tokens = 0;
-try {
-tokens = doc.querySelectorAll('.TiMu,[class*="TiMu"],[class*="Zy_"],input[type="radio"],input[type="checkbox"],textarea').length;
-} catch (_) { tokens = 0; }
-if (tokens < 2) continue;
+if (!quizPaperStructurePresent(doc, marker)) continue;
 // 卷面标志明确时不强求“提交”按钮：新版页面要全部答完才启用按钮，或按钮放在另一个框架里。
 // 只有靠题型标签判定时才继续要求可见的提交按钮，避免把视频弹题认成整份试卷。
 if (!marker.hasCount && marker.headings < 1 && !visibleQuizSubmitIn(doc)) continue;
@@ -1054,17 +1083,13 @@ return value;
 // 卷面已经显示、只是“提交”还没启用（要全部答完才启用）时，也要能把题目框架找出来，
 // 否则会干等 120 秒“未找到提交按钮”。只认当前显示着的卷面文档。
 function quizPaperAnchorDoc() {
-for (const doc of courseDocuments()) {
+for (const doc of allPageDocuments()) {
 if (!doc.body || !docIsDisplayedNow(doc)) continue;
 let text = '';
 try { text = String(doc.body.innerText || ''); } catch (_) { continue; }
 const marker = quizPaperMarkerInfo(text);
 if (!marker.hasCount && marker.headings < 1) continue;
-let tokens = 0;
-try {
-tokens = doc.querySelectorAll('.TiMu,[class*="TiMu"],[class*="Zy_"],input[type="radio"],input[type="checkbox"],textarea').length;
-} catch (_) { tokens = 0; }
-if (tokens < 2) continue;
+if (!quizPaperStructurePresent(doc, marker)) continue;
 if (!visibleQuizSubmitIn(doc, true)) continue;
 return doc;
 }
@@ -1084,6 +1109,22 @@ if (isCards(el)) return el;
 el = el.parentElement;
 }
 } catch (_) { /* jsdom 或页面重建时读不到坐标 */ }
+// 布局读不到坐标时，退一步按面积挑；但框架中心被新任务点内容盖住时不能选：
+// 同一节先视频后测验，旧的视频框架（num=0）还留着尺寸，选它会一直把这一步当成视频
+const frameCenterShown = (frame) => {
+let rect = null;
+try { rect = frame.getClientRects()[0]; } catch (_) { rect = null; }
+if (!rect) return false;
+const cx = rect.left + rect.width / 2;
+const cy = rect.top + rect.height / 2;
+const win = document.defaultView;
+if (!win) return true;
+if (cx < 0 || cy < 0 || cx > (win.innerWidth || 0) || cy > (win.innerHeight || 0)) return false;
+let hit = null;
+try { hit = document.elementFromPoint(cx, cy); } catch (_) { hit = null; }
+if (hit && hit !== frame && !frame.contains(hit) && !hit.contains(frame)) return false;
+return true;
+};
 let best = null;
 let bestArea = 0;
 try {
@@ -1091,6 +1132,7 @@ for (const frame of document.querySelectorAll('iframe[src*="/knowledge/cards"]')
 let rect = null;
 try { rect = frame.getClientRects()[0]; } catch (_) { rect = null; }
 if (!rect) continue;
+if (!frameCenterShown(frame)) continue;
 const area = (rect.width || 0) * (rect.height || 0);
 if (!best || area > bestArea) {
 best = frame;
@@ -1101,7 +1143,7 @@ bestArea = area;
 if (best) return best;
 try {
 return Array.from(document.querySelectorAll('iframe[src*="/knowledge/cards"]'))
-.find((frame) => frame.getClientRects().length > 0) || null;
+.find((frame) => frame.getClientRects().length > 0 && frameCenterShown(frame)) || null;
 } catch (_) { return null; }
 }
 
@@ -1322,6 +1364,24 @@ if (text && text.length <= 50000 && /题量\s*[:：]\s*\d+|交卷|提交试卷/.
 } catch (_) { /* 忽略 */ }
 try {
 let frameEl = media.ownerDocument.defaultView && media.ownerDocument.defaultView.frameElement;
+// 播放器直接在顶层文档里（新版章节页就是）：新任务点（章节测验）的内容
+// 常常是盖在它上面而不是把它从 DOM 里删掉，只看“有没有盒子”会把它当成当前视频。
+// 中心点被别的元素挡住时，这个视频就是上一个任务点的残留。
+if (!frameEl) {
+const win = media.ownerDocument.defaultView;
+let rect = null;
+try { rect = media.getClientRects()[0]; } catch (_) { rect = null; }
+if (win && rect && rect.width >= 2 && rect.height >= 2) {
+const cx = rect.left + rect.width / 2;
+const cy = rect.top + rect.height / 2;
+if (cx >= 0 && cy >= 0 && cx <= (win.innerWidth || 0) && cy <= (win.innerHeight || 0)) {
+let hit = null;
+try { hit = media.ownerDocument.elementFromPoint(cx, cy); } catch (_) { hit = null; }
+if (hit && hit !== media && !media.contains(hit) && !hit.contains(media)) return false;
+}
+}
+return true;
+}
 for (let depth = 0; frameEl && depth < 6; depth++) {
 let rect = null;
 try { rect = frameEl.getBoundingClientRect(); } catch (_) { rect = null; }
@@ -1586,6 +1646,12 @@ return title;
 // 5) 有题目痕迹，但目录高亮明确不是测验节点（例如 1.2 学习天地）：仍按视频处理
 if (label && !labelSaysQuiz && probe.videoAny) return '视频';
 return title;
+};
+
+// 停手前的诊断：把步骤判断失败时的各项依据原样打出来，
+// 下次再出现“明明页面上是测验却说没发现学习步骤”，看这一行就知道卡在哪一项
+app._quizStepProbe = function () {
+return { ...stepProbe(), label: activeCatalogLabel() || '' };
 };
 
 function quizCompleted() {
@@ -7370,7 +7436,7 @@ run() {
 console.log("%c=== 学习通视频与章节测验助手 V800 启动（多视频版 2026-10-25）===", "color:#4CAF50;font-size:16px;font-weight:bold");
 // 脚本是辅助窗口启动时读进内存的：改了脚本必须重启辅助窗口才会生效。
 // 这条版本标记用来确认浏览器实际跑到的是哪一版，排查“改了没生效”时先看它。
-console.log("%c脚本构建：2026-11-12 题干图片指纹版（字体加密的判断题不再被合并）", "color:#2196F3");
+console.log("%c脚本构建：2026-11-18 视频+测验混排识别版（同节残留视频不再挡住测验）", "color:#2196F3");
 this._installWatchdog();
 this._installMemoryGuard();
 this._noteProgress();
@@ -7599,6 +7665,24 @@ if (typeof this._retryAlternateVideoLine === 'function' && this._retryAlternateV
 if (typeof this._waitVideoTaskLoading === 'function' && this._waitVideoTaskLoading()) return;
 // 阅读/图文任务点：先把内容区滚动到最底部，完成后再点“下一节”
 if (typeof this._handleDocumentTask === 'function' && await this._handleDocumentTask()) return;
+// 同一节先视频后测验：切到测验任务点后，上一段视频的播放器/框架可能还留在 DOM 里，
+// 步骤标题被它带回“视频”，这里就会一直找视频、等 20 次后停手。卷面已经露出来时直接做题。
+if (typeof pageShowsQuizPaper === 'function' && pageShowsQuizPaper()) {
+if (typeof this._quizAutomationBusy === 'function' && this._quizAutomationBusy()) {
+this._isPlaying = false;
+this._clearCheckInterval();
+setTimeout(() => { if (!this._destroyed) this.play(); }, 2000);
+return;
+}
+this._videoEl = null;
+this._quizVideo = null;
+this._isPlaying = false;
+this._noVideoRetryTimes = 0;
+this._clearCheckInterval();
+console.warn('%c页面上是章节测验（同节视频任务点的播放器是残留），先去做题', 'color:#4CAF50');
+this._advanceChapterTest();
+return;
+}
 if (this._advanceLearningStep()) {
 console.log("%c当前不在视频页，已尝试切到下一学习步骤，2秒后重试", "color:#607D8B");
 setTimeout(() => {
@@ -7665,6 +7749,10 @@ this.nextUnit();
 } else {
 // 这是有意停下的（不是卡住），停滞自检不要在这里反复拉起
 this._safeStopped = true;
+try {
+const probe = typeof this._quizStepProbe === 'function' ? this._quizStepProbe() : null;
+console.warn('停手前的页面诊断:', probe, '卷面识别:', typeof pageShowsQuizPaper === 'function' ? pageShowsQuizPaper() : 'n/a');
+} catch (_) { /* 诊断失败不影响停手 */ }
 console.warn('%c当前小节未发现视频或可识别的学习步骤，已安全停止。确认无需完成课件后，可执行 app.nextUnit()。', 'color:#FF9800');
 }
 return;
